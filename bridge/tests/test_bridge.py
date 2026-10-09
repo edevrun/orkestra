@@ -1,0 +1,262 @@
+"""Bridge tests: real HTTP server subprocess + fake claude + local callback receiver (no network)."""
+import json
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unittest
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+BRIDGE = HERE.parent / "orkestra_bridge.py"
+FAKE = HERE / "fake_claude.py"
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class Receiver(BaseHTTPRequestHandler):
+    got = []
+
+    def do_POST(self):  # noqa: N802
+        n = int(self.headers.get("Content-Length") or 0)
+        Receiver.got.append(json.loads(self.rfile.read(n)))
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *a):
+        pass
+
+
+class BridgeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = Path(tempfile.mkdtemp(prefix="bridge-test-")).resolve()
+        cls.home = cls.tmp / "home"
+        cls.ws = cls.tmp / "Projects"
+        (cls.ws / "demo").mkdir(parents=True)
+        (cls.ws / "demo" / "AGENTS.md").write_text("# demo\n")
+        subprocess.run(["git", "init", "-q", str(cls.ws / "demo")], check=True)
+        (cls.ws / "demo2").mkdir()
+        (cls.ws / "demo2" / "AGENTS.md").write_text("# demo2\n")
+        subprocess.run(["git", "init", "-q", str(cls.ws / "demo2")], check=True)
+        (cls.ws / "secret-proj").mkdir()
+        (cls.ws / "demo3").mkdir()
+        (cls.ws / "demo3" / "AGENTS.md").write_text("# demo3\n")
+        subprocess.run(["git", "init", "-q", str(cls.ws / "demo3")], check=True)
+        for extra in ("demo4", "demo5"):
+            (cls.ws / extra).mkdir()
+            (cls.ws / extra / "AGENTS.md").write_text(f"# {extra}\n")
+            subprocess.run(["git", "init", "-q", str(cls.ws / extra)], check=True)
+        cls.cb_port = free_port()
+        cls.receiver = HTTPServer(("127.0.0.1", cls.cb_port), Receiver)
+        threading.Thread(target=cls.receiver.serve_forever, daemon=True).start()
+        cls.port = free_port()
+        cls.token = "test-token-123"
+        cls.home.mkdir()
+        (cls.home / "bridge.secret.json").write_text(json.dumps({
+            "port": cls.port, "token": cls.token, "workspace": str(cls.ws),
+            "claude_bin": str(FAKE), "callback_url": f"http://127.0.0.1:{cls.cb_port}/cb",
+            "allowed_projects": ["demo", "demo2", "demo3", "demo4", "demo5"],
+            "watchdog_interval": 0, "auto_resume_delays": [0, 0, 0],
+            "telegram": {"bot_token": "", "allowed_chat_ids": ["42"]}}))
+        env = dict(os.environ, ORKESTRA_HOME=str(cls.home), ORKESTRA_WORKSPACE=str(cls.ws))
+        cls.proc = subprocess.Popen([sys.executable, str(BRIDGE), "serve"], env=env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, text=True)
+        for _ in range(50):
+            try:
+                urllib.request.urlopen(f"http://127.0.0.1:{cls.port}/health", timeout=1)
+                break
+            except Exception:
+                time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait(timeout=10)
+        cls.receiver.shutdown()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def call(self, method, path, body=None, token=True):
+        req = urllib.request.Request(f"http://127.0.0.1:{self.port}{path}", method=method,
+                                     data=json.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"})
+        if token:
+            req.add_header("Authorization", f"Bearer {self.token}")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, json.loads(r.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"{}")
+
+    def wait_status(self, job_id, want, timeout=30):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            code, job = self.call("GET", f"/jobs/{job_id}")
+            if job.get("status") == want:
+                return job
+            time.sleep(0.2)
+        self.fail(f"job {job_id} never reached {want}; last: {job}")
+
+    def test_1_health_and_auth(self):
+        self.assertEqual(urllib.request.urlopen(f"http://127.0.0.1:{self.port}/health").status, 200)
+        self.assertEqual(self.call("GET", "/jobs", token=False)[0], 401)
+        self.assertEqual(self.call("POST", "/jobs", {"project": "demo", "request": "x"}, token=False)[0], 401)
+
+    def test_2_project_validation(self):
+        for bad in ("../etc", "/etc", "nope", "", "a b"):
+            code, body = self.call("POST", "/jobs", {"project": bad, "request": "bir şey yap"})
+            self.assertEqual(code, 400, (bad, body))
+
+    def test_3_job_lifecycle(self):
+        code, job = self.call("POST", "/jobs", {"project": "demo", "request": "öncelik ekle", "chat_id": "42"})
+        self.assertEqual(code, 202, job)
+        job = self.wait_status(job["id"], "awaiting_user")
+        self.assertIn("Varsayılan öncelik", job["last_message"])
+        self.assertEqual(job["phase"], "intake")
+        # a second job for the same project is refused while one is open
+        code, body = self.call("POST", "/jobs", {"project": "demo", "request": "başka iş"})
+        self.assertEqual(code, 400)
+        self.assertIn("açık bir iş", body["error"])
+        # callback delivered
+        deadline = time.time() + 5
+        while time.time() < deadline and not Receiver.got:
+            time.sleep(0.1)
+        self.assertTrue(any(p.get("id") == job["id"] and "Yanıtını bekliyor" in p.get("message", "") for p in Receiver.got))
+        # reply by chat id → fake claude blocks the run → status maps to blocked
+        code, _ = self.call("POST", "/reply", {"chat_id": "42", "text": "engelle"})
+        self.assertEqual(code, 202)
+        self.wait_status(job["id"], "blocked")
+        code, listing = self.call("GET", "/jobs?chat_id=42")
+        self.assertTrue(any(j["id"] == job["id"] for j in listing["jobs"]))
+
+    def test_4_telegram_command_language(self):
+        code, body = self.call("POST", "/telegram", {"chat_id": "42", "text": "/yap"})
+        self.assertEqual(code, 200)
+        self.assertIn("Kullanım", body["message"])
+        code, body = self.call("POST", "/telegram", {"chat_id": "42", "text": "/durum"})
+        self.assertEqual(code, 200)
+        self.assertIn("Canlı çalışmalar", body["message"])
+        code, body = self.call("GET", "/runs")
+        self.assertEqual(code, 200)
+        self.assertIsInstance(body["runs"], list)
+        self.assertEqual(self.call("GET", "/runs", token=False)[0], 401)
+        code, body = self.call("POST", "/telegram", {"chat_id": "999", "text": "/durum"})
+        self.assertEqual(code, 403)
+        code, body = self.call("POST", "/telegram", {"chat_id": "42", "text": "/yap ../etc kötü"})
+        self.assertIn("Başlatılamadı", body["message"])
+
+
+    def test_5_dash_reply_and_allowlist(self):
+        code, body = self.call("POST", "/jobs", {"project": "secret-proj", "request": "bir şey yap"})
+        self.assertEqual(code, 400)
+        self.assertIn("allowed_projects", body["error"])
+        code, job = self.call("POST", "/jobs", {"project": "demo2", "request": "öncelik ekle", "chat_id": "77"})
+        self.assertEqual(code, 202)
+        self.wait_status(job["id"], "awaiting_user")
+        code, _ = self.call("POST", f"/jobs/{job['id']}/reply", {"text": "- T2'yi çıkar"})
+        self.assertEqual(code, 202)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            j = self.call("GET", f"/jobs/{job['id']}")[1]
+            if "devam ediyorum: - T2" in (j.get("last_message") or ""):
+                break
+            time.sleep(0.2)
+        self.assertIn("devam ediyorum: - T2", j.get("last_message"))
+
+
+    def test_6_client_cli(self):
+        client = HERE.parent / "orkestra_client.py"
+        env = dict(os.environ, ORKESTRA_HOME=str(self.home))
+        def run(*a):
+            return subprocess.run([sys.executable, str(client), *a], capture_output=True, text=True, env=env)
+        cp = run("start", "demo3", "bir", "şey", "yap", "--chat-id", "55", "--source", "openclaw")
+        self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+        job = json.loads(cp.stdout)
+        out = run("wait", job["id"], "--timeout", "30").stdout
+        self.assertIn("awaiting_user", out)
+        self.assertEqual(run("status", job["id"]).returncode, 0)
+        self.assertEqual(run("start").returncode, 2)
+        cp = run("runs")
+        self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+        self.assertIn("demo3", cp.stdout)
+        self.assertIsInstance(json.loads(run("runs", "--json").stdout)["runs"], list)
+
+    def test_7_stalled_job_is_resumed_on_the_same_session(self):
+        code, job = self.call("POST", "/jobs", {"project": "demo4", "request": "öncelik ekle", "chat_id": "81"})
+        self.assertEqual(code, 202, job)
+        self.wait_status(job["id"], "awaiting_user")
+        sid_before = json.loads((self.home / "bridge" / "jobs" / f"{job['id']}.json").read_text())["session_id"]
+        # the next turn ends while the run is still active → the bridge continues it by itself with /orkestra:resume
+        self.assertEqual(self.call("POST", f"/jobs/{job['id']}/reply", {"text": "takıl"})[0], 202)
+        deadline = time.time() + 30
+        j = {}
+        while time.time() < deadline:
+            j = json.loads((self.home / "bridge" / "jobs" / f"{job['id']}.json").read_text())
+            if j.get("status") == "awaiting_user" and "kaldığım yerden" in (j.get("last_message") or ""):
+                break
+            time.sleep(0.2)
+        self.assertIn("kaldığım yerden devam ettim", j.get("last_message") or "", j)
+        prompts = [t["prompt"] for t in j["turns"]]
+        self.assertEqual(prompts[-2:], ["takıl", "/orkestra:resume"], prompts)
+        self.assertEqual(j["session_id"], sid_before)          # same session: nothing runs twice in parallel
+        self.assertEqual(j.get("auto_resumes"), 1)
+
+    def test_8_auto_resume_is_capped_and_then_asks_the_user(self):
+        code, job = self.call("POST", "/jobs", {"project": "demo5", "request": "öncelik ekle", "chat_id": "82"})
+        self.assertEqual(code, 202, job)
+        self.wait_status(job["id"], "awaiting_user")
+        self.assertEqual(self.call("POST", f"/jobs/{job['id']}/reply", {"text": "hep takıl"})[0], 202)
+        deadline = time.time() + 40
+        j = {}
+        while time.time() < deadline:
+            j = json.loads((self.home / "bridge" / "jobs" / f"{job['id']}.json").read_text())
+            if j.get("status") == "awaiting_user" and "sınırı aşıldı" in (j.get("last_message") or ""):
+                break
+            time.sleep(0.2)
+        self.assertIn("Otomatik devam sınırı aşıldı", j.get("last_message") or "", j)
+        prompts = [t["prompt"] for t in j["turns"]]
+        self.assertEqual(prompts.count("/orkestra:resume"), 3, prompts)     # default max_auto_resumes
+        # a human reply starts a fresh budget (the run stalls again here, so it is continued again — up to the cap)
+        self.assertEqual(self.call("POST", f"/jobs/{job['id']}/reply", {"text": "devam"})[0], 202)
+        deadline = time.time() + 30
+        n = 0
+        while time.time() < deadline and n < 6:
+            j = json.loads((self.home / "bridge" / "jobs" / f"{job['id']}.json").read_text())
+            n = [t["prompt"] for t in j["turns"]].count("/orkestra:resume")
+            time.sleep(0.2)
+        self.assertEqual(n, 6)
+
+    def test_9_a_cancel_during_the_turn_end_wins(self):
+        """Reading the run state at turn end takes a subprocess: a cancel in that window must not be overwritten."""
+        code = ("import json, sys; sys.path.insert(0, sys.argv[1]); import orkestra_bridge as B\n"
+                "job = {'id': 'aaaa11112222', 'status': 'running', 'turns': [{'at': 'x', 'prompt': 'p'}], 'project': 'demo'}\n"
+                "B.save_job(job)\n"
+                "B.save_job(dict(job, status='cancelled'))\n"
+                "late = dict(job, status='running', auto_resumes=1)\n"
+                "print(json.dumps([B._save_unless_cancelled(late), B.load_job('aaaa11112222')['status'],\n"
+                "                  B._save_unless_cancelled(dict(job, id='bbbb11112222', status='awaiting_user')),\n"
+                "                  B.load_job('bbbb11112222')['status']]))\n")
+        home = self.tmp / "home-race"
+        home.mkdir(exist_ok=True)
+        cp = subprocess.run([sys.executable, "-c", code, str(BRIDGE.parent)], capture_output=True, text=True,
+                            env=dict(os.environ, ORKESTRA_HOME=str(home), ORKESTRA_WORKSPACE=str(self.ws)))
+        self.assertEqual(cp.returncode, 0, cp.stderr)
+        self.assertEqual(json.loads(cp.stdout.strip().splitlines()[-1]), [False, "cancelled", True, "awaiting_user"])
+
+
+if __name__ == "__main__":
+    unittest.main()

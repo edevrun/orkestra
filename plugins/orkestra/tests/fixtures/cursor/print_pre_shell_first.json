@@ -1,0 +1,21 @@
+{
+ "conversation_id": "3b5ee6db-ee24-4fb9-8d00-3d189f8daccf",
+ "generation_id": "3b5ee6db-ee24-4fb9-8d00-3d189f8daccf",
+ "model": "default",
+ "tool_name": "Shell",
+ "tool_input": {
+  "command": "orkestra playbook run",
+  "cwd": "",
+  "timeout": 30000
+ },
+ "tool_use_id": "901fb5e2-9b3d-4461-866f-c5d10c83b9ed",
+ "cwd": "",
+ "session_id": "3b5ee6db-ee24-4fb9-8d00-3d189f8daccf",
+ "hook_event_name": "preToolUse",
+ "cursor_version": "2026.10.01-14929f9",
+ "workspace_roots": [
+  "/private/tmp/orkestra-e2e/ws/demo"
+ ],
+ "user_email": "user@example.com",
+ "transcript_path": null
+}

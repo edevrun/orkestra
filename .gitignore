@@ -1,0 +1,35 @@
+# Per-project runtime state and local credentials
+.orkestra/
+bridge.secret.json
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+/.claude/settings.local.json
+
+# Python bytecode, environments, and test/analysis output
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Node dependencies and npm logs
+node_modules/
+npm-debug.log*
+
+# Local OS/editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Repository policy: release bundles and private notes stay local
+/dist/
+/internal/

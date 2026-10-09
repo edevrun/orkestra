@@ -1,0 +1,21 @@
+{
+ "conversation_id": "3b5ee6db-ee24-4fb9-8d00-3d189f8daccf",
+ "generation_id": "4adbb0e9-7aee-4ca6-afa3-a58732249410",
+ "model": "",
+ "tool_name": "Task",
+ "tool_input": {
+  "description": "T001 implement sub",
+  "prompt": "project: /private/tmp/orkestra-e2e/ws/demo\nFollow your protocol; reply in ≤ 6 lines.\n\n# Task brief — T001 · run 001-add-sub-function · project demo (/private/tmp/orkestra-e2e/ws/demo)\nartifacts: /private/tmp/orkestra-e2e/ws/demo/.orkestra/features/001-add-sub-function  (context.md has the code map; read only what you need)\n## Global constraints\n- Mevcut public API/davranış bozulmaz (baseline gate'leri yeşil kalır).\n- İstek dışı refactor, format değişikliği, bağımlılık yok.\n- Kod yorumları İngilizce; kullanıcıya dönük metinler projenin dilinde.\n## Boundaries (spec)\n- Her zaman: AGENTS.md (stdlib only, unittest); mevcut `add` davranışı; minimal diff\n- Asla: commit/push/deploy; istek dışı refactor/bağımlılık; test silme/zayıflatma\n## Task\n### T001 — Add sub with test\n- Dosyalar: `calc.py` (değişir), `tests/test_calc.py` (değişir)\n- Bağımlı: —\n- Kabul: Given `calc` modülü When `sub(5, 3)` çağrılır Then `2` döner; `test_sub` geçer; mevcut `test_add` geçer (FR-001, FR-002, SC-001, SC-002, E1–E3)\n- Test: `python3 -m unittest tests.test_calc -q`\n- TDD: required\n## Referenced requirements\n- **FR-001**: Sistem `sub(a, b)` fonksiyonunu `calc` modülünden export MUST; dönüş değeri `a - b` MUST.\n- **FR-002**: Sistem `sub` için unittest MUST; mevcut `add` testleri bozulmamalı.\n- **SC-001**: `sub(5, 3)` → `2` (ve benzeri temel örnekler testte doğrulanır).\n- **SC-002**: `python3 -m unittest discover -s tests -q` PASS.\n| E1 | Negatif sonuç | sub(3, 5) | -2 | FR-001 |\n| E2 | Sıfır | sub(4, 4) | 0 | FR-001 |\n| E3 | Mevcut add korunur | add(2, 3) | 5 | FR-002 |\n## Gates\nunit=`python3 -m unittest discover -s tests -q`\n## Report file\n/private/tmp/orkestra-e2e/ws/demo/.orkestra/features/001-add-sub-function/tasks/T001.report.md",
+  "subagent_type": "orkestra-implementer",
+  "run_in_background": false
+ },
+ "tool_use_id": "call-174d37d8-f721-41a9-bcc0-a6ca0e7887fd-28\nfc_8a36fc90-e44e-98eb-9d24-72cb85db87da_0",
+ "session_id": "3b5ee6db-ee24-4fb9-8d00-3d189f8daccf",
+ "hook_event_name": "preToolUse",
+ "cursor_version": "2026.10.01-14929f9",
+ "workspace_roots": [
+  "/private/tmp/orkestra-e2e/ws/demo"
+ ],
+ "user_email": "user@example.com",
+ "transcript_path": "/Users/u/.cursor/projects/private-tmp-orkestra-e2e-ws-demo/agent-transcripts/3b5ee6db-ee24-4fb9-8d00-3d189f8daccf/3b5ee6db-ee24-4fb9-8d00-3d189f8daccf.jsonl"
+}

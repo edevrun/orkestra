@@ -1,0 +1,80 @@
+{
+  "name": "Orkestra · Bildirimler (callback)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "orkestra-callback",
+        "responseMode": "onReceived",
+        "options": {}
+      },
+      "id": "483a11d0-9520-4d19-8555-77be54164654",
+      "name": "Webhook: POST /orkestra-callback",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        0
+      ],
+      "webhookId": "d6dc0564-5146-4304-85ff-4f3caf43915c"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalizes the bridge callback for any channel node that follows (Telegram, Slack, e-mail ...)\nconst b = $input.first().json.body || {};\nreturn [{ json: {\n  chat_id: b.chat_id || null,\n  status: b.status,\n  project: b.project,\n  phase: b.phase || null,\n  job_id: b.id,\n  text: String(b.message || '').slice(0, 3800),\n  needs_user: b.status === 'awaiting_user'\n} }];"
+      },
+      "id": "c9623e31-cf1e-4630-b7ca-c506f722fc09",
+      "name": "Mesajı hazırla",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chat_id || '__TELEGRAM_CHAT_ID__' }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "disable_web_page_preview": true
+        }
+      },
+      "id": "e9121fca-40bb-46eb-8b4a-37596d6a2da4",
+      "name": "Telegram'a gönder (kimlik bilgisi seçip etkinleştir)",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        40,
+        0
+      ],
+      "disabled": true
+    }
+  ],
+  "connections": {
+    "Webhook: POST /orkestra-callback": {
+      "main": [
+        [
+          {
+            "node": "Mesajı hazırla",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mesajı hazırla": {
+      "main": [
+        [
+          {
+            "node": "Telegram'a gönder (kimlik bilgisi seçip etkinleştir)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

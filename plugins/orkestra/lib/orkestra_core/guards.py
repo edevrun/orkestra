@@ -1,0 +1,1268 @@
+"""Guard policy engine (pure functions, unit-tested). Hooks call `pre_tool_decision`.
+
+Global guards (every session where the plugin is enabled, toggle in ~/.orkestra/config.json):
+  git      git/gh writes only when the user's CURRENT prompt asks for them
+  secrets  no reading/writing of secret files (.env, *.p8, SA keys, private keys ...)
+  store    no EAS/expo.dev cloud build/submit/update (user rule 06)
+
+Run guards (only for a session bound to an active orkestra run):
+  internals  .orkestra/runs/** is CLI-only; spec.md is frozen after approval
+  roles      read-only agents write only inside the feature folder; CLI subcommands by role
+  phase      no source edits before the plan is approved
+  isolation  no writes outside the run's project (temp dirs excepted)
+  deps       no new dependency unless listed in plan `approved_dependencies`
+  deploy     no deploy / publish / prod-migration / remote commands
+  wait       the main session does not sleep/poll for subagent reports (they arrive as messages)
+  dialogs    no command that opens a macOS system dialog on the user's screen
+"""
+from __future__ import annotations
+
+import fnmatch
+import os
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+
+from . import cliparse as CP
+from . import shellparse as sp
+from .gates import normalize_pkg
+from .paths import is_headless, orkestra_home
+from .util import is_relative_to, resolve_path
+
+WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+READ_TOOLS = {"Read"}
+
+PRE_APPROVAL_PHASES = {"intake", "discover", "clarify", "plan", "approve"}
+CODE_PHASES = {"implement", "verify", "review", "deliver"}
+
+AGENT_PREFIX = "orkestra:"
+READONLY_AGENTS = {"scout", "researcher", "architect", "plan-critic", "reviewer", "adversary", "verifier"}
+IMPLEMENTER = "implementer"
+
+# orkestra CLI subcommands each role may run (main session may run everything)
+CLI_ALLOWED = {
+    "implementer": {"context", "status", "brief", "tdd", "task:start", "task:note", "gate:run", "gate:list", "gate:last",
+                    "evidence", "integrity:check", "next", "tempo",
+                    "changes", "diff", "plan:check", "deps:check", "doctor", "help", "version", "template",
+                    "playbook", "memory:show"},
+    "readonly": {"context", "status", "brief", "changes", "diff", "gate:run", "gate:list", "trace:check",
+                 "deps:check", "plan:check", "review:check", "doctor", "help", "version", "template", "playbook",
+                 "memory:show", "gate:last", "evidence", "integrity:check", "report:evidence", "next", "tempo",
+                 "task:list", "integrity", "phase:show", "phase:check"},
+}
+
+SECRET_GLOBS = [
+    ".env", ".env.*", "*.pem", "*.key", "*.p8", "*.p12", "*.pfx", "*.keystore", "*.jks", "*.ppk",
+    "id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".netrc", "_netrc", ".pgpass", "credentials.json",
+    "*service-account*.json", "*service_account*.json", "*serviceaccount*.json", "gen-lang-client-*.json",
+    "*.secret", "*.secrets", "*.secret.json", "secrets.json", "secrets.yml", "secrets.yaml", ".dev.vars", "*.tfvars",
+    "*.mobileprovision", "*.env", ".envrc", "key.properties", "keystore.properties", ".git-credentials", ".pypirc",
+    "*/.aws/credentials", "*/.aws/config", "*/gh/hosts.yml", "*/.docker/config.json", "*.kdbx", "*.secret.json",
+]
+SECRET_ALLOW_GLOBS = [".env.example", ".env.sample", ".env.template", ".env.dist", ".env.defaults",
+                      ".env.*.example", ".env.*.sample", "*.env.example", "*.env.sample", "example.env", "sample.env",
+                      "*.pub", "*.example.json", "*.tfvars.example"]
+CONTENT_DUMPERS = {
+    "cat", "less", "more", "head", "tail", "bat", "batcat", "strings", "xxd", "od", "hexdump", "base64",
+    "nl", "tac", "sed", "gsed", "awk", "gawk", "grep", "egrep", "fgrep", "rg", "ag", "cut", "sort", "uniq",
+    "jq", "yq", "python", "python3", "node", "ruby", "perl", "source", ".", "cp", "scp", "rsync", "curl",
+    "wget", "openssl", "pbcopy", "xclip", "diff", "cmp", "vim", "vi", "nano", "code", "open", "dotenv",
+    "printenv", "plutil", "security", "zip", "tar", "gpg", "iconv", "column", "paste", "fold", "tr",
+}
+
+TEMP_PREFIXES = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/", "/dev/")
+
+
+@dataclass
+class Decision:
+    action: str = "allow"          # allow | deny
+    reason: str = ""
+    guard: str = ""
+
+    @property
+    def denied(self) -> bool:
+        return self.action == "deny"
+
+
+ALLOW = Decision()
+
+
+def deny(guard: str, reason: str) -> Decision:
+    return Decision("deny", reason, guard)
+
+
+# ====================================================================== helpers
+
+def _is_temp(p: str) -> bool:
+    tmpdir = os.environ.get("TMPDIR", "").rstrip("/")
+    return p.startswith(TEMP_PREFIXES) or p == "/dev/null" \
+        or (bool(tmpdir) and p.casefold().startswith(tmpdir.casefold() + "/"))     # paths may arrive case-folded
+
+
+def _is_temp_subdir(base: str) -> bool:
+    """A directory strictly BELOW a temp root (`/tmp/x`, not `/tmp` itself): `rm -rf /tmp/*` is not a scratch write."""
+    b = base.rstrip("/").casefold() + "/"
+    roots = [r for r in TEMP_PREFIXES if r != "/dev/"]
+    tmpdir = os.environ.get("TMPDIR", "")
+    if tmpdir:
+        roots.append(tmpdir.rstrip("/").casefold() + "/")
+    return any(b.startswith(r) and len(b) > len(r) for r in roots)
+
+
+def is_secret_path(path: str, extra: Iterable[str] = (), allow: Iterable[str] = ()) -> bool:
+    if not path:
+        return False
+    path = path.lower()                 # macOS volumes are case-insensitive: `.ENV` opens `.env`
+    base = os.path.basename(path.rstrip("/"))
+    if not base:
+        return False
+    for g in list(SECRET_ALLOW_GLOBS) + list(allow):
+        if fnmatch.fnmatch(base, g.lower()) or fnmatch.fnmatch(path, g.lower()):
+            return False
+    for g in list(SECRET_GLOBS) + list(extra):
+        if fnmatch.fnmatch(base, g.lower()) or fnmatch.fnmatch(path, g.lower()):
+            return True
+    return False
+
+
+def looks_like_token_file(path: Path) -> bool:
+    """.npmrc / .yarnrc.yml with auth tokens."""
+    try:
+        if path.name not in (".npmrc", ".yarnrc", ".yarnrc.yml") or not path.is_file() or path.stat().st_size > 65536:
+            return False
+        txt = path.read_text(encoding="utf-8", errors="ignore")
+        return "_auth" in txt or "npmAuthToken" in txt or "password" in txt.lower()
+    except Exception:
+        return False
+
+
+def looks_like_sa_key(path: Path) -> bool:
+    try:
+        if path.suffix.lower() != ".json" or not path.is_file() or path.stat().st_size > 262144:
+            return False
+        head = path.read_text(encoding="utf-8", errors="ignore")
+        return '"private_key"' in head and ("BEGIN PRIVATE KEY" in head or '"client_email"' in head)
+    except Exception:
+        return False
+
+
+def _agent_role(event: Dict[str, Any]) -> Optional[str]:
+    at = event.get("agent_type") or ""
+    if not at:
+        return None
+    if at.startswith(AGENT_PREFIX):
+        name = at[len(AGENT_PREFIX):]
+        if name == IMPLEMENTER:
+            return "implementer"
+        if name in READONLY_AGENTS:
+            return "readonly"
+        return "other"
+    return "foreign"  # some other plugin's / built-in subagent (Explore, Plan, general-purpose)
+
+
+def _tool_paths(event: Dict[str, Any]) -> List[str]:
+    ti = event.get("tool_input") or {}
+    out = []
+    for key in ("file_path", "notebook_path", "path"):
+        v = ti.get(key)
+        if isinstance(v, str) and v:
+            out.append(v)
+    return out
+
+
+# ---------------------------------------------------------------- bash write detection
+
+FORMATTERS = {
+    "prettier": lambda a: "--write" in a or "-w" in a,
+    "eslint": lambda a: "--fix" in a,
+    "ruff": lambda a: "--fix" in a or (a[:1] == ["format"] and "--check" not in a and "--diff" not in a),
+    "black": lambda a: "--check" not in a and "--diff" not in a,
+    "isort": lambda a: "--check" not in a and "--check-only" not in a and "--diff" not in a,
+    "gofmt": lambda a: "-w" in a,
+    "goimports": lambda a: "-w" in a,
+    "rustfmt": lambda a: "--check" not in a,
+    "swiftformat": lambda a: "--lint" not in a,
+    "clang-format": lambda a: "-i" in a,
+    "rubocop": lambda a: "-a" in a or "-A" in a or "--autocorrect" in a,
+    "ktlint": lambda a: "-F" in a or "--format" in a,
+    "biome": lambda a: "--write" in a or "--apply" in a or (a[:1] == ["format"] and "--check" not in a),
+    "dprint": lambda a: a[:1] == ["fmt"],
+}
+
+
+def with_cwd(segs: List[sp.Segment], cwd: str) -> List[Tuple[sp.Segment, str]]:
+    """Pair each segment with the working directory it runs in (follows `cd`/`pushd` within the command)."""
+    out: List[Tuple[sp.Segment, str]] = []
+    cur = cwd
+    for seg in segs:
+        out.append((seg, cur))
+        if seg.program in ("cd", "pushd"):
+            args = [x for x in seg.args if not x.startswith("-")]
+            if not args:
+                cur = str(Path.home()) if seg.program == "cd" else cur
+            elif args[0] != "-":
+                cur = str(resolve_path(args[0], cur))
+    return out
+
+
+def bash_write_targets(seg: sp.Segment, cwd: str) -> List[str]:
+    """Best-effort list of absolute paths a segment writes. "<cwd>/*" means 'unknown files under cwd'."""
+    targets: List[str] = []
+    for op, target in seg.redirects:
+        if op in (">", ">>", ">|", "&>", "&>>", "<>", ">&") and target and target != "/dev/null" \
+                and not target.startswith("/dev/"):          # `>& file` writes it too (`>&2` never gets here)
+            targets.append(target)
+    prog, a = seg.program, seg.args
+    pos = sp.positional(a)
+    if prog == "tee":
+        targets += pos
+    elif prog in ("sed", "gsed") and any(x == "-i" or x.startswith("-i") or x.startswith("--in-place") for x in a):
+        uses_e = any(x in ("-e", "--expression", "-f", "--file") for x in a)
+        a2 = list(a)
+        for i, x in enumerate(a2[:-1]):          # BSD/macOS `sed -i '' …`: the empty backup suffix is not a file
+            if x == "-i" and a2[i + 1] == "":
+                del a2[i + 1]
+                break
+        files = sp.positional(a2, ("-e", "--expression", "-f", "--file"))
+        targets += files if uses_e else files[1:]
+    elif prog == "perl" and any(re.match(r"^-\w*i", x) for x in a):
+        files = sp.positional(a, ("-e", "-E"))
+        targets += files
+    elif prog in ("rm", "rmdir", "unlink", "shred", "touch", "truncate", "mkdir"):
+        targets += pos
+    elif prog == "mv":
+        targets += pos
+    elif prog in ("cp", "rsync", "install", "ln", "ditto"):
+        if len(pos) >= 2:
+            targets.append(pos[-1])
+    elif prog == "dd":
+        targets += [x[3:] for x in a if x.startswith("of=")]
+    elif prog in ("patch",) or (prog == "git" and a[:1] == ["apply"]):
+        targets.append("*")
+    elif prog in FORMATTERS and FORMATTERS[prog](a):
+        files = [p for p in pos if not p.startswith(("format", "check", "fmt"))]
+        targets += files or ["*"]
+    elif prog == "cargo" and a[:1] == ["fmt"] and "--check" not in a:
+        targets.append("*")
+    elif prog in ("dart", "flutter") and a[:1] == ["format"] and "--output=none" not in a and "--set-exit-if-changed" not in a:
+        targets.append("*")
+    elif prog == "go" and a[:1] == ["fmt"]:
+        targets.append("*")
+    out = []
+    for t in targets:
+        if t == "*":
+            out.append(str(Path(cwd).resolve(strict=False)) + "/*")
+        elif t and not t.startswith("-"):
+            out.append(str(resolve_path(t, cwd)))
+    return out
+
+
+# ====================================================================== global guards
+
+def secrets_guard(event: Dict[str, Any], cfg: Dict[str, Any], segs: List[sp.Segment]) -> Decision:
+    sconf = cfg.get("secrets") or {}
+    extra, allow = sconf.get("extra_patterns") or [], sconf.get("allow") or []
+    tool = event.get("tool_name")
+    cwd = event.get("cwd") or os.getcwd()
+    msg = ("Secret file access is blocked by orkestra (secrets guard). Do not read, write, move or delete credentials. "
+           "Use the matching *.example file, ask the user for the variable NAME only, or ask the user to edit the file "
+           "themselves.")
+
+    def sniff(path: Path) -> bool:
+        return (looks_like_sa_key(path) or looks_like_token_file(path)) and not any(fnmatch.fnmatch(str(path), g) for g in allow)
+
+    if tool in WRITE_TOOLS or tool in READ_TOOLS or tool == "Grep":
+        for p in _tool_paths(event):
+            rp = str(resolve_path(p, cwd))
+            if is_secret_path(rp, extra, allow):
+                return deny("secrets", f"{msg} Path: {p}")
+            if tool in READ_TOOLS and sniff(Path(rp)):
+                return deny("secrets", f"{msg} Path contains credentials: {p}")
+        if tool == "Grep":
+            g = ((event.get("tool_input") or {}).get("glob") or "").strip()
+            samples = (".env", ".env.local", ".env.production", "prod.env", "key.pem", "AuthKey_X.p8", "id_rsa")
+            last = g.split("/")[-1]
+            # `dir/**`, `*`, `*.*` match everything: they do not TARGET secret files (the search still skips them)
+            if g and g.strip("*/{}") and any(fnmatch.fnmatch(x, last) for x in samples) \
+                    and ".example" not in g and last != "*.*" and set(last) != {"*"}:
+                return deny("secrets", f"{msg} Grep glob targets secret files: {g}")
+    if tool == "Bash":
+        for seg, scwd in with_cwd(segs, cwd):
+            for t in bash_write_targets(seg, scwd):
+                if not t.endswith("/*") and is_secret_path(t, extra, allow):
+                    return deny("secrets", f"{msg} Command would write/move/delete: {t}")
+            if seg.program not in CONTENT_DUMPERS:
+                continue
+            for tok in seg.args + [t for op, t in seg.redirects if op == "<"]:
+                if tok.startswith("-") and "=" not in tok:
+                    continue
+                val = tok.split("=", 1)[1] if tok.startswith("-") else tok
+                val = val.lstrip("@")
+                if is_secret_path(val, extra, allow):
+                    return deny("secrets", f"{msg} Command touches: {val}")
+                if (val.endswith(".json") or os.path.basename(val).startswith((".npmrc", ".yarnrc"))) and \
+                        sniff(resolve_path(val, scwd)):
+                    return deny("secrets", f"{msg} Command touches a credentials file: {val}")
+    return ALLOW
+
+
+def home_guard(event: Dict[str, Any], segs: List[sp.Segment]) -> Decision:
+    """~/.orkestra (guard config, grants, bindings) is never written by the model."""
+    home = orkestra_home().resolve(strict=False)
+    cwd = event.get("cwd") or os.getcwd()
+    tool = event.get("tool_name")
+    msg = ("~/.orkestra holds orkestra's guard configuration, permission grants and run bindings. The model must not "
+           "change it — ask the user to edit it if a guard needs adjusting.")
+    if tool in WRITE_TOOLS:
+        for p in _tool_paths(event):
+            if is_relative_to(resolve_path(p, cwd), home):
+                return deny("home", msg)
+    if tool == "Bash":
+        for seg, scwd in with_cwd(segs, cwd):
+            if seg.program == "orkestra":
+                continue
+            for t in bash_write_targets(seg, scwd):
+                if is_relative_to(Path(t.rstrip("/*")), home):
+                    return deny("home", msg)
+            if seg.program in ("python", "python3", "node", "ruby", "perl", "bash", "sh", "zsh") and \
+                    re.search(r"\.orkestra/(config\.json|grants|sessions|active-runs)", seg.raw) and \
+                    re.search(r"open\(|write|unlink|rename|replace|remove|rm\b|>", seg.raw):
+                return deny("home", msg)
+    return ALLOW
+
+
+GIT_READ_SUBS = {
+    "", "status", "diff", "log", "show", "blame", "grep", "ls-files", "ls-tree", "ls-remote", "rev-parse",
+    "rev-list", "describe", "fetch", "cat-file", "shortlog", "whatchanged", "check-ignore", "check-attr",
+    "merge-base", "name-rev", "count-objects", "fsck", "var", "help", "version", "--version", "archive",
+    "format-patch", "diff-tree", "diff-files", "diff-index", "for-each-ref", "show-ref", "verify-commit",
+    "verify-tag", "cherry", "range-diff", "show-branch", "annotate", "difftool", "clone", "init",
+    "check-ref-format", "hash-object", "maintenance", "lfs",
+}
+GIT_ALWAYS_DENY = {"filter-branch", "filter-repo", "update-ref", "replace", "gc", "prune", "update-index",
+                   "fast-import", "commit-tree", "write-tree", "read-tree", "symbolic-ref:write", "config:write",
+                   "remote:write", "reflog:write", "notes:write"}
+
+
+PROTECTED_BRANCH_RE = re.compile(r"(^\+?|:)(refs/heads/)?(main|master)$")
+
+
+def _git_subkind(call: sp.GitCall, ctx: Optional[Dict[str, Any]] = None) -> Tuple[str, Optional[str]]:
+    """Return (kind, needed_grant). kind: read | needs | forbidden.  needed_grant may be "a|b" (either)."""
+    ctx = ctx or {}
+    s, a = call.sub, call.args
+    pos = sp.positional(a)
+    shorts = sp.short_flags(a)
+    hooks_off = any("core.hookspath" in g.lower() for g in call.globals) or any("core.hookspath" in x.lower() for x in a)
+
+    if s in ("commit",):
+        if "--no-verify" in a or "n" in shorts or hooks_off:
+            return "forbidden", None
+        if "--amend" in a:
+            return "needs", "amend"
+        return "needs", "commit"
+    if s == "add":
+        return ("read", None) if ("n" in shorts or "--dry-run" in a) else ("needs", "commit")
+    if s == "push":
+        if "--no-verify" in a or hooks_off or "--mirror" in a or "--delete" in a or "d" in shorts \
+                or any(p.startswith(":") for p in pos) or "--prune" in a:
+            return "forbidden", None
+        forced = any(x.startswith("--force") for x in a) or "f" in shorts or any(p.startswith("+") for p in pos)
+        if forced:
+            refspecs = pos[1:] if len(pos) > 1 else []
+            if any(PROTECTED_BRANCH_RE.search(p) for p in refspecs):
+                return "forbidden", None
+            if not refspecs and ctx.get("current_branch") in ("main", "master", None):
+                return "forbidden", None
+            return "needs", "force"
+        if "--dry-run" in a or "n" in shorts:
+            return "read", None
+        return "needs", "push"
+    if s in ("merge", "rebase", "cherry-pick", "revert", "am", "pull"):
+        if any(x in ("--abort", "--quit", "--show-current-patch") for x in a):
+            return "read", None
+        return "needs", "sync"
+    if s == "branch":
+        mutating_flags = {"-d", "-D", "--delete", "-m", "-M", "--move", "-c", "-C", "--copy", "-f", "--force",
+                          "-u", "--set-upstream-to", "--unset-upstream", "--edit-description", "-t", "--track"}
+        listing = {"-l", "--list", "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current",
+                   "--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--column", "--no-column",
+                   "--color", "--no-color", "-q", "--quiet"}
+        if any(x in ("-D",) for x in a):
+            return "needs", "discard"
+        if any(x in mutating_flags or x.startswith(("--set-upstream-to=", "--track=")) for x in a):
+            return "needs", "branch"
+        listing_mode = any(x in ("-l", "--list") for x in a)
+        value_flags = ("--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format")
+        p2 = sp.positional(a, value_flags)
+        if p2 and not listing_mode:
+            return "needs", "branch"
+        _ = listing
+        return "read", None
+    if s in ("checkout", "switch"):
+        if "--" in a or "." in pos:
+            return "needs", "discard"
+        if any(x in ("-b", "-B", "-c", "-C", "--orphan", "--detach", "-f", "--force") for x in a):
+            return "needs", "branch"
+        target = "-" if "-" in a else (pos[0] if len(pos) == 1 else None)
+        existing = target is not None and (target == "-" or target in (ctx.get("branches") or []))
+        if existing and ctx.get("clean") and not ctx.get("bound"):
+            return "read", None  # switching to an existing branch with a clean tree, outside a run
+        return "needs", "branch|discard"
+    if s == "restore":
+        if all(x in ("--staged", "-S") or not x.startswith("-") for x in a) and ("--staged" in a or "-S" in a) \
+                and not ("--worktree" in a or "-W" in a):
+            return "needs", "commit"
+        return "needs", "discard"
+    if s == "reset":
+        if any(x in ("--hard", "--keep", "--merge") for x in a):
+            return "needs", "hard_reset"
+        if "--" in a or not pos:
+            return "needs", "commit"
+        return "needs", "discard"
+    if s == "clean":
+        return ("read", None) if ("n" in shorts or "--dry-run" in a) else ("needs", "hard_reset")
+    if s == "stash":
+        if a and a[0] in ("list", "show"):
+            return "read", None
+        if a and a[0] in ("drop", "clear"):
+            return "needs", "discard"
+        return "needs", "stash|discard"
+    if s == "tag":
+        listing = (not pos and not any(x in ("-d", "--delete", "-a", "-s", "-f", "-m", "-F", "-u") for x in a)) \
+            or any(x in ("-l", "--list") for x in a)
+        if listing:
+            return "read", None
+        return "needs", "tag"
+    if s in ("worktree", "submodule", "sparse-checkout", "bisect"):
+        if a and a[0] in ("list", "status", "summary"):
+            return "read", None
+        if s == "submodule" and a[:1] == ["update"] and "--remote" not in a:
+            return "read", None
+        if s == "bisect" and a[:1] in (["reset"], ["log"], ["view"], ["visualize"]):
+            return "read", None
+        if not a and s in ("submodule",):
+            return "read", None
+        return "needs", "branch"
+    if s in ("rm", "mv"):
+        if "--cached" in a and s == "rm":
+            return "needs", "commit"
+        return "needs", "commit"
+    if s == "apply":
+        return ("needs", "commit") if ("--cached" in a or "--index" in a) else ("read", None)
+    if s == "config":
+        read_flags = {"--get", "--get-all", "--get-regexp", "--list", "-l", "--show-origin", "--show-scope",
+                      "--get-urlmatch", "--name-only", "-z", "--null", "--global", "--local", "--system",
+                      "--worktree", "--includes", "--no-includes", "--type", "--bool", "--int", "--path"}
+        if all(x in read_flags or not x.startswith("-") for x in a) and len(sp.positional(a, ("--type", "--file", "-f"))) <= 1:
+            return "read", None
+        return "forbidden", None
+    if s == "remote":
+        if not a or a[0] in ("-v", "--verbose", "show", "get-url"):
+            return "read", None
+        return "forbidden", None
+    if s == "reflog":
+        if a and a[0] in ("expire", "delete"):
+            return "forbidden", None
+        return "read", None
+    if s == "notes":
+        return ("read", None) if (not a or a[0] in ("list", "show")) else ("needs", "commit")
+    if s == "symbolic-ref":
+        return ("read", None) if len(pos) <= 1 and "-d" not in a and "--delete" not in a else ("forbidden", None)
+    if s in ("filter-branch", "filter-repo", "update-ref", "replace", "update-index", "fast-import",
+             "commit-tree", "write-tree", "read-tree"):
+        return "forbidden", None
+    if s in ("gc", "prune"):
+        return ("forbidden", None) if any("prune" in x for x in a) or s == "prune" else ("read", None)
+    if s == "lfs":
+        return ("needs", "push") if (a[:1] == ["push"]) else ("read", None)
+    if s == "flow":
+        return "needs", "branch"
+    if s in GIT_READ_SUBS:
+        return "read", None
+    return "read", None  # unknown subcommand / alias: allowed (documented limitation)
+
+
+GH_READ = {
+    "pr": {"view", "list", "status", "diff", "checks"},
+    "issue": {"view", "list", "status"},
+    "run": {"view", "list", "watch", "download"},
+    "repo": {"view", "list", "clone"},
+    "release": {"view", "list", "download"},
+    "workflow": {"view", "list"},
+    "gist": {"view", "list", "clone"},
+    "label": {"list"},
+    "search": None, "browse": None, "auth": None, "status": None, "help": None, "version": None,
+    "cache": {"list"}, "ruleset": {"list", "view", "check"}, "extension": {"list"}, "codespace": {"list"},
+    "secret": {"list"}, "variable": {"list", "get"}, "project": {"list", "view"}, "org": {"list"},
+}
+
+
+def _gh_subkind(seg: sp.Segment) -> Tuple[str, Optional[str]]:
+    a = seg.args
+    while a and a[0].startswith("-"):
+        flag = a[0]
+        a = a[2:] if flag in ("-R", "--repo", "--hostname") and len(a) > 1 else a[1:]
+    if not a:
+        return "read", None
+    group = a[0]
+    sub = a[1] if len(a) > 1 else ""
+    if group == "api":
+        method = None
+        for i, x in enumerate(a):
+            if x in ("-X", "--method") and i + 1 < len(a):
+                method = a[i + 1].upper()
+            elif x.startswith("--method="):
+                method = x.split("=", 1)[1].upper()
+            elif x.startswith("-X") and len(x) > 2:
+                method = x[2:].upper()
+        has_fields = any(x in ("-f", "-F", "--field", "--raw-field", "--input") or x.startswith(("--field=", "--raw-field="))
+                         for x in a)
+        if (method in (None, "GET")) and not has_fields:
+            return "read", None
+        if method == "GET" and has_fields:
+            return "read", None
+        if a[1:2] == ["graphql"] and method in (None, "POST") and not re.search(r"\bmutation\b", " ".join(a), re.I):
+            return "read", None
+        return "needs", "gh_write"
+    allowed = GH_READ.get(group, set())
+    if allowed is None:
+        return "read", None
+    if group in ("secret", "variable") and sub not in (allowed or set()):
+        return "forbidden", None
+    if sub in (allowed or set()) or (not sub and group in GH_READ):
+        return "read", None
+    if group == "pr":
+        if sub == "checkout":
+            return "needs", "branch"
+        if sub == "merge":
+            return "needs", "sync"
+        return "needs", "pr"
+    return "needs", "gh_write"
+
+
+GRANT_HINT = {
+    "commit": "commit (e.g. 'commitle')", "push": "push (e.g. 'pushla')", "force": "force push",
+    "amend": "commit --amend", "branch": "branch create/switch (e.g. 'yeni branch aç')",
+    "pr": "PR (e.g. 'PR aç')", "gh_write": "a GitHub write", "discard": "discarding changes",
+    "sync": "merge/rebase/pull", "tag": "a tag", "stash": "stash (e.g. 'stashle')",
+    "hard_reset": "a hard reset / git clean (say 'reset --hard' or 'git clean' explicitly)",
+}
+
+
+def git_guard(event: Dict[str, Any], segs: List[sp.Segment], grants: Set[str]) -> Decision:
+    ctx = dict(event.get("_git_ctx") or {})
+    ctx.setdefault("bound", bool(event.get("_bound")))
+    for seg in segs:
+        call = sp.git_call(seg)
+        if call is not None:
+            kind, need = _git_subkind(call, ctx)
+            label = f"git {call.sub}".strip()
+        elif seg.program == "gh":
+            kind, need = _gh_subkind(seg)
+            label = "gh " + " ".join(seg.args[:2])
+        else:
+            continue
+        if kind == "read":
+            continue
+        if kind == "forbidden":
+            return deny("git", f"`{label}` is forbidden by orkestra (history/config-destroying, hook bypass, "
+                               f"force-push to main, or secret change). Ask the user to run it themselves if really needed.")
+        if need and not any(n in grants for n in need.split("|")):
+            hint = " or ".join(GRANT_HINT.get(n, n) for n in need.split("|"))
+            return deny("git", f"`{label}` needs explicit user permission in the CURRENT message "
+                               f"({hint}). Policy: no branch/commit/push unless the user asks. "
+                               f"Leave the changes in the working tree and tell the user they are ready to commit.")
+    return ALLOW
+
+
+def store_guard(segs: List[sp.Segment]) -> Decision:
+    for seg in segs:
+        prog, a = seg.program, seg.args
+        if any(x in ("--eas-cloud", "--auto-submit") for x in a):
+            return deny("store", "EAS/expo.dev cloud build/submit is forbidden (rule 06-local-store-release-only). "
+                                 "Use the project's local build + direct App Store Connect / Play scripts.")
+        if prog in ("eas", "eas-cli"):
+            sub = a[0] if a else ""
+            if sub in ("submit", "update", "deploy") or sub.startswith(("workflow", "submit:", "update:")) or sub == "build:internal" \
+                    or (sub == "build" and "--local" not in a):
+                return deny("store", f"`eas {sub}` (cloud) is forbidden (rule 06-local-store-release-only). "
+                                     f"Use `eas build --local` or the project's local build/submit scripts.")
+        if prog == "expo" and a[:1] == ["publish"]:
+            return deny("store", "`expo publish` (expo.dev) is forbidden (rule 06-local-store-release-only).")
+    return ALLOW
+
+
+# ====================================================================== run guards
+
+DEPLOY_PATTERNS: List[Tuple[str, Any]] = [
+    ("npm", lambda a: a[:1] == ["publish"] or (a[:1] in (["run"], ["run-script"]) and len(a) > 1 and re.match(r"^(deploy|release|publish|submit|ship)", a[1]))),
+    ("pnpm", lambda a: a[:1] in (["publish"], ["deploy"]) or (a[:1] == ["run"] and len(a) > 1 and re.match(r"^(deploy|release|publish|submit|ship)", a[1])) or (a[:1] and re.match(r"^(deploy|release|publish|submit|ship)", a[0]))),
+    ("yarn", lambda a: a[:1] in (["publish"], ["npm"]) or (a[:1] and re.match(r"^(deploy|release|publish|submit|ship)", a[0]))),
+    ("bun", lambda a: a[:1] == ["publish"] or (a[:1] == ["run"] and len(a) > 1 and re.match(r"^(deploy|release|publish|submit|ship)", a[1]))),
+    ("vercel", lambda a: not a or a[0] in ("deploy", "promote", "alias", "rollback", "redeploy", "--prod", "-p", "remove", "rm") or "--prod" in a),
+    ("netlify", lambda a: a[:1] in (["deploy"], ["sites:delete"])),
+    ("fly", lambda a: a[:1] and a[0] in ("deploy", "launch", "scale", "secrets", "destroy", "apps")),
+    ("flyctl", lambda a: a[:1] and a[0] in ("deploy", "launch", "scale", "secrets", "destroy", "apps")),
+    ("wrangler", lambda a: a[:1] and a[0] in ("deploy", "publish", "secret", "delete", "rollback")),
+    ("firebase", lambda a: a[:1] and a[0] in ("deploy", "hosting:disable", "functions:delete")),
+    ("gcloud", lambda a: "deploy" in a or "delete" in a),
+    ("aws", lambda a: any(x in a for x in ("deploy", "sync", "update-function-code", "update-service", "put-object", "delete-stack", "rm", "cp", "mv"))),
+    ("sam", lambda a: a[:1] and a[0] in ("deploy", "delete")),
+    ("serverless", lambda a: a[:1] and a[0] in ("deploy", "remove")),
+    ("sls", lambda a: a[:1] and a[0] in ("deploy", "remove")),
+    ("cdk", lambda a: a[:1] and a[0] in ("deploy", "destroy")),
+    ("terraform", lambda a: a[:1] and a[0] in ("apply", "destroy", "import", "taint")),
+    ("tofu", lambda a: a[:1] and a[0] in ("apply", "destroy", "import")),
+    ("pulumi", lambda a: a[:1] and a[0] in ("up", "destroy", "import")),
+    ("kubectl", lambda a: a[:1] and a[0] in ("apply", "delete", "create", "replace", "patch", "rollout", "scale", "set", "edit", "drain", "cordon")),
+    ("helm", lambda a: a[:1] and a[0] in ("install", "upgrade", "uninstall", "rollback", "delete")),
+    ("docker", lambda a: a[:1] == ["push"] or a[:2] == ["image", "push"] or "-H" in a or "--host" in a),
+    ("heroku", lambda a: bool(a) and not a[0].startswith(("logs", "apps:info", "config:get"))),
+    ("railway", lambda a: a[:1] and a[0] in ("up", "deploy", "down", "delete")),
+    ("shopify", lambda a: (a[:2] in (["app", "deploy"], ["app", "release"])) or (a[:2] in (["theme", "push"], ["theme", "publish"]))),
+    ("fastlane", lambda a: True),
+    ("xcrun", lambda a: a[:1] == ["altool"] or (a[:1] == ["notarytool"] and "submit" in a)),
+    ("prisma", lambda a: a[:2] in (["migrate", "deploy"], ["migrate", "reset"], ["db", "push"], ["db", "execute"])),
+    ("supabase", lambda a: a[:2] in (["db", "push"], ["db", "reset"]) or a[:1] == ["link"] or (a[:1] == ["functions"] and "deploy" in a)),
+    ("drizzle-kit", lambda a: a[:1] in (["push"], ["drop"])),
+    ("ssh", lambda a: True),
+    ("scp", lambda a: any(re.match(r"^[^/\s]+@?[^/\s]*:", x) for x in sp.positional(a))),
+    ("rsync", lambda a: any(re.match(r"^[^/\s]+@?[^/\s]*:", x) for x in sp.positional(a))),
+    ("sftp", lambda a: True),
+    ("lftp", lambda a: True),
+    ("make", lambda a: bool(a) and bool(re.match(r"^(deploy|release|publish|submit|ship)", a[0]))),
+]
+
+
+def deploy_guard(segs: List[sp.Segment]) -> Decision:
+    for seg in segs:
+        for prog, pred in DEPLOY_PATTERNS:
+            if seg.program == prog:
+                try:
+                    hit = bool(pred(seg.args))
+                except Exception:
+                    hit = False
+                if hit:
+                    return deny("deploy", f"`{prog} {' '.join(seg.args[:3])}` is a deploy/publish/remote/prod-DB action. "
+                                          f"Orkestra never runs these during a run. Finish the run, then tell the user "
+                                          f"the exact command to run (project isolation rule 05 applies).")
+    return ALLOW
+
+
+def _install_packages(seg: sp.Segment) -> Optional[Tuple[str, List[str]]]:
+    p, a = seg.program, seg.args
+    vf = ("--registry", "--prefix", "-C", "--dir", "--filter", "-w", "--workspace", "--save-prefix", "--tag",
+          "-i", "--index-url", "--extra-index-url", "-c", "--constraint", "--target", "-t", "--python", "-p",
+          "--group", "-G", "--optional", "--extra", "--source", "--version", "-v", "--framework", "-f")
+    if p in ("npm", "cnpm") and a[:1] and a[0] in ("i", "install", "add", "isntall", "in"):
+        return "npm", sp.positional(a[1:], vf)
+    if p == "pnpm" and a[:1] and a[0] in ("add", "install", "i"):
+        return "pnpm", sp.positional(a[1:], vf)
+    if p == "yarn" and a[:1] and a[0] in ("add",):
+        return "yarn", sp.positional(a[1:], vf)
+    if p == "bun" and a[:1] and a[0] in ("add", "install", "i"):
+        return "bun", sp.positional(a[1:], vf)
+    if p == "expo" and a[:1] == ["install"]:
+        return "expo", sp.positional(a[1:], vf)
+    if p in ("pip", "pip3") and a[:1] == ["install"]:
+        return "pip", _pip_pkgs(a[1:])
+    if p in ("python", "python3") and a[:3] == ["-m", "pip", "install"]:
+        return "pip", _pip_pkgs(a[3:])
+    if p == "uv" and a[:1] == ["add"]:
+        return "uv", sp.positional(a[1:], vf)
+    if p == "uv" and a[:2] == ["pip", "install"]:
+        return "uv", _pip_pkgs(a[2:])
+    if p == "poetry" and a[:1] == ["add"]:
+        return "poetry", sp.positional(a[1:], vf)
+    if p == "pipenv" and a[:1] == ["install"]:
+        return "pipenv", _pip_pkgs(a[1:])
+    if p == "cargo" and a[:1] == ["add"]:
+        return "cargo", sp.positional(a[1:], vf)
+    if p == "go" and a[:1] == ["get"]:
+        return "go", sp.positional(a[1:], vf)
+    if p == "gem" and a[:1] == ["install"]:
+        return "gem", sp.positional(a[1:], vf)
+    if p == "bundle" and a[:1] == ["add"]:
+        return "bundle", sp.positional(a[1:], vf)
+    if p == "composer" and a[:1] in (["require"], ["req"]):
+        return "composer", sp.positional(a[1:], vf)
+    if p == "dotnet" and a[:1] == ["add"] and "package" in a:
+        idx = a.index("package")
+        return "dotnet", sp.positional(a[idx + 1:], vf)[:1]
+    if p in ("flutter", "dart") and a[:2] == ["pub", "add"]:
+        return "pub", sp.positional(a[2:], vf)
+    if p == "brew" and a[:1] in (["install"], ["reinstall"]):
+        return "brew", sp.positional(a[1:], vf)
+    if p == "pod" and a[:1] == ["install"]:
+        return None
+    return None
+
+
+def _pip_pkgs(a: List[str]) -> List[str]:
+    out, skip = [], False
+    for x in a:
+        if skip:
+            skip = False
+            continue
+        if x in ("-r", "--requirement", "-e", "--editable", "-c", "--constraint", "-i", "--index-url",
+                 "--extra-index-url", "-t", "--target", "--python", "-f", "--find-links"):
+            skip = True
+            continue
+        if x.startswith("-"):
+            continue
+        if x in (".", "..") or x.startswith(("./", "../", "/")) or x.endswith((".whl", ".tar.gz", ".zip")):
+            continue
+        out.append(x)
+    return out
+
+
+def deps_guard(segs: List[sp.Segment], approved: Iterable[str]) -> Decision:
+    approved_n = {normalize_pkg(x) for x in approved}
+    for seg in segs:
+        hit = _install_packages(seg)
+        if not hit:
+            continue
+        manager, pkgs = hit
+        new = [normalize_pkg(p) for p in pkgs if normalize_pkg(p) and normalize_pkg(p) not in approved_n]
+        if new:
+            return deny("deps", f"New dependency not approved: {', '.join(new)} ({manager}). Only packages listed in "
+                                f"plan.md `approved_dependencies` (approved by the user) may be installed. If it is truly "
+                                f"needed, stop and ask the user; after approval re-plan or record it via `orkestra` plan change.")
+    return ALLOW
+
+
+# ---------------------------------------------------------------- wait guard (main session of a run)
+# Claude Code runs subagents in the background and delivers their report as a new message. A main session that
+# sleeps or polls for that report only delays it (measured on 2026-10-04: 8–29 % of wall time was this dead wait).
+
+WAIT_SCAN_CHARS = 6000                   # hooks must stay fast on any input: scan a bounded prefix, linear patterns only
+_LOOP_HEAD_RE = re.compile(r"\b(?:while|until)\b|\bfor\s+\w+\s+in\b")
+_LOOP_DO_RE = re.compile(r"\bdo\b")
+_LOOP_SLEEP_RE = re.compile(r"\bsleep\s+[\d.$]")
+_LOOP_DONE_RE = re.compile(r"\bdone\b")
+PY_WAIT_RE = re.compile(r"time\.sleep\(|while\s+time\.time\(\)")
+PY_SLEEP_ARG_RE = re.compile(r"time\.sleep\(\s*(\d+(?:\.\d+)?)")
+RUN_ARTIFACT_RE = re.compile(
+    r"\.orkestra/|\borkestra\s+(?:-\S+\s+\S+\s+)*(?:status|task|watch|context|next|tempo)\b|\.report\.md|"
+    r"\.review\.md|\bverification\.md|\btriage\.md")
+TASK_OUTPUT_RE = re.compile(r"/tasks/[\w.-]+\.output")     # Claude Code's own file for a background agent or command
+
+
+def _has_wait_loop(text: str) -> bool:
+    """`while|until|for … do … sleep N … done`, in that order. Four linear searches (the old single regex with lazy
+    quantifiers was super-linear: 17 KB of `while do sleep 1` took seconds)."""
+    pos = 0
+    for rx in (_LOOP_HEAD_RE, _LOOP_DO_RE, _LOOP_SLEEP_RE, _LOOP_DONE_RE):
+        m = rx.search(text, pos)
+        if not m:
+            return False
+        pos = m.end()
+    return True
+PASSIVE_PROGRAMS = {"sleep", "echo", "true", ":", "wait", "date", "printf", "cd"}
+
+
+def _sleep_seconds(seg: sp.Segment) -> float:
+    if seg.program != "sleep":
+        return 0.0
+    total = 0.0
+    for x in seg.args:
+        m = re.match(r"^(\d+(?:\.\d+)?)([smhd]?)$", x)
+        if m:
+            total += float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+    return total
+
+
+def wait_guard(event: Dict[str, Any], binding: Dict[str, Any], segs: List[sp.Segment]) -> Decision:
+    if event.get("tool_name") != "Bash" or event.get("agent_type"):
+        return ALLOW                                # subagents may wait for their own background commands
+    st = binding.get("state") or {}
+    if st.get("status") != "active" or is_headless(st):
+        return ALLOW                                # `claude -p` ends with its turn: there the old behaviour stays
+    raw = ((event.get("tool_input") or {}).get("command") or "")[:WAIT_SCAN_CHARS]
+    stripped = sp._strip_heredocs(raw)
+    cwd = (event.get("cwd") or "") + "/"
+    sleeps = [_sleep_seconds(s) for s in segs]
+    python = bool(re.search(r"\bpython3?\b", stripped))
+    loop = _has_wait_loop(stripped) or (python and bool(PY_WAIT_RE.search(raw)))
+    touches = bool(RUN_ARTIFACT_RE.search(stripped)) or "/.orkestra/" in cwd
+    waits = loop or max(sleeps or [0.0]) >= 10
+    polls_run = touches and waits
+    polls_output = waits and bool(TASK_OUTPUT_RE.search(stripped))   # may be the session's own background command
+    # a plain wait is only "waiting for a subagent" while one is registered as running (a 30 s pause for a dev
+    # server is fine otherwise) — the registry is read only when the command is a wait candidate at all
+    py_sleep = max([float(x) for x in PY_SLEEP_ARG_RE.findall(raw)] or [0.0]) if python else 0.0
+    plain_wait = (bool(segs) and all(s.program in PASSIVE_PROGRAMS for s in segs) and sum(sleeps) >= 30) \
+        or sum(sleeps) >= 60 or py_sleep >= 30
+    if not polls_run and not polls_output and not plain_wait:
+        return ALLOW
+    project = binding.get("project")
+    pending = []
+    try:
+        from . import tempo as _T                 # late import: only wait candidates pay for it
+        pending = _T.live_agents(Path(str(project)), str(binding.get("run_id") or st.get("run_id") or ""))[0]
+    except Exception:
+        pending = []
+    if pending:
+        return deny("wait", "Do not sleep or poll for a subagent. Subagents run in the background and each final report "
+                            "is delivered to you as a new message — nothing you run here makes it arrive sooner, and a "
+                            "waiting Bash call delays it. End your turn now (the Stop hook allows it while a subagent is "
+                            "running).")
+    if polls_run:
+        return deny("wait", "Do not poll the run's files in a sleep loop: no subagent is registered as running, so "
+                            f"nothing will change by waiting. Ask for the next step instead: `orkestra next -p {project}`.")
+    return ALLOW
+
+
+# ---------------------------------------------------------------- dialog guard (during a run)
+# Commands that put a macOS system dialog on the user's screen (seen 2026-10-04: a test probed a locked keychain with
+# `security show-keychain-info` and the user got password prompts for hours).
+
+def dialog_guard(segs: List[sp.Segment]) -> Decision:
+    for seg in segs:
+        p, a = seg.program, seg.args
+        hit = ""
+        if p == "security" and a:
+            sub = a[0]
+            has_pw = any(x in ("-p", "-P", "-k") or x.startswith(("-p", "-k")) for x in a[1:])
+            if sub in ("show-keychain-info", "authorize", "execute-with-privileges"):
+                hit = f"security {sub}"
+            elif sub in ("unlock-keychain", "create-keychain", "set-key-partition-list", "set-keychain-password") and not has_pw:
+                hit = f"security {sub} (no password argument → GUI prompt)"
+            elif sub in ("find-generic-password", "find-internet-password") and any(x in ("-w", "-g") or
+                                                                                   re.match(r"^-[a-zA-Z]*[wg]", x) for x in a[1:]):
+                hit = f"security {sub} -w/-g (reads a secret → access prompt)"
+        elif p == "osascript" and re.search(r"display\s+(dialog|alert)|choose\s+(file|folder|from\s+list)", seg.raw, re.I):
+            hit = "osascript dialog"
+        elif p == "xcode-select" and "--install" in a:
+            hit = "xcode-select --install"
+        if hit:
+            return deny("dialogs", f"`{hit}` opens a macOS system dialog on the user's screen. Orkestra never does that "
+                                   f"during a run, and tests must not either: stub the binary (a fake `security` first on "
+                                   f"PATH) or pass the password non-interactively to a throw-away keychain. If the real "
+                                   f"call is unavoidable, ask the user first — they can run it themselves.")
+    return ALLOW
+
+
+# `orkestra …` command lines are read with the CLI's OWN parser (cliparse.inspect): what the guard analyses is what
+# the CLI will execute. A private scanner here was a second opinion about the same string, and every difference was a
+# bypass (`phase --no show next`, `orkestra -- task start T001`, `evidence a <cmd> --`).
+MAX_CLI_NESTING = 4
+_CLI_CACHE: Dict[Tuple[str, ...], Tuple[str, List[str], str]] = {}
+
+
+def _cli_info(seg: sp.Segment) -> Tuple[str, List[str], str]:
+    """(subcommand key, command a tdd/evidence call executes, parse error) — ("", [], error) when the CLI would stop
+    with a usage error, in which case nothing runs."""
+    key = tuple(seg.args)
+    hit = _CLI_CACHE.get(key)
+    if hit is None:
+        if len(_CLI_CACHE) > 64:
+            _CLI_CACHE.clear()
+        try:
+            hit = CP.inspect(list(seg.args))
+        except Exception as exc:                    # never let a parser surprise open a hole: treat as unparseable
+            hit = ("", [], f"cannot parse: {exc}")
+        _CLI_CACHE[key] = hit
+    return hit
+
+
+def _cli_subcommand(seg: sp.Segment) -> Optional[str]:
+    """None for other programs; "" when the command line does not parse (the CLI would refuse it)."""
+    if seg.program != "orkestra":
+        return None
+    return _cli_info(seg)[0]
+
+
+def _classify(path: str, project: Path, feature_dir: Path) -> str:
+    # compared case-insensitively: on a macOS volume `.ORKESTRA/runs/x/approval.json` IS the machine state
+    path = str(path).casefold()
+    project, feature_dir = Path(str(project).casefold()), Path(str(feature_dir).casefold())
+    if path.endswith("/*"):
+        base = Path(path[:-2])
+        if is_relative_to(base, project / ".orkestra"):
+            return "orkestra"
+        if is_relative_to(base, project) or is_relative_to(project, base):
+            return "source"
+        return "temp" if _is_temp_subdir(str(base)) else "outside"
+    p = Path(path)
+    if is_relative_to(p, project / ".orkestra" / "runs"):
+        return "runs"
+    if is_relative_to(p, feature_dir):
+        return "feature"
+    if is_relative_to(p, project / ".orkestra"):
+        return "orkestra"
+    if is_relative_to(p, project):
+        return "source"
+    if _is_temp(path):
+        return "temp"
+    return "outside"
+
+
+# Scripts that mention .orkestra/runs: reading the evidence / activity logs is normal work (reviewer, verifier);
+# everything else there is machine state (state.json, approval.json, agents.json, gates-*.json, approved/, snapshot/)
+# and keeps the strict 1.3.0 test — a forged approval.json must not depend on how cleverly `open(…, 'w')` is written.
+RUN_MENTION_RE = re.compile(r"\.orkestra/runs[^\s'\"`)(,;]*", re.I)
+RUN_READABLE_RE = re.compile(r"/evidence(?:/|$)|/activity[\w.]*\.jsonl$|/watchdog-resume-\d+\.log$", re.I)
+SCRIPT_STRICT_RE = re.compile(r"open\(|write|unlink|rename|replace|remove|truncate|shutil|copy|>")
+SCRIPT_WRITE_RE = re.compile(
+    r",\s*['\"](?:[wax]b?\+?|r\+b?|rb\+)['\"]|\bmode\s*=\s*['\"](?:[wax]|r\+)|\.open\(\s*['\"][wax]|os\.open\(|O_WRONLY|O_RDWR|"
+    r"O_TRUNC|O_APPEND|O_CREAT|\.write(?:_text|_bytes)?\(|writeFile|appendFile|createWriteStream|copyFile|cpSync|"
+    r"binwrite|unlink|\brename|os\.replace|os\.remove|shutil\.|rmtree|rmSync|truncate|json\.dump\(|"
+    r"print\([^\n]*\bfile\s*=|['\"]\s*>{1,2}\s*['\"]|>\s*\S*\.orkestra/runs")
+
+
+SCRIPT_PROGRAMS = ("python", "python3", "node", "ruby", "perl", "bash", "sh", "zsh", "deno", "bun", "php")
+MACHINE_STATE_RE = re.compile(r"state\.json|approval|agents\.json|gates-|approved|snapshot|ledger|\.lock|\.\./", re.I)
+
+
+# The hook entry points decide what counts as "the user said so" (plan approval, per-message git permission, which
+# session drives a run). They are started by the agent host — and by the headless drivers, for Cursor's print mode —
+# never by a command the model runs: a model that pipes `{"prompt": "onay"}` into one, or calls the library behind
+# them, would approve its own plan. Defence in depth, not a sandbox: only orkestra's own files and library count
+# (another project's `dispatch.py` or `record_approval()` is none of our business).
+INTERPRETER_RE = re.compile(r"^(?:python[\d.]*|pypy[\d.]*|node|ruby|perl|bash|sh|zsh|dash|deno|bun|php)$")
+HOOK_FILES = ("dispatch.py", "cursor_hook.py")
+HOOK_CODE_RE = re.compile(r"\borkestra_core\b|hooks/(?:dispatch|cursor_hook)\.py|\bimport\s+cursor_hook\b")
+
+
+# 2026-10-05, a real run: told "no need to ask questions", a model looked up how approval is recorded, copied the
+# payload from the test suite into a `python3 <<'PY'` script, ran hooks/cursor_hook.py beforeSubmitPrompt with
+# {"prompt": "onay"} and went on to implement. So, in a bound session, anything that NAMES orkestra's hook entry
+# points or its library may only be read (grep, cat …): no command that executes or writes with those names in it,
+# and no file whose content has them. (A project that is the orkestra checkout itself is exempt — it could not be
+# developed otherwise.) Only orkestra's own names count; another project's dispatch.py is none of our business.
+# Only what points at THIS plugin counts: its directory, an import of its library, its Cursor entry point, the
+# variable Claude Code hands plugins. A project's own `hooks/dispatch.py`, or prose that merely says "orkestra_core",
+# is ordinary work.
+_PLUGIN_DIR = os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+INTERNALS_RE = re.compile(
+    r"plugins/orkestra/(?:hooks|lib|bin)\b|\b(?:from|import)\s+orkestra_core\b|\borkestra_core\s*[./]\s*\w|"
+    r"\bcursor_hook\.py\b|\bCLAUDE_PLUGIN_ROOT\b|orkestra[\w./-]{0,160}/hooks/dispatch\.py|"
+    r"hooks[^\n\w]{2,12}dispatch\.py|plugins/cache/orkestra|"
+    + re.escape(_PLUGIN_DIR) + r"(?![\w-])")
+READONLY_PROGRAMS = {"grep", "rg", "egrep", "fgrep", "cat", "head", "tail", "less", "more", "ls", "wc", "stat", "file",
+                     "diff", "nl", "sort", "uniq", "cut", "bat", "cd", "true", ":", "echo", "printf", "orkestra", "pwd",
+                     "tree", "du", "which", "realpath", "basename", "dirname"}
+GIT_LOOKS = {"log", "show", "diff", "grep", "blame", "status", "ls-files", "cat-file", "shortlog", "describe"}
+FORGERY_MSG = ("This names orkestra's own hook entry points or library. They are run by the agent host and the "
+               "`orkestra` CLI only: a command or file of yours must not call, import or drive them — recording an "
+               "approval or a permission that way is forging the user's consent (also when the user said not to ask "
+               "questions). Reading them is fine. If you need the user's approval: show the summary, run "
+               "`orkestra await \"plan onayı\"` and end your turn.")
+
+
+def _is_orkestra_repo(project: Path) -> bool:
+    return (project / "plugins" / "orkestra" / "hooks" / "dispatch.py").exists() or \
+        (project / "hooks" / "dispatch.py").exists() and (project / "lib" / "orkestra_core").is_dir()
+
+
+def _git_verb(args: List[str]) -> str:
+    i = 0
+    while i < len(args):
+        if args[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            i += 2
+        elif args[i].startswith("-"):
+            i += 1
+        else:
+            return args[i]
+    return ""
+
+
+def _names_internals_and_acts(full: str, segs: List[sp.Segment]) -> bool:
+    """The command text names orkestra's internals and does more than read."""
+    if not INTERNALS_RE.search(full[:100000]):
+        return False
+    if "<<" in full:
+        return True
+    for seg in segs:
+        looks = seg.program in READONLY_PROGRAMS \
+            or (seg.program == "sed" and not any(a == "--in-place" or re.match(r"^-[a-zA-Z]*i", a) for a in seg.args)) \
+            or (seg.program == "git" and _git_verb(seg.args) in GIT_LOOKS)
+        if not looks:
+            return True
+        if any(op.strip("&0123456789").startswith(">") and not t.startswith("/dev/") for op, t in seg.redirects):
+            return True
+    return False
+
+
+def _written_text(event: Dict[str, Any]) -> str:
+    ti = event.get("tool_input") or {}
+    parts = [ti.get(k) for k in ("content", "new_string", "new_source", "patch")]
+    parts += [e.get("new_string") for e in (ti.get("edits") or []) if isinstance(e, dict)]
+    return "\n".join(str(p) for p in parts if isinstance(p, str))[:200000]
+
+
+def _is_orkestra_hook(arg: str, cwd: str) -> bool:
+    if os.path.basename(arg) not in HOOK_FILES:
+        return False
+    try:
+        p = resolve_path(arg, cwd)
+        return p.parent.name == "hooks" and (p.parent.parent / "lib" / "orkestra_core").is_dir()
+    except Exception:
+        return False
+
+
+def _hook_code(text: str) -> bool:
+    return bool(HOOK_CODE_RE.search(text)) or ("hooks" in text and bool(re.search(r"\bimport\s+dispatch\b", text)))
+
+
+def _calls_hook_entry(seg: sp.Segment, cwd: str, raw_program: str = "") -> bool:
+    if seg.program in HOOK_FILES:                   # run directly: ./hooks/dispatch.py UserPromptSubmit
+        first = (seg.raw or "").split()
+        cand = next((w for w in first if os.path.basename(w) == seg.program), "")
+        if cand and _is_orkestra_hook(cand, cwd):
+            return True
+    if not INTERPRETER_RE.match(seg.program or ""):
+        return False
+    args = list(seg.args)
+    for i, a in enumerate(args):
+        if a in ("-c", "-e", "--eval", "-m") and i + 1 < len(args) and _hook_code(args[i + 1]):
+            return True
+        if not a.startswith("-") and _is_orkestra_hook(a, cwd):
+            return True
+    return False
+
+
+def _script_writes_run_state(raw: str) -> bool:
+    mentions = RUN_MENTION_RE.findall(raw)
+    if mentions and all(RUN_READABLE_RE.search(m) for m in mentions):
+        return bool(SCRIPT_WRITE_RE.search(raw))
+    return bool(SCRIPT_STRICT_RE.search(re.sub(r"&?>&?\s*(?:/dev/null\b|\d\b)", " ", raw)))
+
+
+def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any], segs: List[sp.Segment]) -> Decision:
+    st = binding.get("state") or {}
+    if st.get("status") not in ("active", "awaiting_user", "blocked", "paused"):
+        return ALLOW
+    guards = cfg.get("guards") or {}
+    project = Path(binding["project"]).resolve(strict=False)
+    run_id = binding["run_id"]
+    fdir = project / ".orkestra" / "features" / run_id
+    phase = st.get("phase", "intake")
+    role = _agent_role(event)
+    tool = event.get("tool_name")
+    cwd = event.get("cwd") or str(project)
+    spec_path = fdir / "spec.md"
+    approved = bool(st.get("approved"))
+
+    def check_target(path: str, via: str) -> Decision:
+        kind = _classify(path, project, fdir)
+        if kind == "runs":
+            return deny("internals", f"{path} is orkestra machine state; only the `orkestra` CLI and hooks may write it.")
+        if kind == "temp":
+            return ALLOW
+        if approved and str(path).casefold() == str(spec_path).casefold():
+            return deny("internals", "spec.md is frozen after user approval. Record deviations in plan.md "
+                                     "'Plan değişiklik günlüğü' and, if scope changes, go back with "
+                                     "`orkestra phase back plan` to get re-approval.")
+        if role in ("readonly", "other"):
+            if kind != "feature":
+                return deny("roles", f"Agent {event.get('agent_type')} is read-only: it may only write report files under "
+                                     f"{fdir}. Attempted ({via}): {path} — for a mutation probe or scratch copy, `cp` the "
+                                     f"files to /tmp/<dir> and work there; never change or back up files inside the project.")
+            return ALLOW
+        if role == "implementer" and kind == "orkestra" and not str(path).casefold().startswith(str(fdir).casefold()):
+            return deny("roles", "The implementer must not modify orkestra memory/config. Report instead.")
+        if kind == "outside":
+            if guards.get("isolation", True):
+                return deny("isolation", f"Write outside the run's project is blocked (project isolation). "
+                                         f"Project: {project} · attempted ({via}): {path}")
+            return ALLOW
+        if kind == "source" and phase in PRE_APPROVAL_PHASES and guards.get("phase", True):
+            return deny("phase", f"Source changes are blocked in phase '{phase}': the plan is not approved yet. "
+                                 f"Only .orkestra/ artifacts may be written now. Attempted ({via}): {path}")
+        return ALLOW
+
+    own_repo = _is_orkestra_repo(project)
+    if tool in WRITE_TOOLS:
+        for p in _tool_paths(event):
+            d = check_target(str(resolve_path(p, cwd)), tool)
+            if d.denied:
+                return d
+        if not own_repo and INTERNALS_RE.search(_written_text(event)):
+            return deny("internals", FORGERY_MSG)
+        return ALLOW
+
+    if tool != "Bash":
+        return ALLOW
+
+    if not own_repo and _names_internals_and_acts((event.get("tool_input") or {}).get("command") or "", segs):
+        return deny("internals", FORGERY_MSG)
+    for seg, scwd in with_cwd(segs, cwd):
+        sub = _cli_subcommand(seg)
+        if sub is not None:
+            if sub == "":
+                if role is not None:                # the CLI would print a usage error; say why instead
+                    return deny("roles", f"this `orkestra` command line does not parse ({_cli_info(seg)[2][:160]}). Write "
+                                         f"subcommands and options in full, exactly as documented (no abbreviations).")
+                continue
+            if role == "implementer" and sub not in CLI_ALLOWED["implementer"]:
+                return deny("roles", f"`orkestra {sub.replace(':', ' ')}` is reserved for the orchestrator. "
+                                     f"Implementer may use: brief, tdd red/green, task start/note, gate run, changes.")
+            if role in ("readonly", "other") and sub not in CLI_ALLOWED["readonly"] \
+                    and not (event.get("agent_type") == "orkestra:verifier" and sub == "gate:verify"):
+                return deny("roles", f"`orkestra {sub.replace(':', ' ')}` is not allowed for read-only agents.")
+            continue
+        for t in bash_write_targets(seg, scwd):
+            d = check_target(t, f"bash:{seg.program}")
+            if d.denied:
+                return d
+        if not own_repo and _calls_hook_entry(seg, scwd):
+            return deny("internals", FORGERY_MSG)
+        raw = seg.raw
+        if seg.program in SCRIPT_PROGRAMS and "/.orkestra/runs" in (scwd.casefold() + "/"):
+            # relative paths ARE run state here: strict as soon as a machine-state name appears, else the write test
+            clean = re.sub(r"&?>&?\s*(?:/dev/null\b|\d\b)", " ", raw)
+            if (SCRIPT_STRICT_RE if MACHINE_STATE_RE.search(raw) else SCRIPT_WRITE_RE).search(clean):
+                return deny("internals", "Scripts must not modify .orkestra/runs (CLI-only machine state); this one runs "
+                                         "inside it. Work from the project root and read through the `orkestra` CLI.")
+        if ".orkestra/runs" in raw.lower() and seg.program in SCRIPT_PROGRAMS:
+            if _script_writes_run_state(raw):
+                return deny("internals", "Scripts must not modify .orkestra/runs (CLI-only machine state). Reading the "
+                                         "evidence and activity logs there is fine; for state use `orkestra status --json`, "
+                                         "`orkestra next --json` or `orkestra gate last`.")
+    # a script fed through a heredoc (`python3 - <<'EOF' … EOF`): its body is not part of any segment
+    full = (event.get("tool_input") or {}).get("command") or ""
+    if "<<" in full and ".orkestra/runs" in full.lower() and any(s.program in SCRIPT_PROGRAMS for s in segs) \
+            and _script_writes_run_state(full[:20000].replace("<<", " ")):
+        return deny("internals", "Scripts must not modify .orkestra/runs (CLI-only machine state). Reading the evidence "
+                                 "and activity logs there is fine; for state use `orkestra status --json`, "
+                                 "`orkestra next --json` or `orkestra gate last`.")
+    if not own_repo and "<<" in full and _hook_code(full[:20000]) and any(INTERPRETER_RE.match(s.program or "") for s in segs):
+        return deny("internals", FORGERY_MSG)
+    if guards.get("wait", True):
+        d = wait_guard(event, binding, segs)
+        if d.denied:
+            return d
+    if guards.get("dialogs", True):
+        d = dialog_guard(segs)
+        if d.denied:
+            return d
+    if guards.get("deploy", True):
+        d = deploy_guard(segs)
+        if d.denied:
+            return d
+    if guards.get("deps", True):
+        approved_deps = (st.get("approved") or {}).get("deps") or []
+        d = deps_guard(segs, approved_deps)
+        if d.denied:
+            return d
+    return ALLOW
+
+
+# ====================================================================== entry
+
+def expand_cli_commands(segs: List[sp.Segment]) -> List[sp.Segment]:
+    """`orkestra tdd|evidence ... -- <cmd>` runs <cmd>: analyze it like any other command (no guard bypass)."""
+    import shlex as _shlex
+    out = list(segs)
+    todo = [(seg, 0) for seg in segs if seg.program == "orkestra"]
+    while todo:
+        seg, depth = todo.pop()
+        rest = _cli_info(seg)[1]                    # exactly the list the CLI hands to the shell
+        if not rest:
+            continue
+        if depth >= MAX_CLI_NESTING:
+            out.append(sp.Segment(program=TOO_DEEP))
+            continue
+        inner = sp.segments(_shlex.join(rest) if len(rest) > 1 else rest[0])
+        out.extend(inner)
+        todo.extend((s, depth + 1) for s in inner if s.program == "orkestra")   # `evidence a orkestra evidence b …`
+    return out
+
+
+TOO_DEEP = "<orkestra-nested-too-deep>"
+MAX_REDIRECTS = 200
+MAX_SEGMENTS = 2000
+
+
+MCP_WRITE_RE = re.compile(r"^mcp__.+__(replace_|insert_|rename_|delete_|safe_delete_|create_|write_|edit_|move_|remove_)")
+MCP_SHELL_RE = re.compile(r"^mcp__.+__(execute_shell_command|run_shell|shell_exec|execute_command|run_command)$")
+
+
+def normalize_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Map MCP editing/shell tools (e.g. Serena's replace_symbol_body) onto Write/Bash semantics."""
+    tool = event.get("tool_name") or ""
+    if not tool.startswith("mcp__"):
+        return event
+    ti = event.get("tool_input") or {}
+    if MCP_SHELL_RE.match(tool):
+        ev = dict(event)
+        ev["tool_name"] = "Bash"
+        ev["tool_input"] = {"command": str(ti.get("command") or ti.get("cmd") or "")}
+        if ti.get("cwd"):
+            ev["cwd"] = str(resolve_path(str(ti["cwd"]), event.get("cwd")))
+        return ev
+    if MCP_WRITE_RE.match(tool):
+        path = ti.get("relative_path") or ti.get("file_path") or ti.get("path") or ti.get("name_path_file") or ""
+        ev = dict(event)
+        ev["tool_name"] = "Write"
+        ev["tool_input"] = {"file_path": str(path) if path else str(event.get("cwd") or ".")}
+        return ev
+    return event
+
+
+def _has_key(obj: Any, names: Tuple[str, ...], depth: int = 0) -> bool:
+    """A non-empty value under one of `names`, at any depth (the UI may echo the input back in its response)."""
+    if depth > 6:
+        return False
+    if isinstance(obj, dict):
+        return any((k in names and bool(v)) or _has_key(v, names, depth + 1) for k, v in obj.items())
+    if isinstance(obj, list):
+        return any(_has_key(v, names, depth + 1) for v in obj[:50])
+    return False
+
+
+def pre_tool_decision(event: Dict[str, Any], cfg: Dict[str, Any], binding: Optional[Dict[str, Any]],
+                      grants: Iterable[str]) -> Decision:
+    event = normalize_event(event)
+    tool = event.get("tool_name") or ""
+    guards = cfg.get("guards") or {}
+    segs: List[sp.Segment] = []
+    sp.TEST_SYNTAX = bool(guards.get("test_syntax", False))     # one hook process = one decision (see shellparse)
+    if tool == "Bash":
+        cmd = (event.get("tool_input") or {}).get("command") or ""
+        segs = expand_cli_commands(sp.segments(cmd))
+        # every redirect is resolved and checked by several guards: keep the hook far away from its timeout (a hook
+        # that times out lets the command run unchecked)
+        if len({t for s in segs for _, t in s.redirects}) > MAX_REDIRECTS or len(segs) > MAX_SEGMENTS:
+            return deny("complex", f"This command is too large to check in one call (more than {MAX_REDIRECTS} different "
+                                   f"redirect targets or {MAX_SEGMENTS} commands). Split it, or put it in a script file "
+                                   f"under the project and run that.")
+    if guards.get("secrets", True):
+        d = secrets_guard(event, cfg, segs)
+        if d.denied:
+            return d
+    d = home_guard(event, segs)
+    if d.denied:
+        return d
+    if tool == "Bash":
+        if any(seg.program == TOO_DEEP for seg in segs):
+            return deny("internals", "`orkestra tdd|evidence` wrapped inside itself more than "
+                                     f"{MAX_CLI_NESTING} times cannot be analysed. Run the inner command directly.")
+        for seg in segs:                            # nested calls are in `segs` too (expand_cli_commands)
+            if _cli_subcommand(seg) == "rollback" and "--yes" in seg.args and "discard" not in set(grants):
+                return deny("rollback", "`orkestra rollback --yes` reverts files and needs the user's explicit request "
+                                        "in the current message (/orkestra:rollback or 'değişiklikleri geri al'). "
+                                        "Show the dry run instead.")
+        if guards.get("git", True):
+            ev = dict(event, _bound=bool(binding))
+            d = git_guard(ev, segs, set(grants))
+            if d.denied:
+                return d
+        if guards.get("store", True):
+            d = store_guard(segs)
+            if d.denied:
+                return d
+    if binding and tool == "AskUserQuestion":
+        # The UI fills `answers` AFTER PreToolUse; answers present here would be model-authored (forged approval).
+        if _has_key(event.get("tool_input"), ("answers", "answer")):
+            return deny("internals", "Do not pre-fill `answers` in AskUserQuestion — only the user answers questions.")
+        return ALLOW
+    if binding:
+        d = run_guard(event, cfg, binding, segs)
+        if d.denied:
+            return d
+    return ALLOW

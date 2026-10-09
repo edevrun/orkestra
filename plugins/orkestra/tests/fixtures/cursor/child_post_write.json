@@ -1,0 +1,21 @@
+{
+ "conversation_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "generation_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "model": "default",
+ "tool_name": "Write",
+ "tool_input": {
+  "file_path": "/private/tmp/orkestra-e2e/ws/demo/tests/test_calc.py",
+  "content": "import unittest, sys, os\nsys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))\nfrom calc import add, sub\n\n\nclass T(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n\n    def test_sub(self):\n        self.assertEqual(sub(5, 3), 2)\n        self.assertEqual(sub(3, 5), -2)\n        self.assertEqual(sub(4, 4), 0)\n"
+ },
+ "tool_output": "{\"file_path\":\"/private/tmp/orkestra-e2e/ws/demo/tests/test_calc.py\",\"success\":true}",
+ "duration": 38.318,
+ "tool_use_id": "call-13a9405c-c670-41e5-9ebd-3644975d0a66-3\nfc_3c52fb9b-6ebf-9e30-b41e-b0b9d1613b63_0",
+ "session_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "hook_event_name": "postToolUse",
+ "cursor_version": "2026.10.01-14929f9",
+ "workspace_roots": [
+  "/private/tmp/orkestra-e2e/ws/demo"
+ ],
+ "user_email": "user@example.com",
+ "transcript_path": "/Users/u/.cursor/projects/private-tmp-orkestra-e2e-ws-demo/agent-transcripts/93e8f06b-9927-4698-8fe3-40a4bb59660a/93e8f06b-9927-4698-8fe3-40a4bb59660a.jsonl"
+}

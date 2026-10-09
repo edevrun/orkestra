@@ -1,0 +1,20 @@
+{
+  "id": "orkestra-bridge",
+  "name": "Orkestra bridge",
+  "description": "Telegram → orkestra: /yap, /durum, /iptal, reply-to-answer and job notifications.",
+  "activation": {
+    "onStartup": true
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["chatId"],
+    "properties": {
+      "chatId": { "type": "string", "pattern": "^-?[0-9]+$" },
+      "clientPath": { "type": "string" },
+      "orkestraCliPath": { "type": "string" },
+      "python": { "type": "string" },
+      "pollSeconds": { "type": "number", "minimum": 5, "maximum": 300 }
+    }
+  }
+}

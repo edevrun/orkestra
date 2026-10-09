@@ -1,0 +1,21 @@
+{
+ "conversation_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "generation_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "model": "default",
+ "tool_name": "Shell",
+ "tool_input": {
+  "command": "orkestra tdd red T001 -p demo -- python3 -m unittest tests.test_calc -q",
+  "cwd": "",
+  "timeout": 30000
+ },
+ "tool_use_id": "e8a68ca9-c7b4-44c8-845b-063643f83516",
+ "cwd": "",
+ "session_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "hook_event_name": "preToolUse",
+ "cursor_version": "2026.10.01-14929f9",
+ "workspace_roots": [
+  "/private/tmp/orkestra-e2e/ws/demo"
+ ],
+ "user_email": "user@example.com",
+ "transcript_path": "/Users/u/.cursor/projects/private-tmp-orkestra-e2e-ws-demo/agent-transcripts/93e8f06b-9927-4698-8fe3-40a4bb59660a/93e8f06b-9927-4698-8fe3-40a4bb59660a.jsonl"
+}

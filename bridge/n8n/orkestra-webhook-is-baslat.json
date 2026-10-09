@@ -1,0 +1,104 @@
+{
+  "name": "Orkestra · Webhook ile iş başlat",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "orkestra-job",
+        "responseMode": "responseNode",
+        "options": {},
+        "authentication": "headerAuth"
+      },
+      "id": "657c841d-eb75-451a-87b6-fe0a0c736ee3",
+      "name": "Webhook: POST /orkestra-job",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -440,
+        0
+      ],
+      "webhookId": "1ebb9081-1df7-489a-92c8-2c4b7008b009",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "__CRED_ID__",
+          "name": "Orkestra webhook key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://127.0.0.1:47615/jobs",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer __ORKESTRA_TOKEN__"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ project: $json.body.project, request: $json.body.request, chat_id: $json.body.chat_id || null, source: $json.body.source || 'n8n' }) }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "b49edfb4-94a5-49a6-a7a8-2d692b408eac",
+      "name": "Bridge: POST /jobs",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {}
+      },
+      "id": "f7af5a94-9a27-4905-80f4-fbead794f802",
+      "name": "Yanıt",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        40,
+        0
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook: POST /orkestra-job": {
+      "main": [
+        [
+          {
+            "node": "Bridge: POST /jobs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Bridge: POST /jobs": {
+      "main": [
+        [
+          {
+            "node": "Yanıt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,18 @@
+{
+ "conversation_id": "1378b0b6-c2c0-4a11-848e-db16cc6ac187",
+ "generation_id": "a25ceef6-9ca8-44a8-ba19-0c41a6995136",
+ "model": "default",
+ "tool_name": "Read",
+ "tool_input": {
+  "file_path": "/private/tmp/orkestra-e2e/ws/demo/.cursor/skills/orkestra-run/SKILL.md"
+ },
+ "tool_use_id": "call-133a73dd-155b-4184-8f89-4750222eebdd-1\nfc_6700f45e-36a4-9d83-85f4-daf735638d97_0",
+ "session_id": "1378b0b6-c2c0-4a11-848e-db16cc6ac187",
+ "hook_event_name": "preToolUse",
+ "cursor_version": "2026.10.01-14929f9",
+ "workspace_roots": [
+  "/private/tmp/orkestra-e2e/ws/demo"
+ ],
+ "user_email": "user@example.com",
+ "transcript_path": "/Users/u/.cursor/projects/private-tmp-orkestra-e2e-ws-demo/agent-transcripts/1378b0b6-c2c0-4a11-848e-db16cc6ac187/1378b0b6-c2c0-4a11-848e-db16cc6ac187.jsonl"
+}

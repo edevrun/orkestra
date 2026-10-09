@@ -1,0 +1,11 @@
+{
+ "role": "user",
+ "message": {
+  "content": [
+   {
+    "type": "text",
+    "text": "<timestamp>Monday, Oct 5, 2026, 6:12 PM (UTC+3)</timestamp>\n<user_query>\nproject: /private/tmp/orkestra-e2e/ws/demo\nFollow your protocol; reply in ≤ 6 lines.\n\n# Task brief — T001 · run 001-add-sub-function · project demo (/private/tmp/orkestra-e2e/ws/demo)\nartifacts: /private/tmp/orkestra-e2e/ws/demo/.orkestra/features/001-add-sub-function  (context.md has the code map; read only what you need)\n## Global constraints\n- Mevcut public API/davranış bozulmaz (baseline gate'leri yeşil kalır).\n- İstek dışı refactor, format değişikliği, bağımlılık yok.\n- Kod yorumları İngilizce; kullanıcıya dönük metinler projenin dilinde.\n## Boundaries (spec)\n- Her zaman: AGENTS.md (stdlib only, unittest); mevcut `add` davranışı; minimal diff\n- Asla: commit/push/deploy; istek dışı refactor/bağımlılık; test silme/zayıflatma\n## Task\n### T001 — Add sub with test\n- Dosyalar: `calc.py` (değişir), `tests/test_calc.py` (değişir)\n- Bağımlı: —\n- Kabul: Given `calc` modülü When `sub(5, 3)` çağrılır Then `2` döner; `test_sub` geçer; mevcut `test_add` geçer (FR-001, FR-002, SC-001, SC-002, E1–E3)\n- Test: `python3 -m unittest tests.test_calc -q`\n- TDD: required\n## Referenced requirements\n- **FR-001**: Sistem `sub(a, b)` fonksiyonunu `calc` modülünden export MUST; dönüş değeri `a - b` MUST.\n- **FR-002**: Sistem `sub` için unittest MUST; mevcut `add` testleri bozulmamalı.\n- **SC-001**: `sub(5, 3)` → `2` (ve benzeri temel örnekler testte doğrulanır).\n- **SC-002**: `python3 -m unittest discover -s tests -q` PASS.\n| E1 | Negatif sonuç | sub(3, 5) | -2 | FR-001 |\n| E2 | Sıfır | sub(4, 4) | 0 | FR-001 |\n| E3 | Mevcut add korunur | add(2, 3) | 5 | FR-002 |\n## Gates\nunit=`python3 -m unittest discover -s tests -q`\n## Report file\n/private/tmp/orkestra-e2e/ws/demo/.orkestra/features/001-add-sub-function/tasks/T001.report.md\n</user_query>"
+   }
+  ]
+ }
+}

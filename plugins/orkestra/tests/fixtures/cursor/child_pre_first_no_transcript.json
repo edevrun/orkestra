@@ -1,0 +1,18 @@
+{
+ "conversation_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "generation_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "model": "default",
+ "tool_name": "Read",
+ "tool_input": {
+  "file_path": "/private/tmp/orkestra-e2e/ws/demo/tests/test_calc.py"
+ },
+ "tool_use_id": "call-6cfe2082-541f-420e-903c-52100c2c2e14-1\nfc_4f6bc06c-9bcb-95e4-aa5c-bf9033792aef_1",
+ "session_id": "93e8f06b-9927-4698-8fe3-40a4bb59660a",
+ "hook_event_name": "preToolUse",
+ "cursor_version": "2026.10.01-14929f9",
+ "workspace_roots": [
+  "/private/tmp/orkestra-e2e/ws/demo"
+ ],
+ "user_email": "user@example.com",
+ "transcript_path": null
+}

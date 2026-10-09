@@ -1,0 +1,297 @@
+"""Parsers for spec.md / plan.md / verification.md / triage.md.
+
+The formats are defined by templates/ (Turkish headings, English synonyms accepted).
+Parsers are deliberately tolerant about whitespace and strict about structure.
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+ID_RE = re.compile(r"\b((?:FR|SC)-\d{3})\b")
+TASK_HEAD_RE = re.compile(r"^###\s+(T\d{3})\s*(?:[—–:\-]+\s*)?(.*?)\s*$", re.M)
+
+FIELD_ALIASES = {
+    "files": ("dosyalar", "files", "dosya"),
+    "acceptance": ("kabul", "acceptance", "kabul kriteri", "kabul kriterleri"),
+    "test": ("test", "tests", "testler", "doğrulama"),
+    "tdd": ("tdd",),
+    "depends": ("bağımlı", "bagimli", "depends", "bağımlılık", "dependencies"),
+}
+
+
+def parse_frontmatter(text: str) -> Tuple[Dict[str, object], str]:
+    """Tiny YAML subset: `key: value`, `key: [a, b]`, and `key:` followed by `- item` lines."""
+    if not text.startswith("---"):
+        return {}, text
+    lines = text.splitlines()
+    end = None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return {}, text
+    data: Dict[str, object] = {}
+    current_list_key: Optional[str] = None
+    for raw in lines[1:end]:
+        if not raw.strip() or raw.strip().startswith("#"):
+            continue
+        m_item = re.match(r"^\s+-\s+(.*)$", raw) or re.match(r"^-\s+(.*)$", raw)
+        if m_item and current_list_key:
+            lst = data.setdefault(current_list_key, [])
+            if isinstance(lst, list):
+                lst.append(_scalar(m_item.group(1)))
+            continue
+        m = re.match(r"^([A-Za-z0-9_\-]+)\s*:\s*(.*)$", raw)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2).strip()
+        current_list_key = None
+        if val == "":
+            data[key] = []
+            current_list_key = key
+        elif val.startswith("[") and val.endswith("]"):
+            inner = val[1:-1].strip()
+            data[key] = [_scalar(x) for x in _split_list(inner)] if inner else []
+        else:
+            data[key] = _scalar(val)
+    body = "\n".join(lines[end + 1:])
+    return data, body
+
+
+def _split_list(inner: str) -> List[str]:
+    out, buf, quote = [], "", None
+    for ch in inner:
+        if quote:
+            if ch == quote:
+                quote = None
+            else:
+                buf += ch
+        elif ch in "\"'":
+            quote = ch
+        elif ch == ",":
+            out.append(buf.strip())
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        out.append(buf.strip())
+    return out
+
+
+def _scalar(v: str) -> object:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        return v[1:-1]
+    low = v.lower()
+    if low in ("true", "yes"):
+        return True
+    if low in ("false", "no"):
+        return False
+    if low in ("null", "none", "~", ""):
+        return None
+    return v
+
+
+# ---------------------------------------------------------------- spec
+
+def spec_ids(spec_text: str) -> List[str]:
+    seen: List[str] = []
+    for m in ID_RE.finditer(spec_text):
+        if m.group(1) not in seen:
+            seen.append(m.group(1))
+    return seen
+
+
+def has_section(text: str, *names: str) -> bool:
+    for name in names:
+        if re.search(r"^#{2,3}\s+" + re.escape(name) + r"\b", text, re.M | re.I):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------- plan tasks
+
+@dataclass
+class Task:
+    id: str
+    title: str
+    body: str
+    fields: Dict[str, str] = field(default_factory=dict)
+
+    @property
+    def files(self) -> List[str]:
+        raw = self.fields.get("files", "")
+        found = re.findall(r"`([^`]+)`", raw)
+        if found:
+            return [f.strip() for f in found if f.strip()]
+        return [x.strip() for x in re.split(r"[,;]", raw) if x.strip()]
+
+    @property
+    def file_entries(self) -> List[Tuple[str, bool]]:
+        """[(path, is_new)] — a file is new when followed by (yeni)/(new)/(oluşturulacak)/(create)."""
+        raw = self.fields.get("files", "")
+        out: List[Tuple[str, bool]] = []
+        for m in re.finditer(r"`([^`]+)`([^`,;]*)", raw):
+            path, tail = m.group(1).strip(), m.group(2).lower()
+            out.append((path, bool(re.search(r"\((yeni|new|oluştur\w*|create\w*)", tail))))
+        return out
+
+    @property
+    def tdd(self) -> str:
+        raw = self.fields.get("tdd", "required").strip().lower()
+        return "n/a" if raw.startswith(("n/a", "na", "yok", "gerekmez", "none")) else "required"
+
+    @property
+    def depends(self) -> List[str]:
+        return re.findall(r"T\d{3}", self.fields.get("depends", ""))
+
+
+def _field_key(label: str) -> Optional[str]:
+    label = label.strip().strip("*").strip().lower()
+    for key, aliases in FIELD_ALIASES.items():
+        if label in aliases:
+            return key
+    return None
+
+
+def parse_tasks(plan_text: str) -> List[Task]:
+    tasks: List[Task] = []
+    heads = list(TASK_HEAD_RE.finditer(plan_text))
+    for idx, m in enumerate(heads):
+        start = m.end()
+        end = heads[idx + 1].start() if idx + 1 < len(heads) else len(plan_text)
+        body = plan_text[start:end]
+        # stop at the next level-2 heading
+        h2 = re.search(r"^##\s+", body, re.M)
+        if h2:
+            body = body[:h2.start()]
+        fields: Dict[str, str] = {}
+        last_key: Optional[str] = None
+        for line in body.splitlines():
+            fm = re.match(r"^\s*[-*]\s+\**([^:*]+?)\**\s*:\s*(.*)$", line)
+            if fm:
+                key = _field_key(fm.group(1))
+                if key:
+                    fields[key] = fm.group(2).strip()
+                    last_key = key
+                    continue
+            if last_key and re.match(r"^\s{2,}\S", line):
+                fields[last_key] += " " + line.strip()
+        tasks.append(Task(id=m.group(1), title=m.group(2).strip() or m.group(1), body=body.strip(), fields=fields))
+    return tasks
+
+
+def task_section(plan_text: str, task_id: str) -> Optional[str]:
+    for t in parse_tasks(plan_text):
+        if t.id == task_id:
+            return f"### {t.id} — {t.title}\n{t.body}\n"
+    return None
+
+
+def section(text: str, *names: str) -> Optional[str]:
+    """Return the body of the first level-2 section whose title starts with one of names."""
+    for name in names:
+        m = re.search(r"^##\s+" + re.escape(name) + r"[^\n]*\n", text, re.M | re.I)
+        if m:
+            rest = text[m.end():]
+            nxt = re.search(r"^##\s+", rest, re.M)
+            return rest[: nxt.start()] if nxt else rest
+    return None
+
+
+# ---------------------------------------------------------------- checks
+
+def check_plan(spec_text: str, plan_text: str, project: Optional[Path] = None) -> List[str]:
+    """Structural lint (+ file existence when `project` is given). Returns problems (empty == OK)."""
+    problems: List[str] = []
+    if not spec_text.strip():
+        problems.append("spec.md is missing or empty")
+    if not plan_text.strip():
+        problems.append("plan.md is missing or empty")
+        return problems
+    fm, _ = parse_frontmatter(plan_text)
+    if "approved_dependencies" not in fm:
+        problems.append("plan.md frontmatter must declare `approved_dependencies:` (use [] when none)")
+    tasks = parse_tasks(plan_text)
+    if not tasks:
+        problems.append("plan.md has no tasks (expected headings like `### T001 — Title`)")
+    ids = [t.id for t in tasks]
+    dupes = sorted({i for i in ids if ids.count(i) > 1})
+    if dupes:
+        problems.append(f"duplicate task ids: {', '.join(dupes)}")
+    for t in tasks:
+        for req in ("files", "acceptance", "test"):
+            if not t.fields.get(req, "").strip():
+                label = {"files": "Dosyalar", "acceptance": "Kabul", "test": "Test"}[req]
+                problems.append(f"{t.id}: missing `- {label}:` line")
+        if t.tdd == "n/a" and "(" not in t.fields.get("tdd", "") and len(t.fields.get("tdd", "")) < 8:
+            problems.append(f"{t.id}: `TDD: n/a` needs a reason, e.g. `TDD: n/a (docs only)`")
+        for dep in t.depends:
+            if dep not in ids:
+                problems.append(f"{t.id}: depends on unknown task {dep}")
+        if project is not None:
+            for path, is_new in t.file_entries:
+                if any(ch in path for ch in "*?<>{}") or path.startswith(("http", "$")):
+                    continue
+                if not is_new and not (project / path).exists():
+                    problems.append(f"{t.id}: `{path}` does not exist in the project — fix the path, or mark it "
+                                    f"`(yeni)` if the task creates it")
+    # requirement coverage: every FR must be referenced by at least one task
+    fr_ids = [i for i in spec_ids(spec_text) if i.startswith("FR-")]
+    task_text = "\n".join(t.body for t in tasks)
+    for fr in fr_ids:
+        if fr not in task_text:
+            problems.append(f"{fr} is not covered by any task (reference it in a task's `Kabul:` line)")
+    sc_ids = [i for i in spec_ids(spec_text) if i.startswith("SC-")]
+    for sc in sc_ids:
+        if sc not in plan_text:
+            problems.append(f"{sc} is not referenced anywhere in plan.md (map it in the test strategy)")
+    return problems
+
+
+def check_trace(spec_text: str, verification_text: str) -> List[str]:
+    """Every FR/SC id must appear in verification.md on a row marked PASS."""
+    problems: List[str] = []
+    ids = spec_ids(spec_text)
+    if not ids:
+        return ["spec.md defines no FR-/SC- ids"]
+    rows: Dict[str, List[str]] = {}
+    for line in verification_text.splitlines():
+        for m in ID_RE.finditer(line):
+            rows.setdefault(m.group(1), []).append(line)
+    for i in ids:
+        lines = rows.get(i)
+        if not lines:
+            problems.append(f"{i}: not present in verification.md")
+            continue
+        if not any(re.search(r"\bPASS\b", ln) for ln in lines):
+            problems.append(f"{i}: no PASS row in verification.md")
+        if any(re.search(r"\bFAIL\b", ln) for ln in lines):
+            problems.append(f"{i}: has a FAIL row in verification.md")
+    return problems
+
+
+def verdict(text: str) -> Optional[str]:
+    """The LAST `VERDICT:` line wins (a template placeholder or an earlier round must not count)."""
+    found = re.findall(r"^\s*\**VERDICT\**\s*:\s*\**\s*([A-Z_]+)\b", text, re.M)
+    return found[-1] if found else None
+
+
+def open_triage_items(triage_text: str) -> List[str]:
+    """Rows `| R-001 | ... | fix | open |` style. A row with verdict fix and status != done is open."""
+    open_items: List[str] = []
+    for line in triage_text.splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [c.strip().lower() for c in line.strip().strip("|").split("|")]
+        if not cells or not re.match(r"^r-\d{3}$", cells[0]):
+            continue
+        if "fix" in cells and not any(c in ("done", "fixed", "tamam", "yapıldı") for c in cells):
+            open_items.append(cells[0].upper())
+        if any(c in ("pending", "untriaged", "?") for c in cells):
+            open_items.append(cells[0].upper() + " (untriaged)")
+    return open_items

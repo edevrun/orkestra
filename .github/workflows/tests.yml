@@ -1,0 +1,34 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: git identity for the test repositories
+        run: git config --global user.email ci@example.com && git config --global user.name ci && git config --global init.defaultBranch main
+      - name: plugin tests
+        run: cd plugins/orkestra/tests && python -m unittest discover -s . -q
+      - name: bridge tests
+        run: cd bridge/tests && python -m unittest discover -s . -q
+  openclaw:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: OpenClaw plugin tests
+        run: cd integrations/openclaw/plugin && npm test

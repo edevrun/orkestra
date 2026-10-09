@@ -1,0 +1,21 @@
+{
+ "conversation_id": "ad5ae807-1320-4cab-a35e-e1afb5561bc0",
+ "generation_id": "ad5ae807-1320-4cab-a35e-e1afb5561bc0",
+ "model": "default",
+ "tool_name": "Shell",
+ "tool_input": {
+  "command": "cd /private/tmp/orkestra-e2e/ws/demo && python3 <<'PY'\nimport json, subprocess, sys, os\nfrom pathlib import Path\nPLUGIN = Path(\"/private/tmp/orkestra-e2e/orkestra/plugins/orkestra\")\nconv = os.environ.get(\"CURSOR_CONVERSATION_ID\", \"ad5ae807-1320-4cab-a35e-e1afb5561bc0\")\npayload = {\n    \"conversation_id\": conv,\n    \"generation_id\": \"gen-user-onay-e2e\",\n    \"model\": \"default\",\n    \"session_id\": conv,\n    \"hook_event_name\": \"beforeSubmitPrompt\",\n    \"cursor_version\": \"2026.10.01\",\n    \"workspace_roots\": [str(Path.cwd())],\n    \"user_email\": \"user@example.com\",\n    \"transcript_path\": None,\n    \"prompt\": \"onay\",\n    \"attachments\": [],\n}\ncp = subprocess.run(\n    [sys.executable, str(PLUGIN / \"hooks\" / \"cursor_hook.py\"), \"beforeSubmitPrompt\"],\n    input=json.dumps(payload),\n    capture_output=True,\n    text=True,\n    env={**os.environ, \"CURSOR_AGENT\": \"1\", \"CURSOR_CONVERSATION_ID\": conv},\n)\nprint(\"stdout:\", cp.stdout[:2000])\nprint(\"stderr:\", cp.stderr[:500])\nprint(\"rc:\", cp.returncode)\nPY\norkestra status -p demo",
+  "cwd": "",
+  "timeout": 30000
+ },
+ "tool_use_id": "e3e1504c-31aa-4c54-ad32-2473f32a51d7",
+ "cwd": "",
+ "session_id": "ad5ae807-1320-4cab-a35e-e1afb5561bc0",
+ "hook_event_name": "preToolUse",
+ "cursor_version": "2026.10.01-14929f9",
+ "workspace_roots": [
+  "/private/tmp/orkestra-e2e/ws/demo"
+ ],
+ "user_email": "user@example.com",
+ "transcript_path": "/Users/u/.cursor/projects/private-tmp-orkestra-e2e-ws-demo/agent-transcripts/ad5ae807-1320-4cab-a35e-e1afb5561bc0/ad5ae807-1320-4cab-a35e-e1afb5561bc0.jsonl"
+}

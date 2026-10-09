@@ -1,0 +1,19 @@
+{
+ "conversation_id": "70d44405-90fb-4f42-8886-98cea6f37f63",
+ "generation_id": "89c7fa75-25ca-4970-8154-0c1c71576d9a",
+ "model": "default",
+ "status": "completed",
+ "loop_count": 0,
+ "input_tokens": 585557,
+ "output_tokens": 4553,
+ "cache_read_tokens": 554112,
+ "cache_write_tokens": 0,
+ "session_id": "70d44405-90fb-4f42-8886-98cea6f37f63",
+ "hook_event_name": "stop",
+ "cursor_version": "2026.10.01-14929f9",
+ "workspace_roots": [
+  "/private/tmp/orkestra-e2e/ws/demo"
+ ],
+ "user_email": "user@example.com",
+ "transcript_path": "/Users/u/.cursor/projects/private-tmp-orkestra-e2e-ws-demo/agent-transcripts/70d44405-90fb-4f42-8886-98cea6f37f63/70d44405-90fb-4f42-8886-98cea6f37f63.jsonl"
+}
