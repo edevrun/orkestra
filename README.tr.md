@@ -18,7 +18,8 @@ bash ~/Projects/orkestra/install.sh          # etkileşimli
 bash ~/Projects/orkestra/install.sh --yes    # varsayılanlar: Context7 + Playwright MCP, bridge token
 ```
 
-Kurulum önce test paketini senin makinende koşar (boş makinede ~2 dk). Biri bile kırmızıysa kurulumu durdurur.
+Kurulum önce eklenti ve bridge Python testlerini senin makinende koşar (bu Mac'te ~4 dk; CPU ve sistem yüküne göre değişir).
+Biri bile kırmızıysa kurulumu durdurur. İsteğe bağlı OpenClaw Node.js testleri ayrıca `npm test` ile çalıştırılır.
 Plugin `~/Projects/orkestra/plugins/orkestra`'dan yerinde yüklenir; buradaki her düzenleme bir sonraki
 Claude Code oturumunda geçerli olur.
 
@@ -73,12 +74,14 @@ O kayıt eski bir kopyayı gösteriyorsa (`orkestra cursor status` söyler) eski
 |---|---|
 | Terminal (canlı, 2 sn'de bir yenilenir) | `python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra watch` · tek seferlik: `--once` · bitenler de: `--all` · tek proje: `-p <proje>` |
 | Tarayıcı (salt-okunur, yalnız bu Mac) | `python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra dashboard --open` → http://127.0.0.1:47616/ |
+| Yerel chat ve canlı flow haritası | Bridge çalışırken http://127.0.0.1:47615/ · fazları, kayıtlı ajanları, işleri ve son hook hareketlerini izle |
 | Telegram | `/durum` → bu sohbetin işleri + tüm açık çalışmaların canlı durumu |
 | OpenClaw / script | `python3 ~/Projects/orkestra/bridge/orkestra_client.py runs` (ya da `GET /runs`) |
 
 Her çalışma için: faz çubuğu, bu fazda geçen süre, **şu anki durum** (çalışıyor · komut çalışıyor · sessiz ·
 SENİ BEKLİYOR · bloke · oturum kapanmış olabilir), görev ilerlemesi ve R/G kanıtı, kapı sonuçları, bağlı Claude
 oturumu ve son araç çağrıları (hangi ajan hangi dosyayı okudu/yazdı, hangi komutu koştu, hangi guard neyi engelledi).
+Yerel chat'in **akış haritası**, bu gerçek run verisini faz çizgisi, raporlanan alt-agent ağı, etkin görevler ve son altı hook olayı olarak gösterir; yaklaşık 6 saniyede yenilenir.
 Kaynak dosyalar: `<proje>/.orkestra/runs/<run>/activity.jsonl` (hook'lar yazar, git'e girmez) ve
 `<proje>/.orkestra/current/ledger.md` (faz geçişleri). `watch`/`dashboard` hiçbir şeyi değiştirmez.
 Kısa yol istersen `~/.zshrc`'ye: `alias orkestra="python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra"`.
@@ -250,7 +253,7 @@ Mac uykudaysa bridge çalışmaz; Telegram'dan iş başlatmak için Mac açık v
 ```bash
 python3 plugins/orkestra/bin/orkestra doctor                  # ortam + hook öz-testi + MCP durumu
 cd plugins/orkestra/tests && python3 -m unittest discover -s . -q # 357 test
-cd bridge/tests && python3 -m unittest discover -s . -q           # 16 bridge testi
+cd bridge/tests && python3 -m unittest discover -s . -q           # 19 bridge testi
 cd integrations/openclaw/plugin && npm test                       # 15 test
 bash install.sh --refresh-vendor                               # referans projeleri upstream'den tazele
 ```

@@ -52,7 +52,7 @@ fi
 
 # ------------------------------------------------------------------ 1. tests on THIS machine
 if [ "$SKIP_TESTS" = 0 ]; then
-  say "Test paketi bu makinede koşuyor (boş makinede ~2 dk; yük altında daha uzun)"
+  say "Eklenti ve bridge Python testleri bu makinede koşuyor (birkaç dakika; sistem yüküne göre değişir)"
   ( cd "$PLUGIN/tests" && "$PY" -m unittest discover -s . -q ) || die "plugin testleri geçmedi — kurulum durduruldu"
   ( cd "$ROOT/bridge/tests" && "$PY" -m unittest discover -s . -q ) || die "bridge testleri geçmedi — kurulum durduruldu"
   ok "tüm testler yeşil"

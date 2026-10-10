@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Orkestra — Yerel çalışma alanı</title>
+  <link rel="stylesheet" href="/app.css">
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="Orkestra ana sayfa">
+      <span class="brand-mark">O</span>
+      <span>orkestra</span>
+      <span class="local-tag">LOCAL</span>
+    </a>
+    <div class="top-actions">
+      <span id="connection-status" class="connection-status" role="status">Bağlı değil</span>
+      <button id="disconnect-button" class="button button-quiet" type="button" hidden>Bağlantıyı kes</button>
+    </div>
+  </header>
+
+  <main class="shell">
+    <section class="hero">
+      <p class="eyebrow">CONTROLLED AGENT WORKFLOW · LOCALHOST ONLY</p>
+      <h1>İsteğini yaz.<br><span>Kontrollü akışa bırak.</span></h1>
+      <p class="hero-copy">Proje ve çalışma motorunu seç; Orkestra keşif, plan, onay, uygulama ve doğrulama adımlarını yönetir.</p>
+      <div class="phase-strip" aria-label="Orkestra akışı">
+        <span>Keşif</span><i></i><span>Plan</span><i></i><span>Onay</span><i></i><span>Uygulama</span><i></i><span>Doğrulama</span>
+      </div>
+    </section>
+
+    <section id="connect-panel" class="panel connect-panel">
+      <div>
+        <p class="eyebrow">YEREL BRIDGE</p>
+        <h2>Güvenli şekilde bağlan</h2>
+        <p>Token yalnız bu sekmenin belleğinde tutulur; URL’ye veya tarayıcı depolamasına yazılmaz. Sayfayı yenileyince yeniden girmen gerekir.</p>
+      </div>
+      <form id="connect-form" class="connect-form">
+        <label for="bridge-token">Bridge token</label>
+        <div class="input-row">
+          <input id="bridge-token" type="password" name="bridge-token" autocomplete="off" spellcheck="false" required>
+          <button class="button button-primary" type="submit">Bağlan</button>
+        </div>
+        <p class="field-hint">Yerel dosya: <code>~/.orkestra/bridge.secret.json</code> içindeki <code>token</code> alanı.</p>
+        <p id="connect-error" class="error-message" role="alert" hidden></p>
+      </form>
+    </section>
+
+    <section id="workbench" hidden>
+      <div class="workbench-grid">
+        <section class="panel composer">
+          <div class="panel-heading">
+            <div>
+              <p class="eyebrow">YENİ ÇALIŞMA</p>
+              <h2>Ne yapmak istiyorsun?</h2>
+            </div>
+            <span class="step-number">01</span>
+          </div>
+          <form id="job-form">
+            <div class="form-grid">
+              <div class="field">
+                <label for="project-select">Proje</label>
+                <select id="project-select" required>
+                  <option value="">Bağlanınca projeler yüklenecek</option>
+                </select>
+                <p id="project-scope" class="field-hint"></p>
+              </div>
+              <div class="field">
+                <label for="engine-select">Agent motoru</label>
+                <select id="engine-select" required>
+                  <option value="">Yükleniyor…</option>
+                </select>
+                <p id="engine-hint" class="field-hint">Alt-agent ekibini Orkestra aşamaya göre seçer.</p>
+              </div>
+            </div>
+            <div class="field">
+              <div class="label-row">
+                <label for="request-input">İstek</label>
+                <span id="request-count" class="field-hint">0 / 10.000</span>
+              </div>
+              <textarea id="request-input" minlength="3" maxlength="10000" rows="5" required
+                placeholder="Örn. Sipariş listesine CSV dışa aktarma ekle; mevcut testleri ve API sözleşmesini koru."></textarea>
+            </div>
+            <label class="consent-row">
+              <input id="consent-check" type="checkbox" required>
+              <span>Agent’ın seçtiğim projede, işletim sistemi kullanıcı izinlerimle çalıştığını ve değişiklikleri kendim incelemem gerektiğini anlıyorum.</span>
+            </label>
+            <div class="submit-row">
+              <p id="job-error" class="error-message" role="alert" hidden></p>
+              <button id="start-button" class="button button-primary button-start" type="submit" disabled>Akışı başlat <span aria-hidden="true">→</span></button>
+            </div>
+          </form>
+        </section>
+
+        <aside class="panel guide-panel">
+          <p class="eyebrow">NASIL İŞLER</p>
+          <h2>Sen kontrolü elinde tutarsın.</h2>
+          <ol class="guide-list">
+            <li><span>1</span><div><b>İstek ve proje</b><p>Kapsamı net bir dille yaz; doğru klasörü seç.</p></div></li>
+            <li><span>2</span><div><b>Plan ve onay</b><p>Normal akışta planı sen onaylamadan uygulama başlamaz.</p></div></li>
+            <li><span>3</span><div><b>İlerlemeyi izle</b><p>Sorulara buradan yanıt ver; canlı durum bu sayfada güncellenir.</p></div></li>
+          </ol>
+          <div class="local-notice">
+            <span class="notice-icon" aria-hidden="true">i</span>
+            <p>Bu arayüz yalnız bu bilgisayarda dinler. Orkestra veriyi kendi sunucusuna göndermez; seçtiğin Claude Code veya Cursor aracı, istek ve kodu kendi sağlayıcısına aktarabilir.</p>
+          </div>
+        </aside>
+      </div>
+
+      <section class="flow-section" aria-labelledby="flow-heading">
+        <div class="flow-section-heading">
+          <div class="flow-heading-copy">
+            <p class="eyebrow">CANLI ORKESTRASYON</p>
+            <h2 id="flow-heading">Akışın haritası</h2>
+            <p>Her adım, ajan ve hareket gerçek çalışma kaydından gelir; geçmiş etkinlikleri aktif çalışma gibi göstermeyiz.</p>
+          </div>
+          <div class="flow-summary" aria-live="off">
+            <span class="flow-summary-mark" aria-hidden="true"></span>
+            <span id="flow-summary">Akış bekleniyor</span>
+          </div>
+        </div>
+        <div id="flows-list" class="flows-list">
+          <div class="empty-state flow-empty">
+            <span class="empty-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+            <b>Orkestra hazır</b>
+            <span>Bir çalışma başladığında fazları, ajanları ve son hareketleri burada canlı izleyeceksin.</span>
+          </div>
+        </div>
+        <div class="flow-footer">
+          <span id="flows-updated" class="field-hint" role="status">Akış verisi henüz alınmadı</span>
+          <span class="flow-live-legend"><i aria-hidden="true"></i> açık çalışma · yaklaşık 6 sn’de yenilenir</span>
+        </div>
+      </section>
+
+      <section class="jobs-section">
+        <div class="jobs-heading">
+          <div>
+            <p class="eyebrow">CANLI TAKİP</p>
+            <h2>Çalışmalar</h2>
+          </div>
+          <div class="jobs-tools">
+            <span id="jobs-updated" class="field-hint">Henüz güncellenmedi</span>
+            <button id="refresh-button" class="button button-quiet" type="button">Görünümü yenile</button>
+          </div>
+        </div>
+        <div id="jobs-list" class="jobs-list" aria-live="polite">
+          <div class="empty-state">Bridge’e bağlanınca son çalışmalar burada görünür.</div>
+        </div>
+      </section>
+    </section>
+
+    <section class="legal-panel">
+      <div class="legal-copy">
+        <p class="eyebrow">KULLANIM, LİSANS VE KAYNAK</p>
+        <h2>Şeffaf ve yerel.</h2>
+        <p>Orkestra açık kaynak MIT lisanslıdır. Üçüncü taraf referans dosyalarının lisansları ve upstream kaynakları ayrı listelenir. Orkestra bağımsızdır; Anthropic, Cursor veya listelenen projeler tarafından desteklenmez.</p>
+        <p>Yazılım “olduğu gibi” sunulur; çıktı veya hukuki uygunluk garantisi vermez ve hukuki tavsiye değildir. Guard’lar sandbox değildir: agent yerel kullanıcı yetkileriyle çalışır. Üretilen değişiklikleri ve sağlayıcının kullanım/veri koşullarını incelemek senin sorumluluğundadır.</p>
+      </div>
+      <nav class="legal-links" aria-label="Lisans ve kaynak belgeleri">
+        <a href="/legal/license" target="_blank" rel="noopener">MIT lisansı <span>↗</span></a>
+        <a href="/legal/third-party-notices" target="_blank" rel="noopener">Üçüncü taraf kaynakları <span>↗</span></a>
+        <a href="/legal/security" target="_blank" rel="noopener">Güvenlik açıklaması <span>↗</span></a>
+      </nav>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Orkestra · yalnızca 127.0.0.1</span>
+    <span>MIT · telemetry yok · harici UI bağımlılığı yok</span>
+  </footer>
+</body>
+</html>

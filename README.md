@@ -15,8 +15,8 @@ result over. It never commits, pushes or deploys unless you ask for it in that m
 
 What makes the result depend less on how strong the model is:
 
-- **The state machine is code, not a prompt.** Ten phases (intake → discover → clarify → spec → plan → approve →
-  implement → verify → review → deliver). `orkestra phase next` refuses to advance until the evidence for the
+- **The state machine is code, not a prompt.** Ten phases (intake → discover → clarify → plan → approve →
+  implement → verify → review → deliver → done). `orkestra phase next` refuses to advance until the evidence for the
   current phase exists on disk: a plan that passes `orkestra plan check`, a recorded approval, a red and a green
   test run per task, passing gates compared with the baseline taken before the first edit.
 - **Guards are hooks.** Every tool call goes through one hook entry that denies, before the call runs: source
@@ -38,11 +38,13 @@ What makes the result depend less on how strong the model is:
 ## Install
 
 ```bash
-git clone <repository-url> orkestra
+git clone https://github.com/soft-ai-solutions/orkestra.git
 bash orkestra/install.sh            # interactive;  --yes accepts the defaults,  --no-mcp skips optional MCP servers
 ```
 
-The installer first runs the whole test suite on your machine (about two minutes) and stops if anything is red.
+The installer first runs the Python plugin and bridge test suites on your machine (a few minutes; CPU and system
+load affect the duration) and stops if anything is red. The optional OpenClaw Node.js suite is run separately with
+`npm test` (see Tests).
 Then it registers the checkout as a Claude Code plugin marketplace (`orkestra@orkestra-local`); the plugin is
 loaded in place from `orkestra/plugins/orkestra`. For Cursor, additionally:
 
@@ -69,6 +71,10 @@ Projects are looked up by name under a workspace folder, `~/Projects` by default
 
 Health check: `orkestra doctor`. Live view of all runs: `orkestra watch`. An optional HTTP bridge
 (`bridge/orkestra_bridge.py`) starts and answers runs from n8n, Telegram or any webhook; see README.tr.md.
+With the bridge running, open `http://127.0.0.1:47615/` (default port) for the local chat workbench: select a project
+and Claude Code/Cursor engine, start a request, answer follow-up questions and stop a run. It asks for the bridge
+token; the page keeps it in memory only. Its live flow map shows the current phase, reported subagents, in-progress
+tasks, approval/verification gates and recent hook activity. The UI is loopback-only, not a sandbox.
 
 ## Language
 
@@ -90,9 +96,12 @@ in Turkish. Approval is recognised in both languages (`approve`, `yes`, `onay`, 
 
 ```bash
 cd plugins/orkestra/tests && python3 -m unittest discover -s . -q     # 357 tests
-cd bridge/tests && python3 -m unittest discover -s . -q                # 16 tests
+cd bridge/tests && python3 -m unittest discover -s . -q                # 19 tests
 cd integrations/openclaw/plugin && npm test                            # 15 tests
 ```
+
+CI is configured to run the Python suites on Linux and macOS with Python 3.9, 3.13, and 3.14; the OpenClaw
+integration suite runs on Node.js 22.
 
 ## Credits and licences
 

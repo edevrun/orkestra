@@ -12,9 +12,14 @@ HTTP API (all except /health need `Authorization: Bearer <token>`):
     POST /jobs            {"project": "shop", "request": "...", "chat_id": "optional"}
     GET  /jobs[?chat_id=] | GET /jobs/<id>
     GET  /runs            live view of every open orkestra run (phase, what it is doing now, who it waits for)
+    GET  /projects        project names allowed by the bridge workspace/allowlist
+    GET  /engines         configured Claude Code and Cursor availability
     POST /jobs/<id>/reply {"text": "..."}
+    POST /jobs/<id>/cancel
     POST /reply           {"chat_id": "...", "text": "..."}   → latest job of that chat waiting for the user
     POST /telegram        {"chat_id": "...", "text": "..."}   → same command language as the Telegram bot
+
+Local UI: open http://127.0.0.1:47615/ and authenticate with the bridge token.
 
 Command language (Telegram / POST /telegram):
     /yap <proje> <istek>   start a run          /durum   jobs of this chat + live view of open runs
@@ -53,6 +58,16 @@ CONFIG_PATH = HOME / "bridge.secret.json"
 JOBS_DIR = HOME / "bridge" / "jobs"
 LOG_PATH = HOME / "logs" / "bridge.log"
 TG_MAX = 3800
+UI_CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; "
+          "base-uri 'none'; form-action 'self'; frame-ancestors 'none'")
+UI_FILES = {
+    "/": (HERE / "ui" / "index.html", "text/html; charset=utf-8"),
+    "/app.js": (HERE / "ui" / "app.js", "text/javascript; charset=utf-8"),
+    "/app.css": (HERE / "ui" / "app.css", "text/css; charset=utf-8"),
+    "/legal/license": (HERE.parent / "LICENSE", "text/plain; charset=utf-8"),
+    "/legal/third-party-notices": (HERE.parent / "THIRD_PARTY_NOTICES.md", "text/plain; charset=utf-8"),
+    "/legal/security": (HERE.parent / "SECURITY.md", "text/plain; charset=utf-8"),
+}
 
 DEFAULTS: Dict[str, Any] = {
     "host": "127.0.0.1",
@@ -136,6 +151,30 @@ def resolve_project(cfg: Dict[str, Any], name: str) -> Path:
     return path
 
 
+def ui_projects(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    root = workspace(cfg)
+    if not root.is_dir():
+        raise ValueError("bridge workspace is not available")
+    allowed = cfg.get("allowed_projects") or []
+    if not isinstance(allowed, list) or any(not isinstance(name, str) for name in allowed):
+        raise ValueError("bridge allowed_projects must be a list of project names")
+    if allowed:
+        candidates = list(dict.fromkeys(allowed))
+    else:
+        candidates = sorted(p.name for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
+    projects = []
+    for name in candidates:
+        try:
+            resolve_project(cfg, name)
+        except ValueError as exc:
+            if allowed:
+                raise ValueError(f"configured project is unavailable: {name}") from exc
+            continue
+        projects.append({"name": name})
+    projects.sort(key=lambda item: item["name"].casefold())
+    return {"projects": projects, "restricted": bool(allowed)}
+
+
 # ====================================================================== jobs
 
 def job_path(job_id: str) -> Path:
@@ -210,6 +249,20 @@ def cursor_ready(cfg: Dict[str, Any], project: Optional[Path] = None) -> str:
     except Exception as exc:
         return f"Cursor kurulumu denetlenemedi: {exc}"
     return ""
+
+
+def ui_engines(cfg: Dict[str, Any], project_name: Optional[str] = None) -> Dict[str, Any]:
+    project = resolve_project(cfg, project_name) if project_name else None
+    claude = EN.binary("claude", orkestra_cfg(), hint=cfg.get("claude_bin") or None)
+    cursor_error = cursor_ready(cfg, project)
+    return {
+        "default": pick_engine(cfg, None),
+        "engines": [
+            {"id": "claude", "label": "Claude Code", "available": bool(claude),
+             "reason": "" if claude else "Claude Code CLI bulunamadı"},
+            {"id": "cursor", "label": "Cursor", "available": not bool(cursor_error), "reason": cursor_error},
+        ],
+    }
 
 
 def orkestra_status(project: Path) -> Dict[str, Any]:
@@ -645,17 +698,45 @@ def telegram_poller(cfg: Dict[str, Any], stop: threading.Event) -> None:
 
 class Handler(BaseHTTPRequestHandler):
     cfg: Dict[str, Any] = {}
+    server_version = "orkestra-bridge"
+    sys_version = ""
 
     def log_message(self, fmt: str, *args: Any) -> None:  # quiet
         log("http " + fmt % args)
 
     def _send(self, code: int, payload: Any) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self._send_bytes(code, body, "application/json; charset=utf-8")
+
+    def _send_bytes(self, code: int, body: bytes, content_type: str) -> None:
         self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if content_type.startswith("text/html"):
+            self.send_header("Content-Security-Policy", UI_CSP)
         self.end_headers()
         self.wfile.write(body)
+
+    def _local_ui_host(self) -> bool:
+        port = int(self.cfg.get("port") or DEFAULTS["port"])
+        return self.headers.get("Host", "").lower() in {
+            f"127.0.0.1:{port}", f"localhost:{port}", f"[::1]:{port}",
+        }
+
+    def _send_ui_file(self, route: str) -> None:
+        if not self._local_ui_host():
+            return self._send(403, {"error": "invalid host"})
+        path, content_type = UI_FILES[route]
+        try:
+            body = path.read_bytes()
+        except OSError as exc:
+            log(f"UI asset unavailable ({route}): {exc}")
+            return self._send(500, {"error": "local UI resource unavailable"})
+        self._send_bytes(200, body, content_type)
 
     def _auth(self) -> bool:
         token = self.cfg.get("token") or ""
@@ -677,10 +758,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         url = urllib.parse.urlparse(self.path)
+        if url.path in UI_FILES:
+            return self._send_ui_file(url.path)
         if url.path == "/health":
             return self._send(200, {"ok": True})
         if not self._auth():
             return
+        if url.path == "/projects":
+            try:
+                return self._send(200, ui_projects(self.cfg))
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
+            except OSError as exc:
+                log(f"project list unavailable: {exc}")
+                return self._send(503, {"error": "bridge workspace is unavailable"})
+        if url.path == "/engines":
+            project = urllib.parse.parse_qs(url.query).get("project", [None])[0]
+            try:
+                return self._send(200, ui_engines(self.cfg, project))
+            except ValueError as exc:
+                return self._send(400, {"error": str(exc)})
         if url.path == "/jobs":
             chat = urllib.parse.parse_qs(url.query).get("chat_id", [None])[0]
             return self._send(200, {"jobs": [public(j) for j in list_jobs(chat)]})
@@ -702,6 +799,15 @@ class Handler(BaseHTTPRequestHandler):
                 job = start_job(self.cfg, str(data.get("project", "")), str(data.get("request", "")),
                                 data.get("chat_id"), str(data.get("source") or "api")[:40],
                                 str(data.get("engine") or "") or None)
+                return self._send(202, public(job))
+            m = re.match(r"^/jobs/([a-f0-9]+)/cancel$", url.path)
+            if m:
+                job = load_job(m.group(1))
+                if not job:
+                    return self._send(404, {"error": "not found"})
+                if job.get("status") in ("done", "error", "cancelled"):
+                    return self._send(409, {"error": f"job already closed ({job['status']})"})
+                cancel_job(job)
                 return self._send(202, public(job))
             m = re.match(r"^/jobs/([a-f0-9]+)/reply$", url.path)
             if m:
@@ -780,7 +886,8 @@ def serve(cfg: Dict[str, Any]) -> None:
     threading.Thread(target=telegram_poller, args=(cfg, stop), daemon=True).start()
     threading.Thread(target=watchdog_loop, args=(cfg, stop), daemon=True).start()
     log(f"bridge listening on {cfg['host']}:{cfg['port']}")
-    print(f"orkestra bridge on http://{cfg['host']}:{cfg['port']} (log: {LOG_PATH})", flush=True)
+    print(f"orkestra bridge on http://{cfg['host']}:{cfg['port']} · local UI: "
+          f"http://127.0.0.1:{cfg['port']}/ (log: {LOG_PATH})", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

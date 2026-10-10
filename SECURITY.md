@@ -12,4 +12,9 @@ issue. Include the command or tool call, the engine (Claude Code or Cursor) and 
 `~/.orkestra/bridge.secret.json` (mode 600) and the bridge listens on 127.0.0.1 only. Nothing is sent to any
 server by Orkestra itself.
 
+The local browser UI is served by that loopback bridge. It asks you to enter the token, does not put it in the URL
+or browser storage, and keeps it in page memory only. The selected Claude Code or Cursor client may send prompts and
+project context to its own provider under that provider's terms. The UI is not a security boundary against other
+programs running as your OS user.
+
 **Supported versions.** The latest release.

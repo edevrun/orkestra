@@ -3,6 +3,10 @@
 ## Unreleased
 - Güncel Claude kaynaklarından altı bayat Cursor skill'i yeniden üretildi.
 - OpenClaw eklentisinin Node testleri Linux ve macOS CI iş akışına eklendi.
+- Bridge'e token bellekte tutulan, loopback-only yerel chat arayüzü ve proje/motor keşfi eklendi.
+- Yerel arayüze gerçek run verisinden responsive faz haritası, etkin ajan ağı, görevler, kalite kapıları ve son hook hareketleri eklendi.
+- README kurulum adresi ve faz listesi kodla eşitlendi; CI Python matrisi 3.14'e genişletildi (3.9 minimumu korunarak).
+- Herkese açık depo testi, köke sabitlenmiş `dist/`/`internal/` ignore kurallarını davranış olarak doğruluyor.
 
 ## 1.6.0 — 2026-10-06
 Depoyu herkese açmaya hazırlık (dört açıdan denetim, her bulgu ayrıca çürütülmeye çalışıldı) ve zayıf bir modelin

@@ -116,6 +116,58 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.call("GET", "/jobs", token=False)[0], 401)
         self.assertEqual(self.call("POST", "/jobs", {"project": "demo", "request": "x"}, token=False)[0], 401)
 
+    def test_local_ui_assets_and_legal_links(self):
+        base = f"http://127.0.0.1:{self.port}"
+        with urllib.request.urlopen(base + "/", timeout=3) as response:
+            html = response.read().decode("utf-8")
+            self.assertIn("default-src 'none'", response.headers.get("Content-Security-Policy", ""))
+            self.assertIn("script-src 'self'", response.headers.get("Content-Security-Policy", ""))
+            self.assertEqual(response.headers.get("X-Frame-Options"), "DENY")
+        self.assertIn("id=\"job-form\"", html)
+        self.assertIn("id=\"flows-list\"", html)
+        self.assertIn("/legal/third-party-notices", html)
+        for path, marker in (("/app.css", "--accent"), ("/app.js", "Bearer ${state.token}"),
+                             ("/legal/license", "MIT License"),
+                             ("/legal/third-party-notices", "https://github.com/obra/superpowers"),
+                             ("/legal/security", "not a sandbox")):
+            with urllib.request.urlopen(base + path, timeout=3) as response:
+                self.assertEqual(response.status, 200)
+                self.assertIn(marker, response.read().decode("utf-8"))
+        request = urllib.request.Request(base + "/", headers={"Host": "example.invalid"})
+        with self.assertRaises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(request, timeout=3)
+        self.assertEqual(raised.exception.code, 403)
+        raised.exception.close()
+        with urllib.request.urlopen(base + "/app.js", timeout=3) as response:
+            self.assertIn('api("/runs")', response.read().decode("utf-8"))
+        with urllib.request.urlopen(base + "/app.css", timeout=3) as response:
+            self.assertIn("flow-stage-list", response.read().decode("utf-8"))
+
+    def test_ui_project_and_engine_options_are_authenticated_and_scoped(self):
+        self.assertEqual(self.call("GET", "/projects", token=False)[0], 401)
+        code, projects = self.call("GET", "/projects")
+        self.assertEqual(code, 200)
+        self.assertTrue(projects["restricted"])
+        self.assertEqual({item["name"] for item in projects["projects"]},
+                         {"demo", "demo2", "demo3", "demo4", "demo5"})
+        self.assertNotIn(str(self.ws), json.dumps(projects))
+        code, engines = self.call("GET", "/engines?project=demo")
+        self.assertEqual(code, 200)
+        self.assertEqual(engines["default"], "claude")
+        self.assertEqual({item["id"] for item in engines["engines"]}, {"claude", "cursor"})
+        self.assertTrue(all(isinstance(item["available"], bool) for item in engines["engines"]))
+        self.assertEqual(self.call("GET", "/engines?project=../etc")[0], 400)
+
+    def test_0_job_can_be_cancelled_by_id(self):
+        code, job = self.call("POST", "/jobs", {"project": "demo3", "request": "öncelik ekle"})
+        self.assertEqual(code, 202, job)
+        self.wait_status(job["id"], "awaiting_user")
+        self.assertEqual(self.call("POST", f"/jobs/{job['id']}/cancel", {}, token=False)[0], 401)
+        code, cancelled = self.call("POST", f"/jobs/{job['id']}/cancel", {})
+        self.assertEqual(code, 202, cancelled)
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(self.call("POST", f"/jobs/{job['id']}/cancel", {})[0], 409)
+
     def test_2_project_validation(self):
         for bad in ("../etc", "/etc", "nope", "", "a b"):
             code, body = self.call("POST", "/jobs", {"project": bad, "request": "bir şey yap"})

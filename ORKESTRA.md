@@ -55,6 +55,7 @@ Terminalde (`python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra …`; kı
 | Komut | İş |
 |---|---|
 | `watch` · `dashboard --open` | Canlı görünüm (terminal · http://127.0.0.1:47616). Salt-okunur. |
+| Bridge chat UI | http://127.0.0.1:47615/ · proje/Claude/Cursor seç; faz haritası, ajan ağı, görevler ve son hook hareketlerini izle. |
 | `status -p <proje>` · `context` | Run'ın fazı, görevleri, kanıt eksikleri. |
 | `next -p <proje>` | Sıradaki tek adım. Aynı durumda hep aynı cevap. |
 | `tempo -p <proje> [--run <id>]` | Süre dökümü: fazlar, görev başına süre, inceleme retleri, ölü bekleme payı. |
@@ -162,7 +163,7 @@ Test:
 
 ```bash
 cd ~/Projects/orkestra/plugins/orkestra/tests && python3 -m unittest discover -s . -q   # 357 test
-cd ~/Projects/orkestra/bridge/tests && python3 -m unittest discover -s . -q             # 16 test
+cd ~/Projects/orkestra/bridge/tests && python3 -m unittest discover -s . -q             # 19 test
 cd ~/Projects/orkestra/integrations/openclaw/plugin && npm test                          # 15 test
 python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra doctor
 ```
@@ -187,7 +188,7 @@ Sabitlenmiş referansları yenilemek: `bash install.sh --refresh-vendor` (kaynak
 
 ## Açık konular
 
-- Testler Python 3.9 ve 3.10 (Linux) ile 3.14 (bu Mac) üzerinde koştu.
+- CI matrisi Python 3.9, 3.13 ve 3.14 için Linux/macOS'ta yapılandırıldı; tam yerel test paketi Python 3.14.7'de koştu.
 - Cursor motoru komut satırı aracıyla (`agent` 2026.10.01) beş gerçek XS run'da denendi; Cursor IDE penceresi ayrıca
   denenmedi (aynı hook sözleşmesi; IDE'ye özgü bir fark gözlenmedi çünkü bakılmadı).
 - Cursor, Claude Code'un eklenti kaydındaki eski orkestra kopyasını (1.0.0, `~/.claude/plugins/cache/…`) da yükler;

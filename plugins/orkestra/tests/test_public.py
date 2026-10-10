@@ -4,6 +4,7 @@ Plus the files a public repository must ship (licences, notices, no private data
 import json
 import os
 import re
+import subprocess
 import time
 import unittest
 from pathlib import Path
@@ -102,7 +103,12 @@ class TestPublicRepository(unittest.TestCase):
 
     def files(self):
         for d, dirs, names in os.walk(ROOT):
-            dirs[:] = [x for x in dirs if x not in ("dist", "internal", "__pycache__", ".git", "node_modules")]
+            root = Path(d)
+            dirs[:] = [
+                name for name in dirs
+                if name not in ("__pycache__", ".git", "node_modules")
+                and not (root == ROOT and name in ("dist", "internal"))
+            ]
             for n in names:
                 if n.endswith(self.TEXT):
                     yield Path(d) / n
@@ -147,8 +153,15 @@ class TestPublicRepository(unittest.TestCase):
         self.assertEqual(hits[:15], [])
         for manifest in (ROOT / ".claude-plugin/marketplace.json", helpers.PLUGIN / ".claude-plugin/plugin.json"):
             self.assertNotIn("email", manifest.read_text())
-        self.assertIn("internal/", (ROOT / ".gitignore").read_text().split())
-        self.assertIn("dist/", (ROOT / ".gitignore").read_text().split())
+        ignore_file = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        self.assertIn("/internal/", ignore_file.splitlines())
+        self.assertIn("/dist/", ignore_file.splitlines())
+        for path in ("dist/release.tar.gz", "internal/notes.md"):
+            cp = subprocess.run(["git", "check-ignore", "--no-index", "--quiet", "--", path], cwd=ROOT)
+            self.assertEqual(cp.returncode, 0, f"{path} should be ignored")
+        for path in ("bridge/dist/package.json", "bridge/internal/guide.md"):
+            cp = subprocess.run(["git", "check-ignore", "--no-index", "--quiet", "--", path], cwd=ROOT)
+            self.assertEqual(cp.returncode, 1, f"{path} should not be ignored by the root-only rules")
 
     def test_documents_point_at_files_that_exist(self):
         for doc in ("README.md", "README.tr.md", "ORKESTRA.md", "CONTRIBUTING.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md"):
