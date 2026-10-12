@@ -1,7 +1,12 @@
 {
   "name": "orkestra-local",
-  "owner": { "name": "Orkestra contributors" },
-  "metadata": { "description": "Marketplace for the Orkestra plugin (installed from a local checkout)", "version": "1.6.0" },
+  "owner": {
+    "name": "Orkestra contributors"
+  },
+  "metadata": {
+    "description": "Marketplace for the Orkestra plugin (installed from a local checkout)",
+    "version": "1.6.0"
+  },
   "plugins": [
     {
       "name": "orkestra",

@@ -63,6 +63,15 @@ class TestParserFixes(unittest.TestCase):
         self.assertFalse(decide(bash("rm -rf /tmp/rev-T043/*", agent="orkestra:reviewer"), binding()).denied)
         self.assertTrue(decide(bash("rm -rf /w/other/*"), binding()).denied)
 
+    def test_recursive_project_deletion_is_blocked_but_plan_commands_stay_allowed(self):
+        for cmd in ("rm -rf src", "rm -r -f src", "rm --recursive --force src", "command rm -rf src",
+                    "env rm -rf src", "bash -c 'rm -rf src'", "bash -lc 'rm -rf src'"):
+            d = decide(bash(cmd), binding())
+            self.assertTrue(d.denied and d.guard == "destructive", cmd)
+        self.assertFalse(decide(bash("rm src/obsolete.ts"), binding()).denied)
+        self.assertFalse(decide(bash("rm -rf /tmp/orkestra-probe/*"), binding()).denied)
+        self.assertFalse(decide(bash("npm test"), binding()).denied)
+
     def test_scripts_may_read_run_state_but_not_write_it(self):
         b = binding()
         read = "python3 -c \"print(open('.orkestra/runs/001-x/evidence/T001-red-1.log').read()[-400:])\" 2>/dev/null"

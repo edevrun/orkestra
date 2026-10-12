@@ -21,6 +21,20 @@ from orkestra_core import monitor as MON
 
 
 class ActivityUnit(unittest.TestCase):
+    def test_dashboard_compacts_repeated_bash_denials_without_hiding_distinct_reasons(self):
+        rows = [
+            {"ts": 1000, "agent": "main", "kind": "deny", "tool": "Bash", "what": "internals"},
+            {"ts": 1010, "agent": "main", "kind": "deny", "tool": "Bash", "what": "internals"},
+            {"ts": 1020, "agent": "main", "kind": "tool", "tool": "Read", "what": "file.py"},
+            {"ts": 1030, "agent": "main", "kind": "deny", "tool": "Bash", "what": "roles"},
+        ]
+        feed = MON._activity_feed(rows, 10)
+        denials = [item for item in feed if item["kind"] == "deny"]
+        self.assertEqual(len(feed), 3)
+        self.assertEqual(len(denials), 2)
+        repeated = next(item for item in denials if item["what"] == "internals")
+        self.assertEqual(repeated["repeat_count"], 2)
+
     def test_liveness_levels(self):
         now = 10_000.0
         st = {"status": "active", "phase": "implement"}
@@ -34,6 +48,14 @@ class ActivityUnit(unittest.TestCase):
         self.assertEqual(A.liveness(st, answered, now)["level"], "run")
         idle = [{"ts": now - 30, "kind": "idle", "tool": "", "what": "tur bitti"}]
         self.assertIn("turu bitirdi", A.liveness(st, idle, now)["text"])
+        resumed_live = A.liveness(st, idle, now, state_mtime=now - 5)
+        self.assertEqual(resumed_live["level"], "run")
+        self.assertIn("5 sn önce güncellendi", resumed_live["text"])
+        old_hook = [{"ts": now - 27_000, "kind": "end", "tool": "Bash", "what": "✓"}]
+        recent_state = A.liveness(dict(st, phase="plan"), old_hook, now, state_mtime=now - 5)
+        self.assertEqual(recent_state["level"], "run")
+        self.assertIn("plan", recent_state["text"])
+        self.assertIn("7 sa 30 dk", recent_state["text"])
         bash = [{"ts": now - 300, "kind": "tool", "tool": "Bash", "what": "npm test"}]
         lv = A.liveness(st, bash, now)
         self.assertEqual(lv["level"], "run")
@@ -103,6 +125,16 @@ class ActivityHooks(FlowBase):
         text = MON.render_text(views, color=False, width=120)
         self.assertIn("SENİ BEKLİYOR", text)
         self.assertIn(self.rid, text)
+        for _ in range(3):
+            self.hook("PreToolUse", dict(base, tool_name="Bash",
+                                          tool_input={"command": f"python3 {helpers.PLUGIN}/hooks/dispatch.py Stop"}))
+        compacted = MON.discover()[0]["activity"]
+        bash_denials = [row for row in compacted if row["kind"] == "deny" and row["tool"] == "Bash"]
+        self.assertEqual(len(bash_denials), 1)
+        self.assertEqual(bash_denials[0]["repeat_count"], 3)
+        summary = MON.render_text(MON.discover(), color=False, width=120)
+        self.assertIn("Koruma ×3", summary)
+        self.assertNotIn("deny Bash", summary)
 
         # answer → running again; then the turn ends → waiting for the user
         self.hook("PostToolUse", dict(base, tool_name="AskUserQuestion",

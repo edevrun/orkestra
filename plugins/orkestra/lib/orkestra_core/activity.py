@@ -81,6 +81,9 @@ def record(project: Path, run_id: str, ev: Dict[str, Any], kind: str, extra: str
             "tool": ev.get("tool_name") or "",
             "what": _mask(what),
         }
+        sid = str(ev.get("session_id") or "")
+        if sid:
+            row["sid"] = re.sub(r"[^A-Za-z0-9_.-]", "_", sid)[:120]
         if ev.get("agent_type") and ev.get("agent_id"):
             row["aid"] = str(ev["agent_id"])[:64]           # which instance (two implementers share one type)
         with open(path, "a", encoding="utf-8") as fh:
@@ -120,6 +123,70 @@ def is_synthetic_prompt(prompt: str) -> bool:
     return head.startswith("<system-reminder") and bool(
         re.search(r"<agent-message\b|<task-notification\b|\[Subagent hand-back\]", head))
 
+
+
+DRIVE_KINDS = frozenset({"tool", "result", "answer", "deny", "end"})
+
+
+def _safe_sid_token(session_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", session_id or "")[:120]
+
+
+def last_user_what(project: Path, run_id: str, session_id: str = "") -> str:
+    """Newest activity `user` row text for this session (empty when none)."""
+    rows = read_rows(project, run_id)
+    want = _safe_sid_token(session_id) if session_id else ""
+    for r in reversed(rows):
+        if r.get("kind") != "user":
+            continue
+        sid = str(r.get("sid") or "")
+        if want and sid and sid != want:
+            continue
+        return str(r.get("what") or "")
+    return ""
+
+
+def turn_drove_run(project: Path, run_id: str, session_id: str = "") -> bool:
+    """True when this session did drive work on the run since the last real user prompt.
+
+    No user prompt yet: a fresh bind still counts, so start/resume mid-run keeps Stop pressure.
+    After a user prompt with no tool/result/answer/deny/end: False (unbind + idle — do not hijack).
+
+    If the last user row for this session is off-topic vs the bound project, return False even when
+    tools ran earlier — Stop follow-ups skip beforeSubmitPrompt, so this is the bind-isolation gate.
+    """
+    from . import intent as _intent
+    rows = read_rows(project, run_id)
+    want = _safe_sid_token(session_id) if session_id else ""
+    last_user = -1
+    for i, r in enumerate(rows):
+        if r.get("kind") != "user":
+            continue
+        sid = str(r.get("sid") or "")
+        if want and sid and sid != want:
+            continue
+        last_user = i
+    if last_user >= 0:
+        what = str(rows[last_user].get("what") or "")
+        if what and _intent.off_topic_vs_project(what, project, run_id, title=""):
+            return False
+    after = rows[last_user + 1:] if last_user >= 0 else rows
+    for r in after:
+        if r.get("kind") not in DRIVE_KINDS:
+            continue
+        sid = str(r.get("sid") or "")
+        if want and sid and sid != want:
+            continue
+        return True
+    if last_user < 0:
+        for r in rows:
+            if r.get("kind") != "bind":
+                continue
+            sid = str(r.get("sid") or "")
+            if want and sid and sid != want:
+                continue
+            return True
+    return False
 
 def read_all_rows(project: Path, run_id: str) -> List[Dict[str, Any]]:
     """Archive + live rows, oldest first (timing analysis only — never called from hooks)."""
@@ -610,7 +677,9 @@ def _liveness(st: Dict[str, Any], rows: List[Dict[str, Any]], now: Optional[floa
         if r.get("kind") != "nudge":
             last = r
             break
-    last_ts = float(last.get("ts") or 0) if last else float(state_mtime or 0)
+    event_ts = float(last.get("ts") or 0) if last else 0.0
+    state_ts = float(state_mtime or 0)
+    last_ts = max(event_ts, state_ts)
     age = max(0, int(now - last_ts)) if last_ts else None
     if pending:                                     # background subagents registered by the hooks (agents.json)
         who = ", ".join(f"{short_agent(str(a.get('type') or ''))}"
@@ -620,13 +689,20 @@ def _liveness(st: Dict[str, Any], rows: List[Dict[str, Any]], now: Optional[floa
         return {"level": "run", "text": f"alt-ajan çalışıyor: {who}"
                                         + (" · ana oturum raporu bekliyor" if main_waits else "")}
     if last and last.get("kind") == "idle":
-        return {"level": "wait", "text": f"SENİ BEKLİYOR — Claude turu bitirdi ({_ago(age)}); o pencereye cevap yaz"}
+        if state_ts <= event_ts:
+            return {"level": "wait", "text": f"SENİ BEKLİYOR — Claude turu bitirdi ({_ago(age)}); o pencereye cevap yaz"}
     talk_phase = st.get("phase") in ("clarify", "approve")
     if talk_phase and (age is None or age >= 90) and not (last and last.get("kind") == "tool"
                                                           and last.get("tool") == "Bash" and (age or 0) < 1800):
         return {"level": "wait", "text": f"muhtemelen SENİ BEKLİYOR — {st.get('phase')} fazında"
                                          f"{'' if age is None else ' ' + _dur(age) + ' hareket yok'}; "
                                          f"o projenin Claude penceresinde soru/onay açık olabilir"}
+    if status == "active" and state_ts > event_ts:
+        state_age = max(0, int(now - state_ts))
+        event_age = max(0, int(now - event_ts)) if event_ts else None
+        level = "run" if state_age < 90 else "quiet"
+        hook_activity = f"son hook aktivitesi {_ago(event_age)}" if event_age is not None else "henüz hook aktivitesi yok"
+        return {"level": level, "text": f"{st.get('phase') or 'aktif'} fazı açık — run durumu {_ago(state_age)} güncellendi; {hook_activity}"}
     if age is None:
         return {"level": "quiet", "text": "henüz aktivite kaydı yok"}
     agents = running_agents(rows)

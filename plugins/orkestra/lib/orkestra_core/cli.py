@@ -19,6 +19,7 @@ from . import __version__
 from . import engines as EN
 from . import evidence as E
 from . import gates as G
+from . import intent
 from . import memory as M
 from . import paths
 from . import planparse as PP
@@ -74,6 +75,28 @@ def _bind_here(project: Path, rid: str) -> None:
         return                                      # a subagent's shell: its parent drives the run
     try:
         ST.bind_session(EN.session_key("cursor", raw), project, rid, engine="cursor")
+    except Exception:
+        pass
+
+
+def _unbind_here(project: Path, rid: str) -> None:
+    """Drop this Cursor conversation bind to rid immediately (pause/abort).
+    Claude Code still relies on the marker parsed by PostToolUse; Cursor gets both
+    so Stop cannot keep driving after pause."""
+    raw = EN.env_session_id()
+    if not raw:
+        return
+    from . import state as ST
+    if ST.child_binding(raw):
+        return
+    try:
+        sid = EN.session_key("cursor", raw)
+        data = read_json(paths.sessions_dir() / f"{ST._safe(sid)}.json")
+        if not isinstance(data, dict):
+            return
+        if data.get("run_id") != rid or Path(str(data.get("project") or "")) != project:
+            return
+        ST.unbind_session(sid)
     except Exception:
         pass
 
@@ -252,10 +275,19 @@ def cmd_start(a: argparse.Namespace) -> int:
     except EN.EngineError as exc:
         raise OrkestraError(str(exc))
     _require_cursor_hooks()
-    st = R.start_run(project, a.title, request, a.size, mode, engine)
+    approval_mode = a.approval_mode or os.environ.get("ORKESTRA_APPROVAL_MODE") or (
+        "manual" if intent.manual_approval_requested(request) else "autopilot")
+    if approval_mode not in ("autopilot", "manual"):
+        raise OrkestraError("ORKESTRA_APPROVAL_MODE must be autopilot or manual")
+    size_arg = getattr(a, "size", "auto") or "auto"
+    size = intent.infer_size(request) if size_arg == "auto" else size_arg
+    if size not in intent.SIZES:
+        raise OrkestraError(f"invalid size {size!r}")
+    st = R.start_run(project, a.title, request, size, mode, engine, approval_mode)
     rid = st["run_id"]
     _bind_here(project, rid)
     _out(f"run started: {rid} in {project}" + ("" if engine == "claude" else f" (engine: {engine})"))
+    _out(f"size: {size}" + (" (inferred from request; override with --size XS|S|M|L)" if size_arg == "auto" else ""))
     _out(f"baseline: git={st['baseline']['git']} head={str(st['baseline'].get('head'))[:12]} "
          f"uncommitted_files={st['baseline']['dirty_files']}")
     if st["baseline"]["dirty_files"]:
@@ -311,6 +343,7 @@ def cmd_status(a: argparse.Namespace) -> int:
         _out(json.dumps(st, indent=2, ensure_ascii=False))
         return 0
     _out(f"{rid} · \"{st['title']}\" · phase {st['phase']} · status {st['status']} · size {st['size']} · mode {st['mode']}"
+         f" · approval {st.get('approval_mode', 'autopilot')}"
          + (f" · engine {st['engine']}" if (st.get("engine") or "claude") != "claude" else ""))
     for tid in sorted(st.get("tasks") or {}):
         t = st["tasks"][tid]
@@ -372,9 +405,12 @@ def cmd_status_change(a: argparse.Namespace) -> int:
         raise OrkestraError(f"orkestra {a.cmd} needs a reason/question text")
     R.set_status(project, rid, status, reason)
     _out(f"{rid}: status → {status}" + (f" ({reason})" if reason else ""))
-    if status == "aborted":
+    if status in ("aborted", "paused"):
+        # Pause used to leave the session bound: Stop could still force-continue the run.
+        _unbind_here(project, rid)
         _out(unbind_marker(project, rid))
-        _out("Run aborted. Files are untouched; use /orkestra:rollback if the user wants changes reverted.")
+        if status == "aborted":
+            _out("Run aborted. Files are untouched; use /orkestra:rollback if the user wants changes reverted.")
     return 0
 
 
@@ -881,7 +917,17 @@ def cmd_run(a: argparse.Namespace) -> int:
         if not CK.hooks_active(project):            # without them the agent would run unguarded
             raise OrkestraError("orkestra's hooks are not installed for Cursor — run `orkestra cursor install` once "
                                 "(it keeps your own ~/.cursor/hooks.json entries), then try again.")
+    plugin_dir = ""
+    if engine == "copilot":
+        plugin_dir = EN.copilot_plugin_dir(cfg)
+        if not EN.copilot_hooks_active(plugin_dir):
+            raise OrkestraError("Orkestra's Copilot hooks are not installed. Install the Orkestra plugin with "
+                                "UserPromptSubmit, PreToolUse and PostToolUse hooks before starting a guarded Copilot run.")
     opts = dict(((cfg.get("engine") or {}).get(engine)) or {})
+    if plugin_dir:
+        opts["plugin_dir"] = plugin_dir
+    approval_mode = a.approval_mode or ("manual" if intent.manual_approval_requested(request) else "autopilot")
+    opts["approval_mode"] = approval_mode
     argv = EN.interactive_command(engine, binary, EN.run_prompt(engine, request), opts)
     if a.print:
         _out(f"cd {shlex.quote(str(project))} && " + " ".join(shlex.quote(x) for x in argv))
@@ -889,6 +935,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     os.chdir(str(project))
     env = EN.child_env(engine)
     env.pop("ORKESTRA_HEADLESS", None)              # this is the interactive UI: the user answers in it
+    env["ORKESTRA_APPROVAL_MODE"] = approval_mode
     os.execve(binary, argv, env)
     return 0  # pragma: no cover
 
@@ -923,6 +970,113 @@ def cmd_cursor(a: argparse.Namespace) -> int:
             return 0 if ok else 1
     except EN.EngineError as exc:
         raise OrkestraError(str(exc))
+    return 0
+
+
+def cmd_copilot(a: argparse.Namespace) -> int:
+    """Copilot side: install/uninstall/status for hooks under ~/.copilot/plugins/orkestra."""
+    from . import copilotkit as CK
+    if _ASKER:
+        raise OrkestraError("`orkestra copilot …` changes the Copilot configuration: run it from your terminal.")
+    try:
+        if a.action == "install":
+            done = CK.install(dry=a.dry_run)
+            for line in done:
+                _out(("would " if a.dry_run else "") + line)
+            _out("copilot: " + ("nothing to change" if not done else ("dry run — nothing written" if a.dry_run else
+                 "installed. Restart Copilot / VS Code chats so they load the hooks.")))
+        elif a.action == "uninstall":
+            done = CK.uninstall(dry=a.dry_run)
+            for line in done:
+                _out(("would " if a.dry_run else "") + line)
+            _out("copilot: " + ("nothing installed" if not done else ("dry run" if a.dry_run else "removed")))
+        if a.action in ("status", "install"):
+            ok = True
+            for good, label, detail in CK.status(paths.global_config()):
+                ok = ok and good is not False
+                _out(f"[{'i ' if good is None else ('OK' if good else '!!')}] {label}" + (f" — {detail}" if detail else ""))
+            if a.action == "install":
+                return 0
+            return 0 if ok else 1
+    except EN.EngineError as exc:
+        raise OrkestraError(str(exc))
+    return 0
+
+
+def _ask_yn(question: str, default: str = "y") -> bool:
+    """Interactive yes/no for setup (same defaults shape as install.sh ask())."""
+    hint = "Y/n" if default == "y" else "y/N"
+    try:
+        raw = input(f"{question} [{hint}] ").strip()
+    except EOFError:
+        raw = ""
+    ans = (raw or default).lower()
+    return ans[:1] in ("y", "e")
+
+
+def _setup_detect() -> Dict[str, bool]:
+    """Which host engines look present (Claude on PATH, Cursor/Copilot home dirs)."""
+    from . import cursorkit as Cur
+    from . import copilotkit as Cop
+    return {
+        "claude": shutil.which("claude") is not None,
+        "cursor": Cur.cursor_home().is_dir(),
+        "copilot": Cop.copilot_home().is_dir(),
+    }
+
+
+def _setup_install_claude() -> None:
+    """Claude Code marketplace + plugin (repo root next to plugins/)."""
+    root = PLUGIN_ROOT.parent.parent
+    listed = subprocess.run(["claude", "plugin", "marketplace", "list"], capture_output=True, text=True, timeout=120)
+    if listed.returncode == 0 and "orkestra-local" in (listed.stdout or ""):
+        subprocess.run(["claude", "plugin", "marketplace", "update", "orkestra-local"], check=False, timeout=120)
+    else:
+        subprocess.run(["claude", "plugin", "marketplace", "add", str(root)], check=False, timeout=120)
+    subprocess.run(["claude", "plugin", "install", "orkestra@orkestra-local", "-s", "user"], check=False, timeout=120)
+
+
+def cmd_setup(a: argparse.Namespace) -> int:
+    """Detect Claude/Cursor/Copilot and install Orkestra for each (ask, or --yes for all detected)."""
+    from . import cursorkit as Cur
+    from . import copilotkit as Cop
+    if _ASKER:
+        raise OrkestraError("`orkestra setup` changes host configuration: run it from your terminal.")
+    # FR-003: PATH shim always (motorsuz / declined engines); agent refuse above skips this.
+    Cur.ensure_path_shim()
+    detected = _setup_detect()
+    if not any(detected.values()):
+        _out("setup: motorsuz — no Claude CLI, Cursor home, or Copilot home detected; nothing installed.")
+        return 1
+    yes = bool(getattr(a, "yes", False))
+    if detected["claude"]:
+        if yes or _ask_yn("Claude marketplace/plugin kurulsun mu?", "y"):
+            _setup_install_claude()
+            _out("setup: Claude marketplace/plugin done")
+        else:
+            _out("setup: Claude skipped")
+    if detected["cursor"]:
+        if yes or _ask_yn("Cursor skill, alt-ajan ve hooks kurulsun mu?", "y"):
+            try:
+                done = Cur.install()
+            except EN.EngineError as exc:
+                raise OrkestraError(str(exc))
+            for line in done:
+                _out(line)
+            _out("setup: Cursor " + ("already current" if not done else "installed"))
+        else:
+            _out("setup: Cursor skipped")
+    if detected["copilot"]:
+        if yes or _ask_yn("Copilot hooks kurulsun mu?", "y"):
+            try:
+                done = Cop.install()
+            except EN.EngineError as exc:
+                raise OrkestraError(str(exc))
+            for line in done:
+                _out(line)
+            _out("setup: Copilot " + ("already current" if not done else "installed"))
+        else:
+            _out("setup: Copilot skipped")
     return 0
 
 
@@ -962,8 +1116,9 @@ def cmd_doctor(a: argparse.Namespace) -> int:
 
     py = sys.version_info
     line(py >= (3, 9), "python >= 3.9", platform.python_version())
-    for tool in ("git", "claude"):
-        line(shutil.which(tool) is not None, tool, shutil.which(tool) or "not found")
+    line(shutil.which("git") is not None, "git", shutil.which("git") or "not found")
+    soft(shutil.which("claude") is not None, "claude",
+         shutil.which("claude") or "not found (optional — Cursor/Copilot hooks also count)")
     for tool in ("node", "npx", "uv", "uvx", "gh", "jq"):
         soft(shutil.which(tool) is not None, tool, shutil.which(tool) or "not found (optional)")
     ws = paths.workspace_root()
@@ -982,7 +1137,17 @@ def cmd_doctor(a: argparse.Namespace) -> int:
         line('"deny"' in cp.stdout, "hook self-test (deny force-push)", cp.stdout.strip()[:80] or cp.stderr.strip()[:80])
     except Exception as exc:  # pragma: no cover
         line(False, "hook self-test", str(exc))
-    if shutil.which("claude"):
+    from . import cursorkit as CK
+    claude_ready = shutil.which("claude") is not None
+    cursor_ready = CK.hooks_active()
+    copilot_dir = EN.copilot_plugin_dir(paths.global_config())
+    copilot_ready = EN.copilot_hooks_active(copilot_dir)
+    soft(cursor_ready, "cursor hooks", "active" if cursor_ready else "not installed")
+    soft(copilot_ready, "copilot hooks", "active" if copilot_ready else "not installed")
+    engines_ready = sum((claude_ready, cursor_ready, copilot_ready))
+    line(engines_ready >= 1, "engine ready",
+         f"{engines_ready} ready" if engines_ready else "none — install Claude, `orkestra cursor install`, or Copilot hooks")
+    if claude_ready:
         try:
             cp = subprocess.run(["claude", "mcp", "list"], capture_output=True, text=True, timeout=30,
                                 stdin=subprocess.DEVNULL)
@@ -1007,7 +1172,7 @@ HANDLERS = {
     "watch": cmd_watch, "dashboard": cmd_dashboard,
     "evidence": cmd_evidence, "integrity": cmd_integrity, "report": cmd_report,
     "next": cmd_next, "tempo": cmd_tempo, "watchdog": cmd_watchdog, "agents": cmd_agents,
-    "run": cmd_run, "cursor": cmd_cursor,
+    "run": cmd_run, "cursor": cmd_cursor, "copilot": cmd_copilot, "setup": cmd_setup,
 }
 
 

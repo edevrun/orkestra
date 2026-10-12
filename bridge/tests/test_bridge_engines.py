@@ -18,7 +18,7 @@ BRIDGE = HERE.parent / "orkestra_bridge.py"
 PLUGIN = HERE.parent.parent / "plugins" / "orkestra"
 sys.path.insert(0, str(PLUGIN / "lib"))
 
-PROJECTS = ["demo", "demo2", "demo3", "demo4", "demo5", "demo6", "cursor"]
+PROJECTS = ["demo", "demo2", "demo3", "demo4", "demo5", "demo6", "cursor", "copilot", "copilot2"]
 
 
 def free_port():
@@ -34,6 +34,22 @@ class BridgeEnginesTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = Path(tempfile.mkdtemp(prefix="bridge-engines-")).resolve()
         cls.home, cls.ws, cls.chome = cls.tmp / "home", cls.tmp / "Projects", cls.tmp / "cursor-home"
+        cls.copilot_plugin = cls.tmp / "copilot-plugin"
+        copilot_hooks = cls.copilot_plugin / "com.github.copilot" / "hooks" / "hooks.json"
+        copilot_hooks.parent.mkdir(parents=True)
+        hook_script = PLUGIN / "hooks" / "copilot_hook.py"
+        copilot_hooks.write_text(json.dumps({"hooks": {
+            event: [{"command": f"{sys.executable} {hook_script} {event}", "timeoutSec": 20}]
+            for event in ("UserPromptSubmit", "PreToolUse", "PostToolUse")
+        }}))
+        cls.fake_copilot = cls.tmp / "fake_copilot.py"
+        cls.fake_copilot.write_text(
+            "#!/usr/bin/env python3\nimport json, os, sys\n"
+            "args = sys.argv[1:]\n"
+            "sid = args[args.index('--session-id') + 1] if '--session-id' in args else args[args.index('--resume') + 1]\n"
+            "with open(os.path.join(os.getcwd(), '.fake-copilot.jsonl'), 'a') as f: f.write(json.dumps(args) + '\\n')\n"
+            "print(json.dumps({'type': 'result', 'result': 'copilot-ok', 'session_id': sid}))\n")
+        cls.fake_copilot.chmod(0o755)
         for name in PROJECTS:
             (cls.ws / name).mkdir(parents=True)
             (cls.ws / name / "AGENTS.md").write_text(f"# {name}\n")
@@ -42,7 +58,8 @@ class BridgeEnginesTest(unittest.TestCase):
         cls.home.mkdir()
         (cls.home / "bridge.secret.json").write_text(json.dumps({
             "port": cls.port, "token": cls.token, "workspace": str(cls.ws), "claude_bin": str(HERE / "fake_claude.py"),
-            "cursor_bin": str(HERE / "fake_agent.py"), "allowed_projects": PROJECTS, "watchdog_interval": 0,
+            "cursor_bin": str(HERE / "fake_agent.py"), "copilot_bin": str(cls.fake_copilot),
+            "copilot_plugin_dir": str(cls.copilot_plugin), "allowed_projects": PROJECTS, "watchdog_interval": 0,
             "auto_resume_delays": [0, 0, 0], "telegram": {"bot_token": "", "allowed_chat_ids": ["42"]}}))
         cls.env = dict(os.environ, ORKESTRA_HOME=str(cls.home), ORKESTRA_WORKSPACE=str(cls.ws),
                        ORKESTRA_CURSOR_HOME=str(cls.chome), ORKESTRA_SHIM_DIR=str(cls.tmp / "no-shim"))
@@ -99,7 +116,7 @@ class BridgeEnginesTest(unittest.TestCase):
         return json.loads(states[-1].read_text())
 
     def test_1_cursor_job_from_start_to_reply_and_auto_resume(self):
-        code, job = self.call("POST", "/jobs", {"project": "demo", "request": "öncelik ekle", "chat_id": "42",
+        code, job = self.call("POST", "/jobs", {"project": "demo", "request": "öncelik ekle; ben karar verici olayım", "chat_id": "42",
                                                 "engine": "cursor"})
         self.assertEqual(code, 202, job)
         self.assertEqual(job["engine"], "cursor")
@@ -113,9 +130,9 @@ class BridgeEnginesTest(unittest.TestCase):
         turns = [json.loads(x) for x in (self.ws / "demo" / ".fake-agent.jsonl").read_text().splitlines()]
         self.assertEqual(turns[0]["args"][:7], ["-p", "--output-format", "json", "--force", "--trust", "--resume", chat])
         self.assertIn("orkestra playbook run", turns[0]["args"][-1])
-        self.assertTrue(turns[0]["args"][-1].endswith("İstek: öncelik ekle"))
+        self.assertTrue(turns[0]["args"][-1].endswith("İstek: öncelik ekle; ben karar verici olayım"))
         self.assertEqual(turns[0]["stdin"], "")                                         # the prompt is never on stdin
-        self.assertEqual(j["turns"][0]["prompt"], "/orkestra-run öncelik ekle")         # what the user asked, as logged
+        self.assertEqual(j["turns"][0]["prompt"], "/orkestra-run öncelik ekle; ben karar verici olayım")
         # a second job for the same project is refused while one is open — whatever the engine
         code, body = self.call("POST", "/jobs", {"project": "demo", "request": "başka iş", "engine": "claude"})
         self.assertEqual(code, 400)
@@ -141,23 +158,23 @@ class BridgeEnginesTest(unittest.TestCase):
             self.assertEqual(code, 200, body)
             return body["message"]
 
-        msg = yap("/yap cursor demo2 öncelik ekle")
+        msg = yap("/yap cursor demo2 öncelik ekle; ben karar verici olayım")
         self.assertIn("Başladım: [demo2]", msg)
         self.assertIn("· cursor", msg)
-        msg = yap("/yap Cursor: demo3 öncelik ekle")
+        msg = yap("/yap Cursor: demo3 öncelik ekle; ben karar verici olayım")
         self.assertIn("[demo3]", msg)
         self.assertIn("· cursor", msg)
-        msg = yap("/yap claude demo4 öncelik ekle")
+        msg = yap("/yap claude demo4 öncelik ekle; ben karar verici olayım")
         self.assertIn("[demo4]", msg)
         self.assertNotIn("cursor", msg)
-        msg = yap("/yap demo5 öncelik ekle")                        # no engine word: claude
+        msg = yap("/yap demo5 öncelik ekle; ben karar verici olayım")  # no engine word: claude
         self.assertNotIn("cursor", msg)
-        msg = yap("/yap cursor öncelik ekle")                       # a project that is itself called "cursor"
+        msg = yap("/yap cursor öncelik ekle; ben karar verici olayım")  # a project that is itself called "cursor"
         self.assertIn("Başladım: [cursor]", msg)
         self.assertNotIn("· cursor", msg)
-        self.assertIn("Kullanım: /yap [cursor|claude] <proje> <istek>", yap("/yap cursor: demo6"))
+        self.assertIn("/yap claude:|cursor:|copilot: <proje> <istek>", yap("/yap cursor: demo6"))
         self.assertIn("Başlatılamadı", yap("/yap cursor: nope bir şey yap"))
-        self.assertIn("/yap cursor <proje> <istek>", yap("/yardim"))
+        self.assertIn("/yap claude:|cursor:|copilot:", yap("/yardim"))
         code, listing = self.call("GET", "/jobs?chat_id=42")
         engines = {j["project"]: j["engine"] for j in listing["jobs"]}
         for project, engine in (("demo2", "cursor"), ("demo3", "cursor"), ("demo4", "claude"), ("demo5", "claude"),
@@ -169,6 +186,15 @@ class BridgeEnginesTest(unittest.TestCase):
         self.assertEqual(self.run_state("demo2")["engine"], "cursor")
         self.assertEqual(self.run_state("demo4")["engine"], "claude")
         self.assertEqual(self.run_state("demo5")["engine"], "claude")
+
+    def test_copilot_engine_word_in_the_telegram_command(self):
+        code, body = self.call("POST", "/telegram", {
+            "chat_id": "42", "text": "/yap copilot: copilot2 küçük bir iş yap"})
+        self.assertEqual(code, 200, body)
+        self.assertIn("· copilot", body["message"])
+        _, listing = self.call("GET", "/jobs?chat_id=42")
+        job = [j for j in listing["jobs"] if j.get("project") == "copilot2"][-1]
+        self.wait_for(job["id"], lambda value: value.get("status") == "done")
 
     def test_3_cursor_is_refused_without_its_hooks_and_unknown_engines(self):
         hooks = self.chome / "hooks.json"
@@ -210,6 +236,25 @@ class BridgeEnginesTest(unittest.TestCase):
         self.assertEqual(got[6], ["cursor", "cursor", "x y"])
         self.assertEqual(got[7], [None, "cursor", "x y"])               # the project named "cursor", default engine
 
+    def test_copilot_engine_honors_explicit_model_and_effort(self):
+        code, catalog = self.call("GET", "/engines?project=demo")
+        self.assertEqual(code, 200)
+        copilot = next(item for item in catalog["engines"] if item["id"] == "copilot")
+        self.assertTrue(copilot["available"], copilot)
+
+        code, job = self.call("POST", "/jobs", {"project": "copilot", "request": "kısa bir iş; use gpt-6-astra with reasoning effort high",
+                              "engine": "copilot"})
+        self.assertEqual(code, 202, job)
+        finished = self.wait_for(job["id"], lambda value: value.get("status") == "done")
+        self.assertEqual(finished["engine"], "copilot")
+        args = json.loads((self.ws / "copilot" / ".fake-copilot.jsonl").read_text().splitlines()[0])
+        self.assertIn("--allow-all-tools", args)
+        self.assertIn("--autopilot", args)
+        self.assertIn("--no-ask-user", args)
+        self.assertEqual(args[args.index("--model") + 1], "gpt-6-astra")
+        self.assertEqual(args[args.index("--reasoning-effort") + 1], "high")
+        self.assertEqual(args[args.index("--plugin-dir") + 1], str(self.copilot_plugin))
+
     def test_6_a_turn_that_cannot_start_never_leaves_the_job_running(self):
         notx = self.tmp / "not-executable-agent"
         notx.write_text("#!/bin/sh\n")
@@ -231,7 +276,7 @@ class BridgeEnginesTest(unittest.TestCase):
         self.assertIn("başlatılamadı", message)
 
     def test_7_hooks_are_checked_before_every_cursor_turn(self):
-        code, job = self.call("POST", "/jobs", {"project": "demo6", "request": "öncelik ekle", "chat_id": "66",
+        code, job = self.call("POST", "/jobs", {"project": "demo6", "request": "öncelik ekle; ben karar verici olayım", "chat_id": "66",
                                                 "engine": "cursor"})
         self.assertEqual(code, 202, job)
         self.wait_for(job["id"], lambda j: j.get("status") == "awaiting_user")

@@ -24,7 +24,8 @@ import {
 
 const PROJECT_NAME = /^[A-Za-z0-9._-]{1,80}$/;
 const MAX_MESSAGE_MAP = 300;
-const USAGE = "Kullanım: /yap <proje> <istek>\nÖrnek: /yap shop sipariş listesine CSV dışa aktarma ekle";
+const USAGE =
+  "Kullanım: /yap [claude:|cursor:|copilot:] <proje> <istek>\nÖrnek: /yap copilot: shop sipariş listesine CSV dışa aktarma ekle";
 
 function readState(file) {
   try {
@@ -50,84 +51,127 @@ function short(text, max = 160) {
 export default definePluginEntry({
   id: "orkestra-bridge",
   name: "Orkestra bridge",
-  description: "Telegram → orkestra: /yap, /durum, /iptal, reply-to-answer and job notifications.",
+  description:
+    "Telegram → orkestra: /yap, /durum, /iptal, reply-to-answer and job notifications.",
   register(api) {
     const cfg = api.pluginConfig ?? {};
     const chatId = typeof cfg.chatId === "string" ? cfg.chatId.trim() : "";
     if (!/^-?\d+$/.test(chatId)) {
-      api.logger.warn("orkestra-bridge: plugins.entries.orkestra-bridge.config.chatId missing; plugin inactive");
+      api.logger.warn(
+        "orkestra-bridge: plugins.entries.orkestra-bridge.config.chatId missing; plugin inactive",
+      );
       return;
     }
     const home = os.homedir();
     // the checkout this plugin was loaded from; the old fixed location when OpenClaw runs a copy of this folder
-    const beside = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../bridge/orkestra_client.py");
-    const clientPath = cfg.clientPath || (fs.existsSync(beside) ? beside : path.join(home, "Projects/orkestra/bridge/orkestra_client.py"));
+    const beside = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../bridge/orkestra_client.py",
+    );
+    const clientPath =
+      cfg.clientPath ||
+      (fs.existsSync(beside)
+        ? beside
+        : path.join(home, "Projects/orkestra/bridge/orkestra_client.py"));
     const pollMs = Math.max(5, Number(cfg.pollSeconds) || 15) * 1000;
     const runner = (argv, opts) =>
-      api.runtime.system.runCommandWithTimeout(argv, { timeoutMs: opts.timeoutMs, ...(opts.env ? { env: opts.env } : {}) });
+      api.runtime.system.runCommandWithTimeout(argv, {
+        timeoutMs: opts.timeoutMs,
+        ...(opts.env ? { env: opts.env } : {}),
+      });
     const python = cfg.python || "python3";
     const client = createOrkestraClient({ runner, python, clientPath });
-    const cliPath = cfg.orkestraCliPath || path.resolve(path.dirname(clientPath), "../plugins/orkestra/bin/orkestra");
+    const cliPath =
+      cfg.orkestraCliPath ||
+      path.resolve(
+        path.dirname(clientPath),
+        "../plugins/orkestra/bin/orkestra",
+      );
     const monitor = createOrkestraMonitor({ runner, python, cliPath });
     // Telegram message id → job, filled by the notifier; fallback when the quote is unavailable.
     let messages = {};
 
     api.registerCommand({
       name: "yap",
-      description: "Orkestra işi başlat: /yap <proje> <istek>",
+      description: "Orkestra işi başlat: /yap [engine:] <proje> <istek>",
       channels: ["telegram"],
       acceptsArgs: true,
       requireAuth: true,
       agentPromptGuidance: [
         {
           text:
-            "Orkestra: the owner starts orkestra runs with /yap <project> <request>, checks them with /durum, stops " +
+            "Orkestra: the owner starts runs with /yap [claude:|cursor:|copilot:] <project> <request>, checks them with /durum, stops " +
             "them with /iptal and answers a run by replying (Telegram reply) to its notification; the gateway routes " +
             "all of that without you. In this chat never start, resume, continue or take over an orkestra run (no " +
             "/orkestra:* skills or commands, no orkestra_client.py start/reply, no `orkestra resume`): open runs " +
             "belong to their own desktop or /yap sessions and a second driver breaks them. If the owner asks for " +
-            "orkestra here, tell them to send /yap <project> <request>. Handle other development requests directly.",
+            "orkestra here, tell them to send /yap <project> <request> or prefix an engine (for example /yap copilot: <project> <request>). Handle other development requests directly.",
           surfaces: ["cli_backend", "openclaw_main"],
         },
       ],
       handler: async (ctx) => {
         const m = /^\s*(\S+)\s+([\s\S]*\S)\s*$/.exec(ctx.args ?? "");
-        if (!m || !PROJECT_NAME.test(m[1])) {
+        if (!m) {
+          return { text: USAGE };
+        }
+        let project = m[1];
+        let request = m[2];
+        let engine;
+        const enginePrefix = /^(claude|cursor|copilot):$/i.exec(project);
+        if (enginePrefix) {
+          const target = /^\s*(\S+)\s+([\s\S]*\S)\s*$/.exec(request);
+          if (!target) {
+            return { text: USAGE };
+          }
+          engine = enginePrefix[1].toLowerCase();
+          project = target[1];
+          request = target[2];
+        }
+        if (!PROJECT_NAME.test(project)) {
           return { text: USAGE };
         }
         // Fail closed: without a reliable view of open runs, do not risk taking over one.
         const runs = await monitor.openRuns();
         if (!runs.ok) {
-          return { text: `⚠️ Başlatmadım: açık run kontrolü yapılamadı (${runs.error}). Güvenlik için bekliyorum; biraz sonra tekrar dene.` };
+          return {
+            text: `⚠️ Başlatmadım: açık run kontrolü yapılamadı (${runs.error}). Güvenlik için bekliyorum; biraz sonra tekrar dene.`,
+          };
         }
-        const busy = findOpenRun(runs.runs, m[1]);
+        const busy = findOpenRun(runs.runs, project);
         if (busy) {
-          return { text: formatBusyProject(m[1], busy) };
+          return { text: formatBusyProject(project, busy) };
         }
-        const res = await client.start(m[1], m[2], chatId);
+        const res = await client.start(project, request, chatId, engine);
         if (!res.ok) {
           return { text: `⚠️ Başlatılamadı: ${res.error}` };
         }
         return {
           text:
-            `▶️ Başladım: [${res.body.project}] iş ${res.body.id}\n` +
-            "Soru ya da onay gerektiğinde buraya yazacağım; o mesajı Yanıtla ile cevapla.",
+            `▶️ Başladım: [${res.body.project}] iş ${res.body.id}` +
+            (res.body.engine && res.body.engine !== "claude"
+              ? ` · ${res.body.engine}`
+              : "") +
+            "\nVarsayılan autopilot'ta tamamlayacağım; manual onay istediysen yalnız onay aşamasında bu mesaja Yanıtla.",
         };
       },
     });
 
     api.registerCommand({
       name: "durum",
-      description: "Orkestra durumu: tüm açık run'lar (masaüstü dahil) ve Telegram işleri",
+      description:
+        "Orkestra durumu: tüm açık run'lar (masaüstü dahil) ve Telegram işleri",
       channels: ["telegram"],
       requireAuth: true,
       handler: async () => {
-        const [runs, jobs] = await Promise.all([monitor.openRuns(), client.statusAll()]);
+        const [runs, jobs] = await Promise.all([
+          monitor.openRuns(),
+          client.statusAll(),
+        ]);
         return {
           text: formatStatus({
             runs: runs.ok ? runs.runs : null,
             runsError: runs.ok ? null : runs.error,
-            bridgeJobs: jobs.ok ? jobs.body.jobs ?? [] : null,
+            bridgeJobs: jobs.ok ? (jobs.body.jobs ?? []) : null,
             bridgeError: jobs.ok ? null : jobs.error,
           }),
         };
@@ -141,7 +185,11 @@ export default definePluginEntry({
       requireAuth: true,
       handler: async () => {
         const res = await client.cancel(chatId);
-        return { text: res.ok ? String(res.body.message ?? "İptal isteği gönderildi.") : `⚠️ İptal edilemedi: ${res.error}` };
+        return {
+          text: res.ok
+            ? String(res.body.message ?? "İptal isteği gönderildi.")
+            : `⚠️ İptal edilemedi: ${res.error}`,
+        };
       },
     });
 
@@ -150,13 +198,18 @@ export default definePluginEntry({
       if (channel !== "telegram" || event.isGroup) {
         return;
       }
-      const sender = String(event.senderId ?? ctx.senderId ?? "").replace(/^telegram:/, "");
+      const sender = String(event.senderId ?? ctx.senderId ?? "").replace(
+        /^telegram:/,
+        "",
+      );
       if (sender !== chatId) {
         return;
       }
       const quoted = event.replyToBody ?? ctx.replyToBody;
       const replyToId = String(event.replyToId ?? ctx.replyToId ?? "");
-      const ref = parseJobRef(quoted) ?? (replyToId ? messages[replyToId] ?? null : null);
+      const ref =
+        parseJobRef(quoted) ??
+        (replyToId ? (messages[replyToId] ?? null) : null);
       if (!ref) {
         return;
       }
@@ -166,8 +219,14 @@ export default definePluginEntry({
       }
       const res = await client.reply(ref.jobId, text);
       return res.ok
-        ? { handled: true, text: `↪️ [${ref.project}] iş ${ref.jobId} → ${short(text)}` }
-        : { handled: true, text: `⚠️ [${ref.project}] iş ${ref.jobId}'ye iletilemedi: ${res.error}` };
+        ? {
+            handled: true,
+            text: `↪️ [${ref.project}] iş ${ref.jobId} → ${short(text)}`,
+          }
+        : {
+            handled: true,
+            text: `⚠️ [${ref.project}] iş ${ref.jobId}'ye iletilemedi: ${res.error}`,
+          };
     });
 
     let timer;
@@ -176,7 +235,12 @@ export default definePluginEntry({
     api.registerService({
       id: "orkestra-bridge-notifier",
       start: async (sctx) => {
-        const stateFile = path.join(sctx.stateDir, "plugins", "orkestra-bridge", "state.json");
+        const stateFile = path.join(
+          sctx.stateDir,
+          "plugins",
+          "orkestra-bridge",
+          "state.json",
+        );
         const state = readState(stateFile);
         messages = state.messages;
         const tick = async () => {
@@ -188,21 +252,39 @@ export default definePluginEntry({
             const res = await client.status(chatId);
             if (!res.ok) {
               if (res.error !== lastPollError) {
-                sctx.logger.warn(`orkestra-bridge: status failed: ${short(res.error, 300)}`);
+                sctx.logger.warn(
+                  `orkestra-bridge: status failed: ${short(res.error, 300)}`,
+                );
                 lastPollError = res.error;
               }
               return;
             }
             lastPollError = "";
-            const { announce, seen } = diffJobs(res.body.jobs ?? [], state.seen);
+            const { announce, seen } = diffJobs(
+              res.body.jobs ?? [],
+              state.seen,
+            );
             state.seen = seen;
             for (const job of announce) {
               const sent = await runner(
-                ["openclaw", "message", "send", "--channel", "telegram", "--target", chatId, "-m", formatNotification(job), "--json"],
+                [
+                  "openclaw",
+                  "message",
+                  "send",
+                  "--channel",
+                  "telegram",
+                  "--target",
+                  chatId,
+                  "-m",
+                  formatNotification(job),
+                  "--json",
+                ],
                 { timeoutMs: 60_000 },
               );
               if (sent.code !== 0) {
-                sctx.logger.warn(`orkestra-bridge: notification for ${job.id} failed (exit ${sent.code}); retrying next poll`);
+                sctx.logger.warn(
+                  `orkestra-bridge: notification for ${job.id} failed (exit ${sent.code}); retrying next poll`,
+                );
                 continue;
               }
               state.seen[job.id] = job.updated;
@@ -211,12 +293,17 @@ export default definePluginEntry({
               }
             }
             const ids = Object.keys(state.messages);
-            for (const id of ids.slice(0, Math.max(0, ids.length - MAX_MESSAGE_MAP))) {
+            for (const id of ids.slice(
+              0,
+              Math.max(0, ids.length - MAX_MESSAGE_MAP),
+            )) {
               delete state.messages[id];
             }
             writeState(stateFile, state);
           } catch (error) {
-            sctx.logger.warn(`orkestra-bridge: poll error: ${short(String(error), 300)}`);
+            sctx.logger.warn(
+              `orkestra-bridge: poll error: ${short(String(error), 300)}`,
+            );
           } finally {
             busy = false;
           }
@@ -224,7 +311,9 @@ export default definePluginEntry({
         timer = setInterval(tick, pollMs);
         timer.unref?.();
         await tick();
-        sctx.logger.info(`orkestra-bridge active: chat ${chatId}, poll ${pollMs / 1000}s`);
+        sctx.logger.info(
+          `orkestra-bridge active: chat ${chatId}, poll ${pollMs / 1000}s`,
+        );
       },
       stop: async () => {
         clearInterval(timer);

@@ -1,6 +1,6 @@
 # Phase: verify
 
-Goal: fresh proof that (1) nothing that worked is broken and (2) every requirement is met.
+Goal: fresh proof that nothing that worked is broken and an honest, traceable outcome: `PASS` when every requirement is proven; `PASS_WITH_NOTES` only for explicitly deferred, non-passing evidence.
 
 1. `orkestra gate verify -p <project>`.
    - REGRESSION → `orkestra phase back implement --reason "<gate> regressed"`, brief an implementer with the failing tail (fix the cause, never the test), then return here.
@@ -8,6 +8,7 @@ Goal: fresh proof that (1) nothing that worked is broken and (2) every requireme
    NOT re-run the full suite), runs only narrow tests it needs as evidence, and writes `verification.md` ending in `VERDICT: …`.
    End your turn after dispatching; its report resumes you.
 3. FAIL → fix via implementer (back to implement) and repeat. Unverifiable items must be stated as such — never upgraded to PASS.
+   `PASS_WITH_NOTES` may proceed only when accepted deferrals are explicitly marked `DEFERRED/UNVERIFIED`; failed acceptance criteria remain `FAIL`.
 4. `orkestra phase next` re-checks deterministically: gates green after the last change, traceability with verifiable
    references only (no invented files/tests), test integrity (no removed tests, skip/only markers or new suppressions
    unless listed in the approved plan's `## İstisnalar`), and dependencies.

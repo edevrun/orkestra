@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import helpers
+from orkestra_core import runs as R, tempo as T
 
 UNITTEST = "python3 -m unittest discover -s tests -q"
 
@@ -68,8 +69,11 @@ class FlowBase(helpers.Sandbox):
         cfgp.write_text(json.dumps(cfg))
         self.sid = "sess-1"
 
-    def start(self, title="Subtract"):
-        out = self.cli("start", "-p", "demo", "--title", title, "--request", "sub fonksiyonu ekle", "--size", "S").stdout
+    def start(self, title="Subtract", approval_mode="manual", request="sub fonksiyonu ekle", size="S"):
+        args = ["start", "-p", "demo", "--title", title, "--request", request, "--size", size]
+        if approval_mode:
+            args += ["--approval-mode", approval_mode]
+        out = self.cli(*args).stdout
         m = re.search(r"\[orkestra:bind\] project=(.+?) run=(\S+)", out)
         self.assertIsNotNone(m, out)
         self.rid = m.group(2)
@@ -115,14 +119,40 @@ class FlowBase(helpers.Sandbox):
             fh.write(f"\n\ndef {fn}(a, b):\n    return {expr}\n")
         self.cli("tdd", "green", tid, "-p", "demo", "--", cmd)
 
+    def drive_turn(self, prompt="devam et", prompt_id="p-drive"):
+        """Record a real user prompt + a tool call so this turn counts as driving."""
+        self.hook('UserPromptSubmit', {"session_id": self.sid, "prompt": prompt, "prompt_id": prompt_id,
+                       "cwd": str(self.proj)})
+        self.hook('PreToolUse', {"session_id": self.sid, "tool_name": "Read", "cwd": str(self.proj),
+                       "tool_input": {"file_path": str(self.proj / "calc.py")}})
+
     def approve(self, text="onaylıyorum"):
         return self.hook("UserPromptSubmit", {"session_id": self.sid, "prompt": text, "prompt_id": "p-approve",
                                               "cwd": str(self.proj)})
 
 
 class TestHappyPath(FlowBase):
-    def test_full_lifecycle(self):
+    def test_pass_with_notes_allows_review_without_upgrading_deferred_evidence(self):
         self.start()
+        self.advance_to_approve()
+        self.approve()
+        self.phase_next()  # implement
+        self.cli("task", "start", "T001", "-p", "demo")
+        self.tdd_cycle("T001", "sub", "a - b", 5, 3, 2)
+        self.cli("task", "done", "T001", "-p", "demo", "reviewed: PASS")
+        self.phase_next()  # verify
+        self.cli("gate", "verify", "-p", "demo")
+        (self.fdir / "verification.md").write_text(
+            "| FR-001 | `tests/test_sub.py::test_sub` | PASS |\n"
+            "| SC-001 | gate unit | PASS |\n"
+            "Note: iOS native evidence is DEFERRED/UNVERIFIED; it is not claimed as PASS.\n"
+            "VERDICT: PASS_WITH_NOTES\n"
+        )
+        self.assertIn("(verify → review)", self.cli("next", "-p", "demo").stdout)
+        self.phase_next()  # review
+
+    def test_full_lifecycle(self):
+        self.start(size="M")
         self.assertTrue((self.fdir / "request.md").exists())
         # precondition failures are explicit
         self.phase_next()  # intake → discover
@@ -186,6 +216,7 @@ class TestHappyPath(FlowBase):
         with open(self.proj / "calc.py", "a") as fh:
             fh.write("\n\ndef sub(a, b):\n    return a - b\n")
         cp = self.cli("tdd", "green", "T001", "-p", "demo", "--", "python3 -m unittest tests.test_sub -q")
+        (self.fdir / "reviews" / "T001.review.md").write_text("VERDICT: PASS\n")
         self.cli("task", "done", "T001", "-p", "demo", "reviewed: PASS")
         self.phase_next()  # → verify
 
@@ -244,6 +275,110 @@ class TestHappyPath(FlowBase):
         self.assertEqual([ln for ln in status.splitlines() if not ln.endswith(".orkestra/")], [])
         # git log untouched: still exactly one commit
         self.assertEqual(len(self.git(self.proj, "log", "--oneline").splitlines()), 1)
+
+
+class TestAutopilotApproval(FlowBase):
+    def test_start_inherits_manual_mode_from_orkestra_run_environment(self):
+        self.cli("start", "-p", "demo", "--title", "Manual", "--request", "small change", "--size", "S",
+                 env={"ORKESTRA_APPROVAL_MODE": "manual"})
+
+        state = json.loads(self.cli("status", "--json", "-p", "demo").stdout)
+
+        self.assertEqual(state["approval_mode"], "manual")
+
+    def test_explicit_decision_maker_request_selects_manual_mode(self):
+        self.start(approval_mode=None, request="Bir özellik ekle; ben karar verici olmalıyım.")
+
+        state = json.loads(self.cli("status", "--json", "-p", "demo").stdout)
+
+        self.assertEqual(state["approval_mode"], "manual")
+
+    def test_default_autopilot_approves_only_a_validated_current_plan(self):
+        self.start(approval_mode=None)
+        self.advance_to_approve()
+
+        self.phase_next()
+
+        approval = json.loads((self.proj / ".orkestra" / "runs" / self.rid / "approval.json").read_text())
+        state = json.loads(self.cli("status", "--json", "-p", "demo").stdout)
+        self.assertEqual(state["approval_mode"], "autopilot")
+        self.assertEqual(state["phase"], "implement")
+        self.assertEqual(approval["decision"], "approve")
+        self.assertEqual(approval["source"], "autopilot")
+        self.assertEqual(approval["hash"], R.spec_plan_hash(self.proj, self.rid))
+
+    def test_phase_check_accepts_a_reviewed_autopilot_plan_without_writing_approval(self):
+        self.start(approval_mode=None)
+        self.advance_to_approve()
+
+        cp = self.cli("phase", "check", "-p", "demo", check=False)
+
+        self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
+        self.assertIn("READY", cp.stdout)
+        self.assertFalse((self.proj / ".orkestra" / "runs" / self.rid / "approval.json").exists())
+
+    def test_manual_mode_still_requires_a_real_user_approval(self):
+        self.start(approval_mode="manual")
+        self.advance_to_approve()
+
+        cp = self.phase_next(expect_ok=False)
+        self.assertIn("no user approval", cp.stderr)
+        self.approve("onaylıyorum")
+        self.phase_next()
+
+        approval = json.loads((self.proj / ".orkestra" / "runs" / self.rid / "approval.json").read_text())
+        self.assertEqual(approval["source"], "prompt")
+
+    def test_autopilot_does_not_enter_a_user_wait(self):
+        self.start(approval_mode=None)
+
+        out = self.hook("PreToolUse", {"session_id": self.sid, "tool_name": "AskUserQuestion", "cwd": str(self.proj),
+                                       "tool_input": {"questions": [{"question": "Which option?"}]}})
+        self.assertTrue(self.denied(out), out)
+        self.assertNotEqual(json.loads(self.cli("status", "--json", "-p", "demo").stdout)["status"], "awaiting_user")
+        cp = self.cli("await", "-p", "demo", "plan approval", check=False)
+        self.assertNotEqual(cp.returncode, 0)
+        self.assertIn("autopilot", cp.stderr.lower())
+
+    def test_legacy_approval_wait_is_recovered_by_autopilot(self):
+        self.start(approval_mode=None)
+        self.advance_to_approve()
+        state_path = self.proj / ".orkestra" / "runs" / self.rid / "state.json"
+        state = json.loads(state_path.read_text())
+        state["status"] = "awaiting_user"
+        state["awaiting"] = {"question": "Plan approval"}
+        state_path.write_text(json.dumps(state))
+
+        action = T.next_action(self.proj, state, deep=False)
+
+        self.assertEqual(action["action"], "cli")
+        self.assertIn("autopilot", action["text"].lower())
+        self.phase_next()
+        final = json.loads(self.cli("status", "--json", "-p", "demo").stdout)
+        self.assertEqual((final["phase"], final["status"]), ("implement", "active"))
+
+    def test_legacy_clarify_wait_gets_an_autonomous_next_action(self):
+        self.start(approval_mode=None)
+        state_path = self.proj / ".orkestra" / "runs" / self.rid / "state.json"
+        state = json.loads(state_path.read_text())
+        state.update(phase="clarify", status="awaiting_user", awaiting={"question": "Which behavior?"})
+        state_path.write_text(json.dumps(state))
+
+        action = T.next_action(self.proj, state, deep=False)
+
+        self.assertEqual(action["action"], "work")
+        self.assertIn("autopilot", action["text"].lower())
+        self.assertIn("assumption", action["text"].lower())
+
+    def test_autopilot_refuses_a_plan_changed_after_critic_review(self):
+        self.start(approval_mode="autopilot")
+        self.advance_to_approve()
+        (self.fdir / "plan.md").write_text(PLAN + "\n<!-- changed after critic -->\n")
+
+        cp = self.phase_next(expect_ok=False)
+
+        self.assertIn("changed after plan review", cp.stderr)
+        self.assertFalse((self.proj / ".orkestra" / "runs" / self.rid / "approval.json").exists())
 
 
 class TestSafetyNets(FlowBase):
@@ -310,6 +445,7 @@ class TestSafetyNets(FlowBase):
         self.advance_to_approve()
         self.approve()
         self.phase_next()
+        self.drive_turn(prompt="devam et", prompt_id="p9")
         ev = {"session_id": self.sid, "prompt_id": "p9", "stop_hook_active": False, "cwd": str(self.proj)}
         out = self.hook("Stop", ev)
         self.assertEqual(out.get("decision"), "block")
@@ -481,6 +617,139 @@ class TestContextAndPlaybooks(helpers.Sandbox):
         out = self.cli("context", cwd=p).stdout
         self.assertIn("project: beta", out)
         self.assertIn("NOT INITIALIZED", out)
+
+
+
+class TestStopHijackGuards(FlowBase):
+    """Cross-chat Stop must not force-continue a bound run the user is not driving."""
+
+    def test_pause_emits_unbind_marker_and_clears_cursor_session(self):
+        import importlib, json, os
+        self.start()
+        conv = "hijack-pause-1"
+        EN = importlib.import_module("orkestra_core.engines")
+        ST = importlib.import_module("orkestra_core.state")
+        os.environ["CURSOR_AGENT"] = "1"
+        os.environ["CURSOR_CONVERSATION_ID"] = conv
+        sid = EN.session_key("cursor", conv)
+        ST.bind_session(sid, self.proj, self.rid, engine="cursor")
+        self.assertIsNotNone(ST.session_binding(sid))
+        out = self.cli("pause", "-p", "demo").stdout
+        self.assertIn("[orkestra:unbind]", out)
+        self.assertIsNone(ST.session_binding(sid))
+        st = json.loads(self.cli("status", "--json", "-p", "demo").stdout)
+        self.assertEqual(st["status"], "paused")
+
+    def test_abort_unbinds_cursor_session(self):
+        import importlib, os
+        self.start()
+        conv = "hijack-abort-1"
+        EN = importlib.import_module("orkestra_core.engines")
+        ST = importlib.import_module("orkestra_core.state")
+        os.environ["CURSOR_AGENT"] = "1"
+        os.environ["CURSOR_CONVERSATION_ID"] = conv
+        sid = EN.session_key("cursor", conv)
+        ST.bind_session(sid, self.proj, self.rid, engine="cursor")
+        out = self.cli("abort", "-p", "demo", "test").stdout
+        self.assertIn("[orkestra:unbind]", out)
+        self.assertIsNone(ST.session_binding(sid))
+
+    def test_stop_without_drive_activity_idles_and_unbinds(self):
+        import importlib
+        self.start()
+        self.advance_to_approve()
+        self.approve()
+        self.phase_next()
+        self.hook("UserPromptSubmit", {"session_id": self.sid, "prompt": "bir dakika", "prompt_id": "p-idle",
+                           "cwd": str(self.proj)})
+        out = self.hook("Stop", {"session_id": self.sid, "prompt_id": "p-idle", "stop_hook_active": False,
+                                 "cwd": str(self.proj)})
+        self.assertEqual(out, {})
+        ST = importlib.import_module("orkestra_core.state")
+        self.assertIsNone(ST.session_binding(self.sid))
+
+    def test_off_topic_user_prompt_unbinds(self):
+        import importlib, json
+        self.start()
+        other = self.make_project("otherapp")
+        out = self.hook("UserPromptSubmit", {
+            "session_id": self.sid, "prompt_id": "p-off", "cwd": str(self.proj),
+            "prompt": f"{other.name} reposunda bir bug düzelt",
+        })
+        self.assertIn("Unbound", json.dumps(out))
+        ST = importlib.import_module("orkestra_core.state")
+        self.assertIsNone(ST.session_binding(self.sid))
+
+
+    def test_unnamed_off_topic_prompt_unbinds(self):
+        import importlib, json
+        self.start()
+        out = self.hook("UserPromptSubmit", {
+            "session_id": self.sid, "prompt_id": "p-dash", "cwd": str(self.proj),
+            "prompt": "make this dashboard friendlier",
+        })
+        self.assertIn("Unbound", json.dumps(out))
+        ST = importlib.import_module("orkestra_core.state")
+        self.assertIsNone(ST.session_binding(self.sid))
+
+    def test_stop_still_blocks_when_this_turn_drove(self):
+        self.start()
+        self.advance_to_approve()
+        self.approve()
+        self.phase_next()
+        self.drive_turn(prompt="T001'e devam", prompt_id="p-drive2")
+        out = self.hook("Stop", {"session_id": self.sid, "prompt_id": "p-drive2", "stop_hook_active": False,
+                                 "cwd": str(self.proj)})
+        self.assertEqual(out.get("decision"), "block")
+
+    def test_stop_unbinds_when_last_user_activity_is_off_topic(self):
+        """Stop follow-ups skip beforeSubmitPrompt — activity off-topic must still release the lease."""
+        import importlib
+        self.start()
+        self.advance_to_approve()
+        self.approve()
+        self.phase_next()
+        self.drive_turn(prompt="T001'e devam", prompt_id="p-drive-ot")
+        activity = importlib.import_module("orkestra_core.activity")
+        ST = importlib.import_module("orkestra_core.state")
+        activity.record(self.proj, self.rid, {"session_id": self.sid}, "user",
+                        "prepare orkestra for public github release scrub local paths")
+        out = self.hook("Stop", {"session_id": self.sid, "prompt_id": "p-drive-ot",
+                                 "stop_hook_active": False, "cwd": str(self.proj)})
+        self.assertEqual(out, {})
+        self.assertIsNone(ST.session_binding(self.sid))
+
+    def test_stop_unbinds_when_run_is_paused(self):
+        import importlib
+        self.start()
+        self.advance_to_approve()
+        self.approve()
+        self.phase_next()
+        self.drive_turn(prompt="T001'e devam", prompt_id="p-drive-pause")
+        self.cli("pause", "-p", "demo")
+        # Re-bind after pause (simulates a stale lease) — Stop must clear it, never nudge.
+        ST = importlib.import_module("orkestra_core.state")
+        ST.bind_session(self.sid, self.proj, self.rid, engine="cursor")
+        out = self.hook("Stop", {"session_id": self.sid, "prompt_id": "p-drive-pause",
+                                 "stop_hook_active": False, "cwd": str(self.proj)})
+        self.assertEqual(out, {})
+        self.assertIsNone(ST.session_binding(self.sid))
+
+
+
+class TestSessionIsolation(FlowBase):
+    def test_bind_child_refuses_foreign_project(self):
+        from orkestra_core import state as ST
+        self.start(size="S")
+        other = self.make_project("other")
+        ST.bind_session(self.sid, self.proj, self.rid, engine="cursor")
+        refused = ST.bind_child("child-conv-1", self.sid, other, "001-x", "orkestra:implementer")
+        self.assertTrue(refused.get("refused"), refused)
+        self.assertEqual(refused.get("parent"), "")
+        self.assertIsNone(ST.child_binding("child-conv-1"))
+        ok = ST.bind_child("child-conv-2", self.sid, self.proj, self.rid, "orkestra:implementer")
+        self.assertFalse(ok.get("refused"), ok)
+        self.assertIsNotNone(ST.child_binding("child-conv-2"))
 
 
 if __name__ == "__main__":

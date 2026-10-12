@@ -61,6 +61,7 @@ def main(argv: List[str]) -> int:
         print(__doc__)
         return 2
     cmd, args = argv[0], argv[1:]
+    engine, args = _opt(args, "--engine")
     chat, args = _opt(args, "--chat-id")
     source, args = _opt(args, "--source", "cli")
     timeout, args = _opt(args, "--timeout", "1800")
@@ -68,8 +69,10 @@ def main(argv: List[str]) -> int:
         if len(args) < 2:
             print(__doc__)
             return 2
-        code, body = _call("POST", "/jobs", {"project": args[0], "request": " ".join(args[1:]), "chat_id": chat,
-                                             "source": source})
+        request = {"project": args[0], "request": " ".join(args[1:]), "chat_id": chat, "source": source}
+        if engine:
+            request["engine"] = engine
+        code, body = _call("POST", "/jobs", request)
     elif cmd == "reply":
         if chat:
             code, body = _call("POST", "/reply", {"chat_id": chat, "text": " ".join(args)})

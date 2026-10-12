@@ -1,10 +1,11 @@
 > English: [README.md](README.md)
 
-# Orkestra — Claude Code ve Cursor için uçtan uca agent orkestrası
+# Orkestra — Claude Code, Cursor ve GitHub Copilot için uçtan uca agent orkestrası
 
-Şef sensin. Bir istek yazarsın; Orkestra o projeyi tanır, yalnız sonucu değiştiren soruları sorar,
-`plan.md` hazırlar, **tek onayınla** bir agent ekibine TDD ile uygulatır, çalışan hiçbir şeyin
+Şef sensin. Bir istek yazarsın; Orkestra varsayılan olarak autopilot'ta projeyi tanır, güvenli varsayımları kaydeder,
+`plan.md` ve critic incelemesini tamamlar, TDD ile uygular, çalışan hiçbir şeyin
 bozulmadığını kanıtlar, bağımsız review'dan geçirir ve proje hafızasını güncelleyerek teslim eder.
+Yalnız açıkça “kararı/onayı bana sor” dersen plan onayı için bekler.
 Hiçbir şeyi commit/push/deploy etmez — sen istemedikçe.
 
 ```
@@ -14,39 +15,47 @@ Hiçbir şeyi commit/push/deploy etmez — sen istemedikçe.
 ## Kurulum (bir kez)
 
 ```bash
-bash ~/Projects/orkestra/install.sh          # etkileşimli
-bash ~/Projects/orkestra/install.sh --yes    # varsayılanlar: Context7 + Playwright MCP, bridge token
+git clone https://github.com/soft-ai-solutions/orkestra.git
+cd orkestra
+bash ./install.sh          # etkileşimli
+bash ./install.sh --yes    # varsayılanlar: Context7 + Playwright MCP, bridge token
+bash ./install.sh --skip-tests   # kurulumdaki unittest koşusunu atla (risk sana ait)
 ```
 
+İlk kurulum özeti: [ONBOARDING.md](ONBOARDING.md). Bu depoda ajan kuralları: [AGENTS.md](AGENTS.md).
+
 Kurulum önce eklenti ve bridge Python testlerini senin makinende koşar (bu Mac'te ~4 dk; CPU ve sistem yüküne göre değişir).
-Biri bile kırmızıysa kurulumu durdurur. İsteğe bağlı OpenClaw Node.js testleri ayrıca `npm test` ile çalıştırılır.
-Plugin `~/Projects/orkestra/plugins/orkestra`'dan yerinde yüklenir; buradaki her düzenleme bir sonraki
-Claude Code oturumunda geçerli olur.
+Biri bile kırmızıysa kurulumu durdurur (`--skip-tests` ile atlanır). OpenClaw Node.js logic testleri zorunlu CI
+işidir (`npm test`); tam e2e yerel/isteğe bağlıdır (`npm run test:e2e`, Homebrew `openclaw` veya `OPENCLAW_PKG`).
+Plugin `./plugins/orkestra`'dan yerinde yüklenir; buradaki her düzenleme bir sonraki
+Claude Code oturumunda geçerli olur. Kurulum ve `orkestra setup`, `orkestra` CLI için PATH shim'ini
+`~/.local/bin/orkestra` altına koyar (`ORKESTRA_SHIM_DIR` ile dizin değiştirilebilir).
 
-## Motor: Claude Code ya da Cursor
+## Motor: Claude Code, Cursor ya da Copilot
 
-Aynı akışı iki motor sürebilir; hangisinin süreceğini isteği verirken seçersin. Bir şey yazmazsan Claude.
+Aynı akışı isteği başlatan motor sürer. Normal terminal varsayılanı Claude'dur; Cursor ve Copilot run'ları engine kimliğini açıkça taşır.
 
-| Nereden | Claude (varsayılan) | Cursor |
-|---|---|---|
-| Sohbet | Claude Code: `/orkestra:run <istek>` | Cursor (IDE ya da `agent`): `/orkestra-run <istek>` |
-| Terminal | `orkestra run -p <proje> "<istek>"` | `orkestra run --engine cursor -p <proje> "<istek>"` |
-| Telegram | `/yap <proje> <istek>` | `/yap cursor <proje> <istek>` |
-| Bridge API | `{"project": …, "request": …}` | `… , "engine": "cursor"}` |
+| Nereden    | Claude Code                         | Cursor                                              | GitHub Copilot                                       |
+| ---------- | ----------------------------------- | --------------------------------------------------- | ---------------------------------------------------- |
+| Sohbet     | `/orkestra:run <istek>`             | `/orkestra-run <istek>`                             | `/orkestra:run <istek>`                              |
+| Terminal   | `orkestra run -p <proje> "<istek>"` | `orkestra run --engine cursor -p <proje> "<istek>"` | `orkestra run --engine copilot -p <proje> "<istek>"` |
+| Telegram   | `/yap <proje> <istek>`              | `/yap cursor <proje> <istek>`                       | `/yap copilot: <proje> <istek>`                      |
+| Bridge API | `{"project": …, "request": …}`      | `… , "engine": "cursor"}`                           | `… , "engine": "copilot"}`                           |
 
 Cursor'u bir kez hazırla (Cursor CLI: https://cursor.com/cli):
 
 ```bash
-python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra cursor install   # --dry-run ile önce ne yapacağını gösterir
-python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra cursor status
+python3 ./plugins/orkestra/bin/orkestra cursor install   # --dry-run ile önce ne yapacağını gösterir
+python3 ./plugins/orkestra/bin/orkestra cursor status
 ```
 
 Kurulum `~/.cursor/skills` ve `~/.cursor/agents` altına orkestra skill ve alt-ajanlarını bağlar, `~/.cursor/hooks.json`'a
 orkestra girdilerini **senin girdilerine dokunmadan** ekler (önce `hooks.json.orkestra-backup-<zaman>` yedeği alır) ve
 `orkestra` komutunu `~/.local/bin`'e koyar. Geri almak: `orkestra cursor uninstall`. Yeni açılan Cursor sohbetlerinde geçerlidir.
 
-Cursor'da fark eden üç şey:
-- **Soru ve onay sohbette yazıyla olur.** Model planı gösterir ve durur; onaylamak için `onay` yazarsın (Telegram'daki gibi).
+Cursor'da fark edenler:
+
+- Varsayılan autopilot'ta soru/onay beklemez; güvenli varsayımları kaydeder. Yalnız açıkça manual onay istersen sohbet mesajın plan onayı sayılır.
 - **Yalnız orkestra run'ı süren sohbetler denetlenir.** Diğer Cursor sohbetlerine dokunulmaz. Her-oturum kurallarını
   (commit/push izni, sır dosyaları, store) tüm Cursor sohbetlerine de uygulamak istersen `~/.orkestra/config.json` →
   `"engine": {"cursor": {"global_guards": true}}`.
@@ -57,26 +66,48 @@ Cursor, Claude Code'un eklenti kaydını da okur ve oradaki orkestra kopyasını
 O kayıt eski bir kopyayı gösteriyorsa (`orkestra cursor status` söyler) eski kurallar Cursor'da da cevap verir; kaydı
 `claude plugin update orkestra@orkestra-local` yeniler.
 
+Copilot için VS Code plugin'inde Orkestra lifecycle hook'ları etkin olmalı; yeni Copilot sohbeti açtıktan sonra
+`/orkestra:run` veya `/orkestra:resume` kullan. Copilot CLI başlatmalarında `gpt-6-luna` ve `max` reasoning effort
+varsayılandır; istekte tek bir desteklenen model/effort açıkça belirtilirse kullanılır, geçersiz veya belirsiz seçim
+varsayılana döner. VS Code custom agent'ları aktif sohbet modelini devralır; plugin API'si model/effort'u
+değiştiremediği için varsayılan GPT-6 Luna / max'i veya açıkça istenen alternatifi host model picker'da seç.
+Telegram/bridge Copilot'u
+destekler ve aynı CLI profilini kullanır.
+
 ## Komutlar
 
-| Komut | Ne yapar |
-|---|---|
-| `/orkestra:run <istek>` | Uçtan uca akış. Kökte (`~/Projects`) açtıysan proje adını istekte geçir. |
-| `/orkestra:status` | Faz, görevler, kanıt eksikleri, seni bekleyen bir şey var mı |
-| `/orkestra:resume` | Yarım kalan run'a (yeni oturum, compaction, ara verme) kaldığı yerden devam |
-| `/orkestra:onboard` | Projenin doğrulanmış hafızasını (PROJECT.md + gate'ler) kurar/yeniler |
-| `/orkestra:rollback` | Run'ın değiştirdiği dosyaları run öncesine döndürür. Önce kuru çalıştırma gösterir, onayını ister. Run sırasında senin yaptığın değişikliklere dokunmaz (`--all` demedikçe). Geri almadan önce mevcut içeriği yedekler. git'e yazmaz |
-| `/orkestra:ship` | Commit + push. Yalnız sen çağırabilirsin |
+| Komut                   | Ne yapar                                                                                                                                                                                                                             |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/orkestra:run <istek>` | Uçtan uca akış. Kökte (`~/Projects`) açtıysan proje adını istekte geçir.                                                                                                                                                             |
+| `/orkestra:status`      | Faz, görevler, kanıt eksikleri, seni bekleyen bir şey var mı                                                                                                                                                                         |
+| `/orkestra:resume`      | Yarım kalan run'a (yeni oturum, compaction, ara verme) kaldığı yerden devam                                                                                                                                                          |
+| `/orkestra:onboard`     | Projenin doğrulanmış hafızasını (PROJECT.md + gate'ler) kurar/yeniler                                                                                                                                                                |
+| `/orkestra:rollback`    | Run'ın değiştirdiği dosyaları run öncesine döndürür. Önce kuru çalıştırma gösterir, onayını ister. Run sırasında senin yaptığın değişikliklere dokunmaz (`--all` demedikçe). Geri almadan önce mevcut içeriği yedekler. git'e yazmaz |
+| `/orkestra:ship`        | Commit + push. Yalnız sen çağırabilirsin                                                                                                                                                                                             |
+
+## Kullanım senaryoları
+
+Aynı faz makinesi ve hook'lar; yalnız istek metni ve projenin kapıları değişir.
+
+| Senaryo | Örnek istek | Orkestra neyi zorlar |
+| ------- | ----------- | -------------------- |
+| **TDD ile özellik dilimi** | `sipariş listesine CSV dışa aktarma ekle` | Spec + plan + critic → red/green kanıt → regresyon kapıları → bağımsız review |
+| **Regresyonsuz bug fix** | `sepet boşken null çökmesini düzelt` | Dar plan; görev TDD istiyorsa önce kırık test; verify kapıları yeniden koşar |
+| **Yeşil kapı arkasında refactor** | `fiyatlamayı saf modüle çıkar; public API aynı kalsın` | Dosya kapsamlı implementer; kapılar yeşil kalmalı; beğenmezsen rollback |
+| **Hassas işte manual onay** | `… plan onayını bana sor` / `ben karar verici olayım` | Manual moda geçer; onay/red yalnız senin sohbet cevabınla kayda geçer |
+| **Çok motor, tek proje** | Claude / Cursor / Copilot | Tek `state.json` ve kanıt ağacı; resume'u başlatan motor sürdürür |
+| **Headless / bridge** | Telegram `/yap shop …` veya yerel `POST /runs` | Aynı hook'lar; loopback UI + token; bulut kontrol düzlemi yok |
+| **Güvenli ship** | Diff'i gördükten sonra `/orkestra:ship` | Commit/push yalnız sen ship dersen (veya o mesajda git izni); deploy/mağaza asla otomatik değil |
 
 ## Canlı takip: hangi pipeline nerede, şu an ne yapıyor
 
-| Nereden | Komut / adres |
-|---|---|
-| Terminal (canlı, 2 sn'de bir yenilenir) | `python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra watch` · tek seferlik: `--once` · bitenler de: `--all` · tek proje: `-p <proje>` |
-| Tarayıcı (salt-okunur, yalnız bu Mac) | `python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra dashboard --open` → http://127.0.0.1:47616/ |
-| Yerel chat ve canlı flow haritası | Bridge çalışırken http://127.0.0.1:47615/ · fazları, kayıtlı ajanları, işleri ve son hook hareketlerini izle |
-| Telegram | `/durum` → bu sohbetin işleri + tüm açık çalışmaların canlı durumu |
-| OpenClaw / script | `python3 ~/Projects/orkestra/bridge/orkestra_client.py runs` (ya da `GET /runs`) |
+| Nereden                                 | Komut / adres                                                                                                                               |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Terminal (canlı, 2 sn'de bir yenilenir) | `python3 ./plugins/orkestra/bin/orkestra watch` · tek seferlik: `--once` · bitenler de: `--all` · tek proje: `-p <proje>` |
+| Tarayıcı (salt-okunur, yalnız bu Mac)   | `python3 ./plugins/orkestra/bin/orkestra dashboard --open` → http://127.0.0.1:47616/                                      |
+| Yerel chat ve canlı flow haritası       | Bridge çalışırken http://127.0.0.1:47615/ · fazları, kayıtlı ajanları, işleri ve son hook hareketlerini izle                                |
+| Telegram                                | `/durum` → bu sohbetin işleri + tüm açık çalışmaların canlı durumu                                                                          |
+| OpenClaw / script                       | `python3 ./bridge/orkestra_client.py runs` (ya da `GET /runs`)                                                            |
 
 Her çalışma için: faz çubuğu, bu fazda geçen süre, **şu anki durum** (çalışıyor · komut çalışıyor · sessiz ·
 SENİ BEKLİYOR · bloke · oturum kapanmış olabilir), görev ilerlemesi ve R/G kanıtı, kapı sonuçları, bağlı Claude
@@ -84,16 +115,16 @@ oturumu ve son araç çağrıları (hangi ajan hangi dosyayı okudu/yazdı, hang
 Yerel chat'in **akış haritası**, bu gerçek run verisini faz çizgisi, raporlanan alt-agent ağı, etkin görevler ve son altı hook olayı olarak gösterir; yaklaşık 6 saniyede yenilenir.
 Kaynak dosyalar: `<proje>/.orkestra/runs/<run>/activity.jsonl` (hook'lar yazar, git'e girmez) ve
 `<proje>/.orkestra/current/ledger.md` (faz geçişleri). `watch`/`dashboard` hiçbir şeyi değiştirmez.
-Kısa yol istersen `~/.zshrc`'ye: `alias orkestra="python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra"`.
+Kısa yol istersen `~/.zshrc`'ye: `alias orkestra="python3 $ORKESTRA_ROOT/plugins/orkestra/bin/orkestra"`.
 
 ### Tempo ve kesintisiz devam (1.4.0)
 
-| Komut | Ne yapar |
-|---|---|
-| `orkestra next -p <proje>` | Sıradaki **tek** adım (en çok 3 satır). State, kanıt ve inceleme dosyalarından hesaplanır; aynı durumda hep aynı cevabı verir. Oturum kapansa, bağlam sıkışsa ya da yeni oturum açsan da kaldığın alt-adımı bulur: kanıtı olan görev yeniden yazılmaz, dosyadaki karar uygulanır, soru ve onay asla senin yerine cevaplanmaz. `/orkestra:resume` bunu kullanır. |
-| `orkestra tempo -p <proje> [--run <id>]` | Süre nereye gitti: faz süreleri, görev başına süre, inceleme retleri, ölçülen ölü bekleme payı. Biten run'larda da çalışır. |
-| `orkestra agents [clear] -p <proje>` | Arka planda çalışan alt-ajan kayıtları (çalışan / iz bırakmayan). `clear`: gerçekten gitmiş ajanların kaydını siler; normalde gerekmez (oturum yeniden başlayınca, rapor gelince ve `resume` sırasında kendiliğinden düşer). |
-| `orkestra watchdog [--dry-run\|--json\|--quiet\|--launchd]` | Oturumun dışından tek tarama: seni mi bekliyor, ölü bekleme mi, asılı komut mu, sessiz oturum mu. Bir kez bildirir (macOS bildirimi; bridge açıksa Telegram). Yalnız izin verdiysen devam ettirir. |
+| Komut                                                       | Ne yapar                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `orkestra next -p <proje>`                                  | Sıradaki **tek** adım (en çok 3 satır). State, kanıt ve inceleme dosyalarından hesaplanır; aynı durumda hep aynı cevabı verir. Oturum kapansa, bağlam sıkışsa ya da yeni oturum açsan da kaldığın alt-adımı bulur: kanıtı olan görev yeniden yazılmaz, dosyadaki karar uygulanır, soru ve onay asla senin yerine cevaplanmaz. `/orkestra:resume` bunu kullanır. |
+| `orkestra tempo -p <proje> [--run <id>]`                    | Süre nereye gitti: faz süreleri, görev başına süre, inceleme retleri, ölçülen ölü bekleme payı. Biten run'larda da çalışır.                                                                                                                                                                                                                                     |
+| `orkestra agents [clear] -p <proje>`                        | Arka planda çalışan alt-ajan kayıtları (çalışan / iz bırakmayan). `clear`: gerçekten gitmiş ajanların kaydını siler; normalde gerekmez (oturum yeniden başlayınca, rapor gelince ve `resume` sırasında kendiliğinden düşer).                                                                                                                                    |
+| `orkestra watchdog [--dry-run\|--json\|--quiet\|--launchd]` | Oturumun dışından tek tarama: seni mi bekliyor, ölü bekleme mi, asılı komut mu, sessiz oturum mu. Bir kez bildirir (macOS bildirimi; bridge açıksa Telegram). Yalnız izin verdiysen devam ettirir.                                                                                                                                                              |
 
 Durma sınıfları (`watch`, panel ve `watchdog` aynı sınıflandırıcıyı kullanır): **1** seni bekliyor (meşru) ·
 **2** ölü bekleme (alt-ajan bitti, ana oturum 90 sn'dir hareketsiz) · **3** asılı komut (15 dk; kapılarda 30 dk) ·
@@ -122,16 +153,17 @@ gate'lerde regresyon varsa review'a geçilmez. Model bu kapıları atlayamaz. Ka
 prompt değil.
 
 ### Agent ekibi
-| agent | model | rol |
-|---|---|---|
-| scout | haiku | salt-okur kod haritası (paralel) |
-| researcher | sonnet | sürüme özgü güncel doküman (Context7/web) |
-| architect | opus | spec.md + plan.md |
-| plan-critic | opus | planı sana gelmeden önce çürütmeye çalışır |
+
+| agent       | model  | rol                                                        |
+| ----------- | ------ | ---------------------------------------------------------- |
+| scout       | haiku  | salt-okur kod haritası (paralel)                           |
+| researcher  | sonnet | sürüme özgü güncel doküman (Context7/web)                  |
+| architect   | opus   | spec.md + plan.md                                          |
+| plan-critic | opus   | planı sana gelmeden önce çürütmeye çalışır                 |
 | implementer | sonnet | tek görev, sıkı TDD (red → green kanıtı CLI'ye kaydedilir) |
-| reviewer | opus | spec uyumu + doğruluk + regresyon riski |
-| adversary | opus | kenar durum, güvenlik, hata modları |
-| verifier | sonnet | gereksinimden geriye doğrulama, verification.md |
+| reviewer    | opus   | spec uyumu + doğruluk + regresyon riski                    |
+| adversary   | opus   | kenar durum, güvenlik, hata modları                        |
+| verifier    | sonnet | gereksinimden geriye doğrulama, verification.md            |
 
 Model değiştirmek için ilgili `plugins/orkestra/agents/<ad>.md` dosyasındaki `model:` satırını düzenle.
 
@@ -208,11 +240,13 @@ Plugin'in her oturuma eklediği sabit yük yaklaşık 1,3k token; hook'ların ba
 ## Telegram, OpenClaw ve n8n
 
 **Telegram (tek komutla kurulum):**
+
 ```bash
-python3 ~/Projects/orkestra/bridge/orkestra_bridge.py telegram-setup   # BotFather token'ı ister, chat id'ni yakalar
-python3 ~/Projects/orkestra/bridge/orkestra_bridge.py launchd          # bridge her açılışta çalışsın (ya da: serve)
-python3 ~/Projects/orkestra/bridge/orkestra_bridge.py doctor --live    # her şey hazır mı
+python3 ./bridge/orkestra_bridge.py telegram-setup   # BotFather token'ı ister, chat id'ni yakalar
+python3 ./bridge/orkestra_bridge.py launchd          # bridge her açılışta çalışsın (ya da: serve)
+python3 ./bridge/orkestra_bridge.py doctor --live    # her şey hazır mı
 ```
+
 Sonra Telegram'da: `/yap shop sipariş listesine CSV dışa aktarma ekle` → sorular ve plan özeti gelir →
 düz yazıyla cevap verirsin, onay için `onay` → bitince rapor gelir. `/durum` (işler + canlı durum), `/iptal`.
 Bridge Telegram'ı long-polling ile dinler, public URL gerekmez. Yalnız kurulumda yakalanan chat ve kullanıcı yazabilir.
@@ -221,7 +255,8 @@ Bridge Telegram'ı long-polling ile dinler, public URL gerekmez. Yalnız kurulum
 program dinleyebilir. Ya orkestraya ayrı bir bot ver, ya da OpenClaw'dan `bridge/orkestra_client.py` ile çağır
 (`integrations/openclaw/CONTRACT.md`).
 
-**n8n:** `bridge/n8n/` altında iki workflow var, `install.sh` yerel n8n'e aktarabilir.
+**n8n:** `bridge/n8n/` altında iki workflow var. İçe aktarma yalnız ortam değişkenleriyle yapılır (`N8N_URL`, `N8N_API_KEY` veya `N8N_STATE`); kardeş bir `n8n` deposuna varsayılan yol yoktur. `install.sh` bu değişkenler ayarlıysa sorar; elle: `python3 ./bridge/n8n_import.py`.
+
 - `POST /webhook/orkestra-job` her türlü tetikleyiciden (GitHub, Gmail, iOS Kısayollar, zamanlayıcı) iş başlatır.
   `X-Orkestra-Key` header'ı zorunlu.
 - `orkestra-callback` bildirimleri istediğin kanala dağıtır.
@@ -254,7 +289,8 @@ Mac uykudaysa bridge çalışmaz; Telegram'dan iş başlatmak için Mac açık v
 python3 plugins/orkestra/bin/orkestra doctor                  # ortam + hook öz-testi + MCP durumu
 cd plugins/orkestra/tests && python3 -m unittest discover -s . -q # 357 test
 cd bridge/tests && python3 -m unittest discover -s . -q           # 19 bridge testi
-cd integrations/openclaw/plugin && npm test                       # 15 test
+cd integrations/openclaw/plugin && npm test                       # OpenClaw logic (zorunlu CI)
+cd integrations/openclaw/plugin && npm run test:e2e               # e2e (yerel/isteğe bağlı; OPENCLAW_PKG gerekir)
 bash install.sh --refresh-vendor                               # referans projeleri upstream'den tazele
 ```
 

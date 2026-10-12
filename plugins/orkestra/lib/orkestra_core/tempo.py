@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import activity as A
+from . import intent
 from . import paths
 from . import planparse as PP
 from .state import PHASES
@@ -299,7 +300,8 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
     if status == "blocked":
         return done(_n("wait_user", f"BLOCKED: {(st.get('blocked') or {}).get('reason') or '?'} — needs the user; after it is "
                                     f"resolved: `orkestra unblock {p}`", "blocked runs are never continued automatically"))
-    if status == "awaiting_user":
+    autopilot_user_wait = st.get("approval_mode", "autopilot") == "autopilot"
+    if status == "awaiting_user" and not autopilot_user_wait:
         return done(_n("wait_user", f"WAITING FOR THE USER: {(st.get('awaiting') or {}).get('question') or '?'} — never answer "
                                     f"on their behalf", "a question or approval is open"))
     pending, lost = live_agents(project, rid, now=now)
@@ -325,31 +327,58 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
             act = _n("work", "classify the request: append `## Sınıflandırma` to request.md (`orkestra playbook intake`)",
                      "request.md has no classification yet")
     elif phase == "discover":
-        if len(read_text(fdir / "context.md").strip()) < 200:
-            act = _n("dispatch", "dispatch the scouts in ONE message (+ researcher if third-party APIs), then merge their notes "
-                                 "into context.md (`orkestra playbook discover`)", "context.md is missing or too thin")
+        size = st.get("size") or "M"
+        need = intent.min_context_chars(size)
+        if len(read_text(fdir / "context.md").strip()) < need:
+            if size == "XS":
+                act = _n("work", "XS fast track: read 1–3 files yourself and write context.md "
+                                 f"(≥{need} chars); skip scouts (`orkestra playbook discover`)",
+                         "context.md is missing or too thin")
+            elif size == "S":
+                act = _n("work", "S fast track: optional 0–1 scout OR write context.md yourself "
+                                 f"(≥{need} chars), then continue (`orkestra playbook discover`)",
+                         "context.md is missing or too thin")
+            else:
+                act = _n("dispatch", "dispatch the scouts in ONE message (+ researcher if third-party APIs), then merge their notes "
+                                     "into context.md (`orkestra playbook discover`)", "context.md is missing or too thin")
         elif not (rdir / "gates-baseline.json").exists():
             act = _n("cli", f"`orkestra gate baseline {p}`", "the baseline gates are not recorded", f"orkestra gate baseline {p}")
     elif phase == "clarify":
         if not spec.strip():
-            act = _n("work", "ask only the outcome-changing questions (AskUserQuestion, ≤ 4), then write spec.md with "
-                             "`## Netleştirmeler` (`orkestra playbook clarify`)", "spec.md does not exist")
+            if st.get("approval_mode", "autopilot") == "autopilot":
+                act = _n("work", "Autopilot: infer conservative defaults from the request, codebase and project memory; record "
+                                 "each material assumption in `spec.md` → `## Netleştirmeler`, then continue without asking the user.",
+                         "spec.md does not exist")
+            else:
+                act = _n("work", "ask only the outcome-changing questions (AskUserQuestion, ≤ 4), then write spec.md with "
+                                 "`## Netleştirmeler` (`orkestra playbook clarify`)", "spec.md does not exist")
         elif not PP.has_section(spec, "Netleştirmeler", "Clarifications") or not PP.spec_ids(spec):
-            act = _n("work", "finish spec.md: FR-###/SC-### ids and a `## Netleştirmeler` section", "spec.md is incomplete")
+            act = _n("work", ("Autopilot: finish spec.md with FR-###/SC-### ids, a `## Netleştirmeler` section and "
+                               "conservative assumptions; do not ask the user." if autopilot_user_wait else
+                               "finish spec.md: FR-###/SC-### ids and a `## Netleştirmeler` section"), "spec.md is incomplete")
     elif phase == "plan":
         critic = PP.verdict(read_text(fdir / "reviews" / "plan-critic.md"))
+        size = st.get("size") or "M"
         if not plan.strip():
-            act = _n("dispatch", "dispatch orkestra:architect to write plan.md (`orkestra playbook plan`)", "plan.md does not exist")
-        elif st.get("size") != "XS" and critic is None:
+            if size in ("XS", "S"):
+                act = _n("work", f"{size}: write a short plan.md yourself (1–3 tasks), then `orkestra plan check` "
+                                 "(`orkestra playbook plan`)", "plan.md does not exist")
+            else:
+                act = _n("dispatch", "dispatch orkestra:architect to write plan.md (`orkestra playbook plan`)", "plan.md does not exist")
+        elif not intent.skips_plan_critic(size) and critic is None:
             act = _n("dispatch", "dispatch orkestra:plan-critic (it writes reviews/plan-critic.md)", "the plan has no critic verdict")
-        elif st.get("size") != "XS" and critic == "FAIL":
+        elif not intent.skips_plan_critic(size) and critic == "FAIL":
             act = _n("dispatch", "plan-critic FAILED → send its blockers to the architect, then run the critic again "
                                  "(max 3 rounds, then ask the user)", "reviews/plan-critic.md ends with VERDICT: FAIL")
     elif phase == "approve":
         appr = read_json(rdir / "approval.json")
         if not isinstance(appr, dict):
-            act = _n("ask_user", "show the plan summary and ask for approval — ONE AskUserQuestion with header `Plan onayı` and "
-                                 "nothing else in that call. Never approve yourself.", "no approval is recorded")
+            if st.get("approval_mode", "autopilot") == "autopilot":
+                act = _n("cli", f"Autopilot: the plan and critic passed. Run `orkestra phase next {p}` to record the hash-bound "
+                                 "policy approval and continue.", "no policy approval is recorded", f"orkestra phase next {p}")
+            else:
+                act = _n("ask_user", "show the plan summary and ask for approval — ONE AskUserQuestion with header `Plan onayı` and "
+                                     "nothing else in that call.", "no approval is recorded")
         elif appr.get("decision") != "approve":
             act = _n("work", "the user asked for changes: apply them to spec/plan, `orkestra plan check`, then ask for approval "
                              "again", f"last decision: {appr.get('decision')} ({str(appr.get('detail') or '')[:80]})")
@@ -386,10 +415,10 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
                      f"orkestra gate last {p}")
         elif act is None and ver is None:
             act = _n("dispatch", "dispatch orkestra:verifier (it writes verification.md)", "gates are green; verification.md is missing")
-        elif act is None and ver != "PASS":
+        elif act is None and ver not in ("PASS", "PASS_WITH_NOTES"):
             act = _n("work", "verification FAILED → fix the failing ids through an implementer "
                              f"(`orkestra phase back implement --reason \"verification\" {p}`), then verify again",
-                     "verification.md does not end with VERDICT: PASS")
+                 "verification.md does not end with VERDICT: PASS or PASS_WITH_NOTES")
     elif phase == "review":
         act = _open_tasks_action(project, st, deep)
         if act is None:
@@ -397,9 +426,10 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
             has_final = any("final" in n and "adversary" not in n for n in names)
             has_adv = any("adversary" in n for n in names)
             tri = read_text(fdir / "reviews" / "triage.md")
-            if not has_final or (st.get("size") != "XS" and not has_adv):
+            if not has_final or (not intent.skips_adversary(st.get("size") or "") and not has_adv):
                 act = _n("dispatch", "dispatch orkestra:reviewer (scope: final → reviews/final-review.md)"
-                                     + ("" if st.get("size") == "XS" else " and orkestra:adversary (→ reviews/adversary.md) in ONE message"),
+                                     + ("" if intent.skips_adversary(st.get("size") or "") else
+                                        " and orkestra:adversary (→ reviews/adversary.md) in ONE message"),
                          "the final review has not been written")
             elif not tri.strip():
                 act = _n("work", "triage every finding yourself → reviews/triage.md (`orkestra template triage`); include the "
@@ -603,7 +633,8 @@ def classify(st: Dict[str, Any], rows: List[Dict[str, Any]], pending: Optional[L
         return res(1, "user", ts, f"kullanıcı bekleniyor — açık soru ({q})")
     main_rows = [r for r in rows if (r.get("agent") or "main") == "main" and r.get("kind") not in ("end", "nudge")]
     main_last = main_rows[-1] if main_rows else None
-    if main_last and main_last.get("kind") == "idle":
+    state_ts = float(state_mtime or 0)
+    if main_last and main_last.get("kind") == "idle" and state_ts <= float(main_last.get("ts") or 0):
         return res(1, "turn_ended", float(main_last.get("ts") or 0), "tur bitti — kullanıcının mesajı bekleniyor")
     for agent, ts, what in _running_commands(rows):
         limit = float(wd["gate_command_seconds"] if re.search(r"\borkestra\s+(\S+\s+)*(gate|tdd|evidence)\b", what)
@@ -625,9 +656,14 @@ def classify(st: Dict[str, Any], rows: List[Dict[str, Any]], pending: Optional[L
         if not progressed and (main_waiting or not got_report) and now - done_ts > float(wd["dead_wait_seconds"]):
             why = "ana oturum bekleme komutunda" if main_waiting else "alt-ajan raporu ana oturuma ulaşmadı"
             return res(2, "dead_wait", done_ts, f"ölü bekleme — alt-ajan {dur_tr(now - done_ts)} önce bitti, {why}")
-    last_ts = max([float(r.get("ts") or 0) for r in rows] or [float(state_mtime or 0)])
+    activity_ts = max([float(r.get("ts") or 0) for r in rows] or [0.0])
+    last_ts = max(activity_ts, state_ts)
     if last_ts and now - last_ts > float(wd["silent_seconds"]) and not _running_commands(rows):
         lost = f" ({len(pending)} alt-ajan kaydı var ama {dur_tr(quiet)} hiçbir iz yok)" if pending and quiet else ""
+        if state_ts > activity_ts:
+            hook_activity = f"son hook aktivitesi {dur_tr(now - activity_ts)} önce" if activity_ts else "henüz hook aktivitesi yok"
+            return res(4, "silent", last_ts, f"sessiz oturum — run state {dur_tr(now - state_ts)} önce güncellendi; "
+                       f"{hook_activity}; canlılık hook kayıtlarından doğrulanamıyor{lost}")
         return res(4, "silent", last_ts, f"sessiz oturum — {dur_tr(now - last_ts)} kayıt yok; oturum kapanmış ya da çökmüş "
                                          f"olabilir{lost}")
     return res(0, "working", last_ts, "çalışıyor")

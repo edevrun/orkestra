@@ -11,7 +11,7 @@ import argparse
 from typing import Any, List, Optional, Tuple
 
 RUNS_A_COMMAND = ("tdd", "evidence")
-SUB_ACTION = ("task", "gate", "phase", "memory", "report", "agents", "cursor")  # key = "<cmd>:<action>"
+SUB_ACTION = ("task", "gate", "phase", "memory", "report", "agents", "cursor", "copilot")  # key = "<cmd>:<action>"
 SUB_CHECK = ("plan", "trace", "deps", "review", "integrity")                   # key = "<cmd>:check"
 
 
@@ -97,9 +97,12 @@ def build_parser(parser_class: Any = argparse.ArgumentParser) -> argparse.Argume
     s.add_argument("--title", required=True)
     s.add_argument("--request")
     s.add_argument("--request-file")
-    s.add_argument("--size", default="M", choices=["XS", "S", "M", "L"])
+    s.add_argument("--size", default="auto", choices=["auto", "XS", "S", "M", "L"],
+                   help="run size; auto (default) infers XS/S/M/L from the request — prefer XS/S for small safe work")
     s.add_argument("--headless", action="store_true")
-    s.add_argument("--engine", choices=["claude", "cursor"], help="which agent drives the run (default: the one asking, else claude)")
+    s.add_argument("--engine", choices=["claude", "cursor", "copilot"], help="which agent drives the run (default: the one asking, else claude)")
+    s.add_argument("--approval-mode", choices=["autopilot", "manual"], default=None,
+                   help="default autopilot; use manual when the user explicitly wants to approve the plan")
     sp_("resume")
     s = sp_("status")
     s.add_argument("--json", action="store_true")
@@ -179,12 +182,18 @@ def build_parser(parser_class: Any = argparse.ArgumentParser) -> argparse.Argume
     s.add_argument("--open", action="store_true", help="open the browser")
     s = sp_("run", help="start a run from the terminal with the engine of your choice (opens its interactive UI)")
     s.add_argument("request", nargs="+", help="the request, in your own words")
-    s.add_argument("--engine", choices=["claude", "cursor"], help="default: claude (config: engine.default)")
+    s.add_argument("--engine", choices=["claude", "cursor", "copilot"], help="default: claude (config: engine.default)")
+    s.add_argument("--approval-mode", choices=["autopilot", "manual"], default=None)
     s.add_argument("--print", action="store_true", help="only print the command that would be started")
     s = sp_("cursor", help="Cursor side: build | install | uninstall | status (skills, subagents and hooks in ~/.cursor)")
     s.add_argument("action", choices=["build", "install", "uninstall", "status"])
     s.add_argument("--copy", action="store_true", help="copy files instead of linking them")
     s.add_argument("--dry-run", action="store_true", help="show what would change, write nothing")
+    s = sp_("copilot", help="Copilot side: install | uninstall | status (hooks in ~/.copilot/plugins/orkestra)")
+    s.add_argument("action", choices=["install", "uninstall", "status"])
+    s.add_argument("--dry-run", action="store_true", help="show what would change, write nothing")
+    s = sp_("setup", help="detect Claude/Cursor/Copilot and install Orkestra for each (interactive, or --yes)")
+    s.add_argument("--yes", "-y", action="store_true", help="install every detected engine without asking")
     sp_("doctor")
     sp_("version")
     return p

@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import evidence as E
 from . import gates as G
+from . import intent
 from . import paths
 from . import planparse as PP
 from . import snapshot as S
@@ -63,7 +64,8 @@ def init_project(project: Path) -> List[str]:
 
 # ---------------------------------------------------------------- start / resume
 
-def start_run(project: Path, title: str, request: str, size: str, mode: str, engine: str = "claude") -> Dict[str, Any]:
+def start_run(project: Path, title: str, request: str, size: str, mode: str, engine: str = "claude",
+              approval_mode: str = "autopilot") -> Dict[str, Any]:
     project = project.resolve(strict=False)
     existing = project_active_run(project)
     if existing:
@@ -77,13 +79,14 @@ def start_run(project: Path, title: str, request: str, size: str, mode: str, eng
     (fdir / "tasks").mkdir(parents=True, exist_ok=True)
     (fdir / "reviews").mkdir(parents=True, exist_ok=True)
     rdir.mkdir(parents=True, exist_ok=True)
-    st = new_state(project, run_id, title, size, mode, engine)
+    st = new_state(project, run_id, title, size, mode, engine, approval_mode)
     base = S.take_baseline(project, rdir)
     st["baseline"] = {"git": base["git"], "head": base.get("head"), "at": base["at"],
                       "dirty_files": len(base.get("files") or {})}
     st["baseline"]["deps"] = G.dependency_sets(project)
     save_state(project, st)
-    req_md = (f"# İstek — {title}\n\n- run: `{run_id}`\n- boyut: {size}\n- mod: {mode}\n- motor: {engine}\n- tarih: {now_iso()}\n\n"
+    req_md = (f"# İstek — {title}\n\n- run: `{run_id}`\n- boyut: {size}\n- mod: {mode}\n- motor: {engine}\n"
+              f"- onay modu: {approval_mode}\n- tarih: {now_iso()}\n\n"
               f"## Ham istek\n\n{request.strip()}\n")
     write_text_atomic(fdir / "request.md", req_md)
     set_active_run(project, run_id)
@@ -91,6 +94,41 @@ def start_run(project: Path, title: str, request: str, size: str, mode: str, eng
     ledger(project, run_id, f"run started: {title!r} (size {size}, mode {mode}, engine {engine}); baseline git={base['git']} "
                             f"head={str(base.get('head'))[:10]} dirty_files={st['baseline']['dirty_files']}")
     return st
+
+
+def record_engine_origin(project: Path, run_id: str, engine: str) -> bool:
+    """Correct a run's origin when its host hook identifies it after CLI start."""
+    if engine not in ("claude", "cursor", "copilot"):
+        return False
+    project = Path(project)
+    with StateTxn(project, run_id) as st:
+        if st.get("phase") != "intake" or st.get("engine") == engine:
+            return False
+        st["engine"] = engine
+    request_path = paths.feature_dir(project, run_id) / "request.md"
+    request = read_text(request_path)
+    updated = re.sub(r"(?m)^- motor: [^\n]*$", f"- motor: {engine}", request, count=1)
+    if updated != request:
+        write_text_atomic(request_path, updated)
+    ledger(project, run_id, f"origin engine identified by host hook: {engine}")
+    return True
+
+
+def set_approval_mode(project: Path, run_id: str, mode: str, reason: str = "") -> bool:
+    """Change the decision owner only when a real user explicitly asks to take it back."""
+    if mode not in ("autopilot", "manual"):
+        raise OrkestraError("approval mode must be autopilot or manual")
+    with StateTxn(project, run_id) as st:
+        if st.get("status") in ("done", "aborted"):
+            return False
+        if st.get("approval_mode", "autopilot") == mode:
+            return False
+        st["approval_mode"] = mode
+        if mode == "manual" and st.get("phase") == "approve":
+            st["status"] = "active"
+            st["awaiting"] = None
+    ledger(project, run_id, f"approval mode → {mode}" + (f": {reason[:120]}" if reason else ""))
+    return True
 
 
 def other_open_runs(project: Path) -> List[str]:
@@ -168,6 +206,20 @@ def spec_plan_hash(project: Path, run_id: str) -> str:
     return sha256_bytes(data)
 
 
+def _legacy_plan_review_is_current(project: Path, st: Dict[str, Any]) -> bool:
+    """Migrate pre-hash runs only when their critic artifact is newer than the reviewed inputs."""
+    if intent.skips_plan_critic(st.get("size") or ""):
+        return True
+    fdir = paths.feature_dir(project, st["run_id"])
+    critic = fdir / "reviews" / "plan-critic.md"
+    inputs = [fdir / name for name in ("spec.md", "plan.md")]
+    try:
+        latest_input = max(path.stat().st_mtime_ns for path in inputs if path.exists())
+        return critic.stat().st_mtime_ns >= latest_input
+    except (OSError, ValueError):
+        return False
+
+
 def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
     rid = st["run_id"]
     fdir = paths.feature_dir(project, rid)
@@ -180,8 +232,9 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
             problems.append("request.md missing")
     elif target == "clarify":
         ctx = read_text(fdir / "context.md")
-        if len(ctx.strip()) < 200:
-            problems.append("context.md missing or too thin (discovery output, >= 200 chars)")
+        need = intent.min_context_chars(st.get("size") or "M")
+        if len(ctx.strip()) < need:
+            problems.append(f"context.md missing or too thin (discovery output, >= {need} chars)")
         if not (rdir / "gates-baseline.json").exists():
             problems.append("baseline gates not recorded: run `orkestra gate baseline` (it records an empty "
                             "baseline if the project has no gates, which is reported as a risk)")
@@ -194,21 +247,27 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
             problems.append("spec.md defines no FR-###/SC-### ids")
     elif target == "approve":
         problems += PP.check_plan(spec, plan, project)
-        if st.get("size") != "XS":
+        if not intent.skips_plan_critic(st.get("size") or ""):
             critic = read_text(fdir / "reviews" / "plan-critic.md")
             v = PP.verdict(critic)
             if v not in ("PASS", "PASS_WITH_NOTES"):
                 problems.append("plan-critic verdict missing or not PASS (reviews/plan-critic.md → `VERDICT: PASS`)")
     elif target == "implement":
         appr = read_json(rdir / "approval.json")
-        if not isinstance(appr, dict) or appr.get("decision") != "approve":
-            problems.append("no user approval recorded. Approval is written ONLY by hooks when the user answers the "
-                            "approval question with 'Onayla' or types 'onay'. Ask the user. (Never record it "
-                            "yourself — calling the hooks, writing the file or replaying a test payload is forging the "
-                            "user's consent, also when they said not to ask questions: the approval is not a question "
-                            "you may skip.)")
+        if isinstance(appr, dict) and appr.get("decision") == "reject":
+            problems.append("the user requested plan changes; revise the plan and run the critic again")
+        elif not isinstance(appr, dict) or appr.get("decision") != "approve":
+            if st.get("approval_mode", "autopilot") == "manual":
+                problems.append("no user approval recorded for this manual run. Recording it yourself would be forging the user's consent; ask the user to approve the current plan.")
+            else:
+                critic = PP.verdict(read_text(fdir / "reviews" / "plan-critic.md"))
+                if not intent.skips_plan_critic(st.get("size") or "") and critic not in ("PASS", "PASS_WITH_NOTES"):
+                    problems.append("autopilot needs a current plan-critic PASS before approval")
+                if st.get("plan_review_hash") != spec_plan_hash(project, rid) and not (
+                        not st.get("plan_review_hash") and _legacy_plan_review_is_current(project, st)):
+                    problems.append("spec/plan changed after plan review; rerun plan-critic before autopilot approval")
         elif appr.get("hash") != spec_plan_hash(project, rid):
-            problems.append("spec/plan changed after approval — show the diff and ask the user to approve again")
+            problems.append("spec/plan changed after approval — rerun plan-critic and record a current approval")
         problems += PP.check_plan(spec, plan, project)
     elif target == "verify":
         open_tasks = [tid for tid, t in st.get("tasks", {}).items() if t.get("status") not in ("done", "deferred")]
@@ -230,8 +289,8 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
             if newest_change and newest_change > float(last.get("ts", 0)):
                 problems.append("files changed after the last `orkestra gate verify` — run it again")
         ver = read_text(fdir / "verification.md")
-        if PP.verdict(ver) != "PASS":
-            problems.append("verification.md must end with `VERDICT: PASS`")
+        if PP.verdict(ver) not in ("PASS", "PASS_WITH_NOTES"):
+            problems.append("verification.md must end with `VERDICT: PASS` or `VERDICT: PASS_WITH_NOTES`")
         problems += PP.check_trace(spec, ver)
         gate_names = [g["name"] for g in paths.project_config(project).get("gates") or []]
         problems += E.verification_problems(project, rid, spec, ver, gate_names)
@@ -295,11 +354,35 @@ def phase_next(project: Path, run_id: str, note: str = "") -> Tuple[str, str]:
         if cur == "done":
             raise OrkestraError("run is already done")
         target = PHASES[PHASES.index(cur) + 1]
+        if target == "implement" and st.get("approval_mode", "autopilot") == "autopilot":
+            rdir = paths.run_dir(project, run_id)
+            approval = read_json(rdir / "approval.json")
+            current_hash = spec_plan_hash(project, run_id)
+            if isinstance(approval, dict) and approval.get("decision") == "reject":
+                raise OrkestraError("the plan was rejected; revise spec/plan before continuing")
+            if not isinstance(approval, dict) or approval.get("decision") != "approve" or approval.get("hash") != current_hash:
+                plan_problems = preconditions(project, st, "approve")
+                if plan_problems:
+                    raise OrkestraError("cannot auto-approve the plan:\n  - " + "\n  - ".join(plan_problems))
+                if st.get("plan_review_hash") != current_hash:
+                    if st.get("plan_review_hash") or not _legacy_plan_review_is_current(project, st):
+                        raise OrkestraError("spec/plan changed after plan review; return to plan and run plan-critic again")
+                    st["plan_review_hash"] = current_hash
+                rec = {"decision": "approve", "source": "autopilot",
+                       "detail": "plan checks and critic passed; autopilot is enabled", "at": now_iso(),
+                       "hash": current_hash}
+                write_json_atomic(rdir / "approval.json", rec)
+                ledger(project, run_id, "autopilot approved plan after checks and critic passed")
         problems = preconditions(project, st, target)
         if problems:
             raise OrkestraError(f"cannot move {cur} → {target}:\n  - " + "\n  - ".join(problems))
+        if target == "approve":
+            st["plan_review_hash"] = spec_plan_hash(project, run_id)
         if target == "implement":
             _apply_approval(project, st)
+            st["status"] = "active"
+        elif st.get("status") == "awaiting_user" and st.get("approval_mode", "autopilot") == "autopilot":
+            st["status"] = "active"
         if target == "done":
             st["status"] = "done"
             snap = usage_snapshot(project, st)
@@ -363,10 +446,10 @@ def _apply_approval(project: Path, st: Dict[str, Any]) -> None:
 
 
 def record_approval(project: Path, run_id: str, decision: str, source: str, detail: str = "") -> Optional[Dict[str, Any]]:
-    """Called by hooks only (UserPromptSubmit / PostToolUse on AskUserQuestion)."""
+    """Record a real user decision from a hook; automatic approvals are written by phase_next."""
     rdir = paths.run_dir(project, run_id)
     st = load_state(project, run_id)
-    if st.get("phase") != "approve":
+    if st.get("phase") != "approve" or st.get("approval_mode", "autopilot") != "manual":
         return None
     rec = {"decision": decision, "source": source, "detail": detail[:500], "at": now_iso(),
            "hash": spec_plan_hash(project, run_id)}
@@ -383,6 +466,8 @@ def record_approval(project: Path, run_id: str, decision: str, source: str, deta
 
 def set_status(project: Path, run_id: str, status: str, reason: str = "", source: str = "") -> None:
     with StateTxn(project, run_id) as st:
+        if status == "awaiting_user" and st.get("approval_mode", "autopilot") != "manual":
+            raise OrkestraError("autopilot runs cannot wait for user input; decide conservatively or block on a real external dependency")
         st["status"] = status
         if status == "aborted":
             snap = usage_snapshot(project, st)
@@ -398,7 +483,8 @@ def set_status(project: Path, run_id: str, status: str, reason: str = "", source
             st["blocked"] = None
             st["awaiting"] = None
     ledger(project, run_id, f"status → {status}" + (f": {reason}" if reason else ""))
-    if status == "aborted":
+    if status in ("aborted", "paused"):
+        # Paused must leave the workspace index too: otherwise a foreign chat can re-lease the run.
         set_active_run(project, None)
         point_current(project, None)
 

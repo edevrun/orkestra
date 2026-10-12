@@ -19,6 +19,7 @@ jobs:
         run: cd plugins/orkestra/tests && python -m unittest discover -s . -q
       - name: bridge tests
         run: cd bridge/tests && python -m unittest discover -s . -q
+  # Logic-only OpenClaw suite (no Homebrew openclaw). Full plugin e2e stays local-only.
   openclaw:
     strategy:
       fail-fast: false
@@ -30,5 +31,5 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: OpenClaw plugin tests
+      - name: OpenClaw plugin logic tests (required CI; no openclaw pkg)
         run: cd integrations/openclaw/plugin && npm test

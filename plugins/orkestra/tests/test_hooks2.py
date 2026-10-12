@@ -158,6 +158,7 @@ class TestBackgroundAgents(Base):
     def test_turn_may_end_while_a_subagent_runs_and_not_after(self):
         self.to_implement()
         self.cli("task", "start", "T001", "-p", "demo")
+        self.drive_turn(prompt="T001'i uygula", prompt_id="p1")
         self.assertEqual(self.stop("p1").get("decision"), "block")          # nothing running → nudged
         self.launch("a1", "orkestra:implementer", "Implement T001")
         self.assertEqual(list(self.agents()["pending"]), ["a1"])

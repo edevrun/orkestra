@@ -127,6 +127,38 @@ def _parse_iso(s: str) -> Optional[float]:
         return None
 
 
+def _activity_feed(rows: List[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    entries = []
+    latest_denial = {}
+    for row in A.visible(rows, len(rows)):
+        ts = float(row.get("ts") or 0)
+        agent = str(row.get("agent") or "main")
+        item = {"time": time.strftime("%H:%M:%S", time.localtime(ts)),
+                "agent": A.short_agent(agent), "kind": row.get("kind"), "tool": row.get("tool") or "",
+                "what": row.get("what") or "", "_sort_ts": ts}
+        if item["kind"] == "deny" and item["tool"] == "Bash":
+            key = (agent, item["what"])
+            previous = latest_denial.get(key)
+            if previous and 0 <= ts - previous["_last_ts"] <= 600:
+                previous["repeat_count"] += 1
+                previous["time"] = item["time"]
+                previous["_last_ts"] = ts
+                previous["_sort_ts"] = ts
+                continue
+            item["repeat_count"] = 1
+            item["_last_ts"] = ts
+            latest_denial[key] = item
+        entries.append(item)
+    entries.sort(key=lambda item: item["_sort_ts"])
+    feed = entries[-limit:]
+    for item in feed:
+        item.pop("_last_ts", None)
+        item.pop("_sort_ts", None)
+    return feed
+
+
 def collect(project: Path, st: Dict[str, Any], mtime: float = 0.0, n_activity: int = 14) -> Dict[str, Any]:
     rid = st["run_id"]
     rdir = paths.run_dir(project, rid)
@@ -144,12 +176,9 @@ def collect(project: Path, st: Dict[str, Any], mtime: float = 0.0, n_activity: i
     phase_since = _parse_iso(hist[-1].get("at", "")) if hist else None
     ledger = [ln[2:] for ln in read_text(paths.feature_dir(project, rid) / "ledger.md").splitlines()
               if ln.startswith("- ")][-4:]
-    feed = []
-    for r in A.visible(rows, n_activity):
-        feed.append({"time": time.strftime("%H:%M:%S", time.localtime(float(r.get("ts") or 0))),
-                     "agent": A.short_agent(str(r.get("agent") or "main")), "kind": r.get("kind"),
-                     "tool": r.get("tool") or "", "what": r.get("what") or ""})
+    feed = _activity_feed(rows, n_activity)
     phase = st.get("phase", "intake")
+    state_updated = _parse_iso(st.get("updated")) or mtime
     sessions = _sessions_for(project, rid)
     created = _parse_iso(st.get("created", ""))
     usage = U.for_sessions([s["id"] for s in sessions], since=created - 120 if created else None)
@@ -158,7 +187,7 @@ def collect(project: Path, st: Dict[str, Any], mtime: float = 0.0, n_activity: i
     wd = T.wd_cfg()
     pending = A.agents_pending(project, rid, max_age=float(wd["agent_max_minutes"]) * 60) \
         if st.get("status") in OPEN_STATUSES else []
-    stall = T.classify(st, rows, pending, wd=wd, state_mtime=mtime)
+    stall = T.classify(st, rows, pending, wd=wd, state_mtime=state_updated)
     tm = T.timings(st)
     try:
         flags = T.flags(project, st, rows, wd) if st.get("status") in OPEN_STATUSES else []
@@ -169,7 +198,7 @@ def collect(project: Path, st: Dict[str, Any], mtime: float = 0.0, n_activity: i
         "size": st.get("size", ""), "mode": st.get("mode", ""), "engine": st.get("engine") or "claude", "phase": phase,
         "phase_tr": PHASE_TR.get(phase, phase), "phase_index": PHASES.index(phase) if phase in PHASES else 0,
         "phase_since": phase_since, "status": st.get("status"), "status_tr": STATUS_TR.get(st.get("status"), ""),
-        "approved": bool(st.get("approved")), "live": A.liveness(st, rows, state_mtime=mtime, pending=pending),
+        "approved": bool(st.get("approved")), "live": A.liveness(st, rows, state_mtime=state_updated, pending=pending),
         "agents": [A.short_agent(str(a.get("type") or "")) for a in pending] or
                   [A.short_agent(a) for a in A.running_agents(rows)],
         "stall": stall, "flags": flags,
@@ -198,7 +227,7 @@ class _C:
 LEVEL_COLOR = {"run": "32", "wait": "1;33", "quiet": "36", "stale": "31", "blocked": "1;31", "paused": "35",
                "done": "2"}
 LEVEL_DOT = {"run": "●", "wait": "◆", "quiet": "○", "stale": "✗", "blocked": "■", "paused": "Ⅱ", "done": "✓"}
-KIND_MARK = {"tool": " ", "deny": "⛔", "result": "←", "agent_done": "✓", "answer": "✎", "user": "»", "idle": "⏸",
+KIND_MARK = {"tool": " ", "deny": "!", "result": "←", "agent_done": "✓", "answer": "✎", "user": "»", "idle": "⏸",
              "nudge": "↻", "bind": "⚓", "handback": "⇠", "wait_agents": "⏳"}
 STALL_MARK = {2: "ÖLÜ BEKLEME", 3: "ASILI KOMUT", 4: "SESSİZ OTURUM"}
 
@@ -278,10 +307,16 @@ def render_text(views: List[Dict[str, Any]], color: bool = False, width: Optiona
             out.append(" son hareketler:")
             for r in v["activity"]:
                 mark = KIND_MARK.get(r["kind"], " ")
-                line = f"   {r['time']} {cut(r['agent'], 11):<11} {mark} {cut(r['tool'], 15):<15} {r['what']}"
+                tool, what = r["tool"], r["what"]
+                if r["kind"] == "deny":
+                    count = int(r.get("repeat_count") or 1)
+                    category = str(what).partition("]")[0].lstrip("[") if str(what).startswith("[") else "genel"
+                    tool = f"Koruma ×{count}" if count > 1 else "Koruma"
+                    what = f"{category} koruması"
+                line = f"   {r['time']} {cut(r['agent'], 11):<11} {mark} {cut(tool, 15):<15} {what}"
                 colored = cut(line, width)
                 if r["kind"] == "deny":
-                    colored = c("31", colored)
+                    colored = c("33", colored)
                 elif r["kind"] in ("idle", "user", "answer"):
                     colored = c("33", colored)
                 elif r["kind"] in ("result", "agent_done", "handback", "wait_agents"):
@@ -344,7 +379,7 @@ background:var(--chip);color:var(--mut)}.ph.past{opacity:.55}.ph.cur{background:
 table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px;table-layout:fixed}td{padding:3px 4px;
 border-top:1px solid var(--line);vertical-align:top;overflow-wrap:anywhere}td.t{width:62px;color:var(--mut);
 font-variant-numeric:tabular-nums}td.a{width:86px}td.k{width:110px;color:var(--mut)}
-tr.deny td{color:var(--deny)}tr.idle td,tr.user td,tr.answer td{color:var(--wait)}tr.result td,tr.agent_done td,tr.handback td,tr.wait_agents td{color:var(--quiet)}
+tr.deny td{color:var(--wait)}tr.idle td,tr.user td,tr.answer td{color:var(--wait)}tr.result td,tr.agent_done td,tr.handback td,tr.wait_agents td{color:var(--quiet)}
 .tasks{display:flex;flex-wrap:wrap;gap:4px;margin-top:6px}.task{font-size:11px;padding:2px 6px;border-radius:6px;
 background:var(--chip)}.task.done{opacity:.55}.task.in_progress{outline:2px solid var(--run)}.task.blocked{outline:2px solid var(--blocked)}
 .empty{color:var(--mut);padding:40px 20px}label{font-size:12px;color:var(--mut)}
@@ -378,8 +413,12 @@ function card(v){
   u.title="Çalışmanın başından beri: bağlı oturum(lar) + alt-ajanlar · "+v.usage.messages+" model yanıtı · bağlam = ana oturumun son isteği";}
  else{u.textContent="token: — (bağlı oturumun kaydı bulunamadı)";}c.append(u);
  if(v.ledger.length){c.append(el("div","row","günlük: "+v.ledger[v.ledger.length-1]));}
- const tb=el("table");v.activity.slice().reverse().forEach(r=>{const tr=el("tr",r.kind);tr.append(el("td","t",r.time),
-  el("td","a",r.agent),el("td","k",(r.kind==="tool"?"":r.kind+" ")+r.tool),el("td","",r.what));tb.append(tr);});
+ const tb=el("table");v.activity.slice().reverse().forEach(r=>{const tr=el("tr",r.kind);const isGuard=r.kind==="deny";
+  const guardCount=Number(r.repeat_count||1);const guardLabel=guardCount>1?"Koruma ×"+guardCount:"Koruma";
+    const guardText=String(r.what||"");const guardKind=guardText.startsWith("[")?guardText.split("]",1)[0].slice(1):"genel";
+  const detail=el("td","",isGuard?(guardKind+" koruması"+(guardCount>1?" · "+guardCount+" tekrar":"")):r.what);
+  if(isGuard)detail.title=r.what;
+  tr.append(el("td","t",r.time),el("td","a",r.agent),el("td","k",isGuard?guardLabel:(r.kind==="tool"?"":r.kind+" ")+r.tool),detail);tb.append(tr);});
  if(!v.activity.length){const tr=el("tr");const td=el("td","","aktivite kaydı yok (yeni araç çağrılarıyla başlar)");td.colSpan=4;tr.append(td);tb.append(tr);}
  c.append(tb);const p=el("div","row");p.textContent=v.artifacts;c.append(p);return c;}
 async function tick(){

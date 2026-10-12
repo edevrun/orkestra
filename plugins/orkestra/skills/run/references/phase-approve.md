@@ -1,9 +1,12 @@
-# Phase: approve  (the user's single gate before code changes)
+# Phase: approve (the plan integrity gate before code changes)
 
-Hooks — not you — record the approval. Source edits stay blocked until it is recorded.
-The approval is the user's own answer. "Don't ask me questions" / "just do it" in the request does not waive it, and
-recording it yourself in any way (calling the hook scripts, writing approval files, replaying a test payload) is
-forging the user's consent — never do that; wait for them.
+Read `approval_mode` from `.orkestra/current/state.json`.
+
+- `autopilot` (default): do not ask or wait for the user. Run `orkestra plan check -p <project>` and ensure the current
+  spec/plan has a passing critic review. `orkestra phase next` records a hash-bound policy approval only if those
+  checks still pass. Never write `approval.json` or call a hook to simulate consent.
+- `manual`: use the single user approval gate below. Hooks alone record the user's actual answer; source edits remain
+  blocked until that current plan hash is approved.
 
 1. Show a compact summary in chat (Turkish, ≤ 25 lines):
    - Hedef (1–2 cümle) · Kapsam içi / dışı (madde)

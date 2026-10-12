@@ -11,9 +11,18 @@
  * @param {{ runner: Runner, python: string, clientPath: string, env?: Record<string, string | undefined>,
  *   timeoutMs?: number }} options
  */
-export function createOrkestraClient({ runner, python, clientPath, env, timeoutMs = 45_000 }) {
+export function createOrkestraClient({
+  runner,
+  python,
+  clientPath,
+  env,
+  timeoutMs = 45_000,
+}) {
   async function call(args) {
-    const result = await runner([python, clientPath, ...args], { timeoutMs, env });
+    const result = await runner([python, clientPath, ...args], {
+      timeoutMs,
+      env,
+    });
     let body = null;
     try {
       body = JSON.parse(result.stdout || "null");
@@ -23,14 +32,31 @@ export function createOrkestraClient({ runner, python, clientPath, env, timeoutM
     const ok = result.code === 0 && body !== null;
     const error =
       body?.error ??
-      (ok ? undefined : (result.stderr || result.stdout || `orkestra_client.py exit ${result.code}`).trim().slice(-400));
+      (ok
+        ? undefined
+        : (
+            result.stderr ||
+            result.stdout ||
+            `orkestra_client.py exit ${result.code}`
+          )
+            .trim()
+            .slice(-400));
     return { ok, body, error };
   }
 
   return {
-    /** Starts a run: `/yap <project> <request>`. */
-    start: (project, request, chatId) =>
-      call(["start", project, request, "--chat-id", chatId, "--source", "openclaw"]),
+    /** Starts a run: `/yap [engine] <project> <request>`. */
+    start: (project, request, chatId, engine) =>
+      call([
+        "start",
+        project,
+        request,
+        ...(engine ? ["--engine", engine] : []),
+        "--chat-id",
+        chatId,
+        "--source",
+        "openclaw",
+      ]),
     /** Answers one specific job (the one the user replied to). */
     reply: (jobId, text) => call(["reply", jobId, text]),
     /** Jobs of this chat. */
@@ -50,7 +76,10 @@ export function createOrkestraClient({ runner, python, clientPath, env, timeoutM
 export function createOrkestraMonitor({ runner, python, cliPath, env }) {
   return {
     async openRuns() {
-      const result = await runner([python, cliPath, "watch", "--json"], { timeoutMs: 30_000, env });
+      const result = await runner([python, cliPath, "watch", "--json"], {
+        timeoutMs: 30_000,
+        env,
+      });
       try {
         const runs = JSON.parse(result.stdout || "null");
         if (result.code === 0 && Array.isArray(runs)) {
@@ -59,7 +88,16 @@ export function createOrkestraMonitor({ runner, python, cliPath, env }) {
       } catch {
         // fall through to the error below
       }
-      return { ok: false, error: (result.stderr || result.stdout || `orkestra exit ${result.code}`).trim().slice(-400) };
+      return {
+        ok: false,
+        error: (
+          result.stderr ||
+          result.stdout ||
+          `orkestra exit ${result.code}`
+        )
+          .trim()
+          .slice(-400),
+      };
     },
   };
 }

@@ -8,6 +8,6 @@ Use when a test/gate keeps failing after two attempts, or behavior is not unders
 4. **Compare** — find a similar code path that works (same repo) and list the differences.
 5. **One hypothesis** — state it in one sentence; design the smallest experiment that would falsify it; run it.
 6. **Fix the cause** — add/keep a failing test that captures the root cause, make one change, re-run the narrow test and the fast gates.
-7. **Three strikes** — if three fixes failed, stop: the design is likely wrong. Write the finding in the task notes and escalate to the orchestrator / user with the evidence.
+7. **Three strikes** — if three fixes failed, stop the current approach: the design is likely wrong. Write the evidence in task notes and return a materially different safe approach to the orchestrator; only a genuine external or safety blocker should stop the run.
 
 Never: weaken assertions, add sleeps/retries to hide races, catch-and-ignore, or skip the test.

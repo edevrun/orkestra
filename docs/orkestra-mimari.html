@@ -454,7 +454,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
   <div class="grid g2">
     <div class="card">
       <h3>Orkestra deposu</h3>
-<pre>~/Projects/orkestra/
+<pre>$ORKESTRA_ROOT/
   plugins/orkestra/
     skills/      run, status, resume, onboard, rollback, ship
     skills/run/references/   faz playbook'ları + isteğe bağlı
@@ -504,7 +504,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
   <div class="card scroll">
   <table>
     <tr><th>Nereden</th><th>Komut ya da adres</th><th>Ne gösterir</th></tr>
-    <tr><td>Tarayıcı</td><td><code>python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra dashboard --open</code><br>http://127.0.0.1:47616/</td><td>Tüm açık run'lar: faz, şu anki durum, görev ve kanıt ilerlemesi, kapılar, token kullanımı, son araç çağrıları. Yalnız bu Mac, salt-okunur.</td></tr>
+    <tr><td>Tarayıcı</td><td><code>python3 $ORKESTRA_ROOT/plugins/orkestra/bin/orkestra dashboard --open</code><br>http://127.0.0.1:47616/</td><td>Tüm açık run'lar: faz, şu anki durum, görev ve kanıt ilerlemesi, kapılar, token kullanımı, son araç çağrıları. Yalnız bu Mac, salt-okunur.</td></tr>
     <tr><td>Terminal</td><td><code>… orkestra watch</code> (<code>--once</code>, <code>--all</code>, <code>-p proje</code>)</td><td>Aynı görünüm, 2 saniyede bir yenilenir.</td></tr>
     <tr><td>Sohbet içi</td><td><code>/orkestra:status</code></td><td>Faz, görevler, kanıt eksikleri, seni bekleyen bir şey var mı.</td></tr>
     <tr><td>Sıradaki adım</td><td><code>… orkestra next -p proje</code></td><td>Yapılacak tek iş, en çok 3 satır. Aynı durumda hep aynı cevap.</td></tr>

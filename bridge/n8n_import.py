@@ -1,8 +1,15 @@
 #!/usr/bin/env python3
-"""Import the Orkestra n8n workflows into the local n8n (uses ~/Projects/n8n/bootstrap-state.json's API key).
+"""Import the Orkestra n8n workflows into a running n8n instance.
 
-The bridge token is injected into the HTTP Request header. Workflow A (webhook → bridge) is activated;
-workflow B (callback → Telegram) is imported inactive: pick a Telegram credential, enable the node, activate.
+Requires environment variables (no default path into a sibling private repo):
+
+- ``N8N_URL`` — API base (default ``http://localhost:5678``)
+- ``N8N_API_KEY`` — n8n API key, **or**
+- ``N8N_STATE`` — path to a JSON file that contains ``{"apiKey": "..."}``
+
+The bridge token is injected into the HTTP Request header. Workflow A (webhook → bridge)
+is activated; workflow B (callback → Telegram) is imported inactive: pick a Telegram
+credential, enable the node, activate.
 """
 import json
 import os
@@ -12,15 +19,36 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-N8N_URL = os.environ.get("N8N_URL", "http://localhost:5678")
-STATE = Path(os.environ.get("N8N_STATE", HERE.parent.parent / "n8n" / "bootstrap-state.json"))
+N8N_URL = os.environ.get("N8N_URL", "http://localhost:5678").rstrip("/")
 BRIDGE_CFG = Path(os.environ.get("ORKESTRA_HOME") or "~/.orkestra").expanduser() / "bridge.secret.json"
 
 
+def resolve_api_key() -> str:
+    key = (os.environ.get("N8N_API_KEY") or "").strip()
+    if key:
+        return key
+    state = (os.environ.get("N8N_STATE") or "").strip()
+    if not state:
+        sys.exit(
+            "Set N8N_API_KEY, or N8N_STATE to a JSON file with an apiKey field "
+            "(no default sibling-repo path)."
+        )
+    path = Path(state).expanduser()
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))["apiKey"]
+    except FileNotFoundError:
+        sys.exit(f"missing file: {path}")
+    except (KeyError, json.JSONDecodeError, TypeError) as exc:
+        sys.exit(f"N8N_STATE must be JSON with an apiKey field ({path}): {exc}")
+
+
 def api(path, method="GET", body=None, key=""):
-    req = urllib.request.Request(N8N_URL + path, method=method,
-                                 data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json", "X-N8N-API-KEY": key})
+    req = urllib.request.Request(
+        N8N_URL + path,
+        method=method,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Content-Type": "application/json", "X-N8N-API-KEY": key},
+    )
     with urllib.request.urlopen(req, timeout=20) as r:
         return json.loads(r.read() or b"{}")
 
@@ -36,13 +64,21 @@ def ensure_webhook_credential(key: str, cfg: dict) -> str:
         tmp.write_text(json.dumps(cfg, indent=2))
         os.chmod(tmp, 0o600)
         os.replace(tmp, BRIDGE_CFG)
-    cred = api("/api/v1/credentials", "POST", {"name": "Orkestra webhook key", "type": "httpHeaderAuth",
-                                               "data": {"name": "X-Orkestra-Key", "value": secret}}, key)
+    cred = api(
+        "/api/v1/credentials",
+        "POST",
+        {
+            "name": "Orkestra webhook key",
+            "type": "httpHeaderAuth",
+            "data": {"name": "X-Orkestra-Key", "value": secret},
+        },
+        key,
+    )
     return cred["id"]
 
 
 def main() -> int:
-    key = json.loads(STATE.read_text())["apiKey"]
+    key = resolve_api_key()
     cfg = json.loads(BRIDGE_CFG.read_text())
     token = cfg["token"]
     cred_id = ensure_webhook_credential(key, cfg)
@@ -61,7 +97,10 @@ def main() -> int:
         if activate:
             try:
                 api(f"/api/v1/workflows/{wid}/activate", "POST", None, key)
-                print(f"  active → POST {N8N_URL}/webhook/orkestra-job  header X-Orkestra-Key: <n8n_webhook_key in {BRIDGE_CFG}>")
+                print(
+                    f"  active → POST {N8N_URL}/webhook/orkestra-job  "
+                    f"header X-Orkestra-Key: <n8n_webhook_key in {BRIDGE_CFG}>"
+                )
             except urllib.error.HTTPError as exc:
                 print(f"  could not activate ({exc.code}); activate it in the n8n UI")
     print(f"callback URL for the bridge config (callback_url): {N8N_URL}/webhook/orkestra-callback")

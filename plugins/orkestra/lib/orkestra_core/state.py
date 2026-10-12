@@ -77,7 +77,8 @@ class StateTxn:
             self._lock.__exit__(exc_type, exc, tb)
 
 
-def new_state(project: Path, run_id: str, title: str, size: str, mode: str, engine: str = "claude") -> Dict[str, Any]:
+def new_state(project: Path, run_id: str, title: str, size: str, mode: str, engine: str = "claude",
+              approval_mode: str = "autopilot") -> Dict[str, Any]:
     return {
         "schema": SCHEMA,
         "run_id": run_id,
@@ -89,7 +90,8 @@ def new_state(project: Path, run_id: str, title: str, size: str, mode: str, engi
         "status": "active",
         "size": size,
         "mode": mode,
-        "engine": engine,               # which agent started it (claude | cursor); any engine may resume it
+        "approval_mode": approval_mode,
+        "engine": engine,               # which agent started it; any engine may resume it
         "history": [{"at": now_iso(), "from": None, "to": "intake", "note": "run created"}],
         "tasks": {},
         "approved": None,
@@ -140,13 +142,54 @@ def project_active_run(project: Path) -> Optional[str]:
 
 # ---------------------------------------------------------------- session bindings
 
+def _clear_children_for_parent(parent_session: str, only_other_project: Optional[Path] = None) -> int:
+    """Drop child bindings for a parent chat. If only_other_project is set, drop children whose project differs."""
+    if not parent_session:
+        return 0
+    removed = 0
+    want = None
+    if only_other_project is not None:
+        try:
+            want = Path(only_other_project).resolve()
+        except OSError:
+            want = Path(only_other_project)
+    try:
+        kids = list(children_dir().glob("*.json"))
+    except OSError:
+        return 0
+    for path in kids:
+        data = read_json(path)
+        if not isinstance(data, dict) or data.get("parent") != parent_session:
+            continue
+        if want is not None:
+            try:
+                child_proj = Path(str(data.get("project") or "")).resolve()
+            except OSError:
+                child_proj = Path(str(data.get("project") or ""))
+            if child_proj == want:
+                continue
+        try:
+            path.unlink()
+            removed += 1
+        except FileNotFoundError:
+            pass
+    return removed
+
+
 def bind_session(session_id: str, project: Path, run_id: str, engine: str = "") -> None:
     if not session_id:
         return
+    path = paths.sessions_dir() / f"{_safe(session_id)}.json"
+    prev = read_json(path)
+    # One Cursor chat must not drive two projects: drop foreign child roles when rebinding.
+    if isinstance(prev, dict) and prev.get("project") and str(prev.get("project")) != str(project):
+        _clear_children_for_parent(session_id)
+    else:
+        _clear_children_for_parent(session_id, only_other_project=Path(project))
     data = {"project": str(project), "run_id": run_id, "bound_at": now_iso()}
     if engine:
         data["engine"] = engine                     # which agent drives from this session (claude when absent)
-    write_json_atomic(paths.sessions_dir() / f"{_safe(session_id)}.json", data)
+    write_json_atomic(path, data)
     _prune(paths.sessions_dir(), days=21)
 
 
@@ -163,6 +206,16 @@ def children_dir() -> Path:
 def bind_child(conversation_id: str, parent_session: str, project: Path, run_id: str, agent_type: str) -> Dict[str, Any]:
     data = {"project": str(project), "run_id": run_id, "parent": parent_session, "agent_type": agent_type,
             "bound_at": now_iso()}
+    # Refuse cross-project child: parent chat is bound to a different project (multi-root leakage).
+    parent_b = session_binding(parent_session) if parent_session else None
+    if parent_b:
+        try:
+            same = Path(parent_b["project"]).resolve() == Path(project).resolve()
+        except OSError:
+            same = str(parent_b.get("project")) == str(project)
+        if not same:
+            return {"parent": "", "refused": True, "agent_type": agent_type,
+                    "project": str(project), "run_id": run_id}
     if conversation_id:
         write_json_atomic(children_dir() / f"{_safe(conversation_id)}.json", data)
         _prune(children_dir(), days=7)
@@ -177,10 +230,26 @@ def child_binding(conversation_id: str) -> Optional[Dict[str, Any]]:
 
 
 def unbind_session(session_id: str) -> None:
+    """Drop the active binding, but remember the conversation drove a run.
+
+    After abort / done / pause the chat must not receive Stop follow-ups, yet every-session
+    guards (git, secrets) still apply — Cursor's `_known` looks for this stub.
+    """
+    path = paths.sessions_dir() / f"{_safe(session_id)}.json"
+    data = read_json(path)
     try:
-        (paths.sessions_dir() / f"{_safe(session_id)}.json").unlink()
+        path.unlink()
     except FileNotFoundError:
         pass
+    _clear_children_for_parent(session_id)
+    if isinstance(data, dict) and session_id:
+        known = paths.sessions_dir() / "known"
+        known.mkdir(parents=True, exist_ok=True)
+        write_json_atomic(known / f"{_safe(session_id)}.json", {
+            "project": data.get("project"), "run_id": data.get("run_id"),
+            "engine": data.get("engine"), "unbound_at": now_iso(),
+        })
+        _prune(known, days=21)
 
 
 def session_binding(session_id: str) -> Optional[Dict[str, Any]]:

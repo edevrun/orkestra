@@ -29,7 +29,10 @@ DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
     # cursor.global_guards: outside a run, apply the every-session guards (git, secrets, store) to Cursor chats too.
     "engine": {"default": "claude", "claude": {"bin": "", "interactive_args": []},
                                     "cursor": {"bin": "", "model": "", "interactive_args": [], "global_guards": False,
-                                               "hooks_carry_agent_env": False}},
+                                               "hooks_carry_agent_env": False},
+                                    "copilot": {"bin": "", "model": "gpt-6-luna", "reasoning_effort": "max",
+                                                "plugin_dir": "", "max_autopilot_continues": 20,
+                                                "interactive_args": []}},
     # stall detection (`orkestra watch`, `orkestra watchdog`); auto_resume: off | headless | all
     "watchdog": {"dead_wait_seconds": 90, "hung_command_seconds": 900, "gate_command_seconds": 1800,
                  "silent_seconds": 600, "user_wait_notify_seconds": 300, "loop_repeats": 3, "agent_max_minutes": 60,

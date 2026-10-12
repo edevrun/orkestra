@@ -254,12 +254,29 @@ def _spawn_resume(v: Dict[str, Any], cfg: Dict[str, Any], session: str, attempt:
         spec = EN.headless_command("cursor", binary, EN.raw_session_id(session),
                                    (ctx + "\n\n" if ctx else "") + EN.resume_prompt("cursor", project.name), False,
                                    {"model": ((cfg.get("engine") or {}).get("cursor") or {}).get("model")})
-    else:
+    elif engine == "copilot":
+        binary = EN.binary("copilot", cfg)
+        if not binary:
+            return "copilot CLI not found"
+        plugin_dir = EN.copilot_plugin_dir(cfg)
+        if not EN.copilot_hooks_active(plugin_dir):
+            return "Orkestra's Copilot hooks are not installed"
+        run_state = ST.load_state(project, v["run_id"])
+        if run_state.get("approval_mode", "autopilot") == "manual" and run_state.get("phase") in ("clarify", "approve"):
+            return "manual decision mode needs the user's approval"
+        copilot_cfg = dict(((cfg.get("engine") or {}).get("copilot") or {}))
+        copilot_cfg["plugin_dir"] = plugin_dir
+        copilot_cfg["approval_mode"] = run_state.get("approval_mode", "autopilot")
+        spec = EN.headless_command("copilot", binary, session, EN.resume_prompt("copilot", project.name), False,
+                                   copilot_cfg)
+    elif engine == "claude":
         binary = _claude_bin()
         if not binary:
             return "claude CLI not found"
         spec = EN.headless_command("claude", binary, session, EN.resume_prompt("claude", project.name), False,
                                    {"permission_mode": h.get("permission_mode"), "max_turns": h.get("max_turns")})
+    else:
+        return f"unsupported engine: {engine}"
     env = EN.child_env(engine)
     log = paths.run_dir(project, v["run_id"]) / f"watchdog-resume-{attempt}.log"
     try:
@@ -272,7 +289,8 @@ def _spawn_resume(v: Dict[str, Any], cfg: Dict[str, Any], session: str, attempt:
         proc.stdin.close()
     except Exception as exc:
         return f"could not start {engine}: {exc}"
-    ST.ledger(project, v["run_id"], f"watchdog auto-resume #{attempt} ({'cursor ' if engine == 'cursor' else ''}session {EN.short_sid(session)}, {v['stall']['text'][:80]}) pid={proc.pid}")
+    ST.ledger(project, v["run_id"], f"watchdog auto-resume #{attempt} ({engine} session {EN.short_sid(session)}, "
+                                      f"{v['stall']['text'][:80]}) pid={proc.pid}")
     _children[int(proc.pid)] = proc
     return int(proc.pid)
 

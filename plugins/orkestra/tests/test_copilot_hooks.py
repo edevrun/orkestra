@@ -7,6 +7,7 @@ from pathlib import Path
 
 import helpers
 from orkestra_core import state as ST
+from orkestra_core import engines as EN
 from test_flow import FlowBase
 
 PLUGIN = Path(__file__).resolve().parent.parent
@@ -19,6 +20,18 @@ class TestCopilotHookAdapter(FlowBase):
     def copilot(self, event_name, **fields):
         payload = {"hook_event_name": event_name, "session_id": self.sid, "cwd": str(self.proj), **fields}
         return copilot_hook.handle_event(event_name, payload)
+
+    def start(self, title="Subtract", approval_mode="manual"):
+        out = self.cli("start", "-p", "demo", "--title", title, "--request", "sub fonksiyonu ekle", "--size", "S",
+                       "--engine", "copilot", "--approval-mode", approval_mode).stdout
+        self.rid = out.split("run=")[-1].split()[0]
+        self.fdir = self.proj / ".orkestra" / "features" / self.rid
+        self.copilot("PostToolUse", tool_name="bash", tool_input={"command": "orkestra start"},
+                     tool_result={"result_type": "success", "text_result_for_llm": out})
+        return out
+
+    def approve(self, text="onaylıyorum"):
+        return self.copilot("UserPromptSubmit", prompt=text, prompt_id="p-approve")
 
     def test_pre_tool_denial_uses_copilot_output_shape(self):
         self.start()
@@ -44,7 +57,13 @@ class TestCopilotHookAdapter(FlowBase):
         out = self.copilot("PostToolUse", tool_name="bash", tool_input={"command": "orkestra start"},
                            tool_result={"result_type": "success", "text_result_for_llm": started})
         self.assertEqual(out, {})
-        self.assertEqual(ST.session_binding(self.sid)["project"], str(self.proj))
+        binding = ST.session_binding(EN.session_key("copilot", self.sid))
+        self.assertEqual(binding["project"], str(self.proj))
+        self.assertEqual(binding["engine"], "copilot")
+        state = json.loads(self.cli("status", "--json", "-p", "demo").stdout)
+        self.assertEqual(state["engine"], "copilot")
+        feature = self.proj / ".orkestra" / "features" / binding["run_id"]
+        self.assertIn("- motor: copilot", (feature / "request.md").read_text())
 
     def test_vscode_terminal_tool_alias_binds_resume_output(self):
         started = self.cli("start", "-p", "demo", "--title", "Copilot", "--request", "sub fonksiyonu ekle",
@@ -53,7 +72,7 @@ class TestCopilotHookAdapter(FlowBase):
                            tool_input={"command": "orkestra resume"},
                            tool_result={"result_type": "success", "text_result_for_llm": started})
         self.assertEqual(out, {})
-        self.assertEqual(ST.session_binding(self.sid)["project"], str(self.proj))
+        self.assertEqual(ST.session_binding(EN.session_key("copilot", self.sid))["project"], str(self.proj))
 
     def test_unrecognized_terminal_tool_binds_explicit_cli_marker(self):
         started = self.cli("start", "-p", "demo", "--title", "Copilot", "--request", "sub fonksiyonu ekle",
@@ -64,11 +83,12 @@ class TestCopilotHookAdapter(FlowBase):
             "tool_result": {"result_type": "success", "text_result_for_llm": started},
         })
         self.assertEqual(out, {})
-        binding = ST.session_binding(self.sid)
+        binding = ST.session_binding(EN.session_key("copilot", self.sid))
         self.assertEqual(binding["project"], str(self.proj))
 
     def test_explicit_resume_prompt_binds_named_project_and_releases_user_wait(self):
-        self.cli("start", "-p", "demo", "--title", "Copilot", "--request", "sub fonksiyonu ekle", "--size", "S")
+        self.cli("start", "-p", "demo", "--title", "Copilot", "--request", "sub fonksiyonu ekle", "--size", "S",
+                 "--approval-mode", "manual")
         self.cli("await", "-p", "demo", "İlk dilimi seç")
         copilot_hook.handle_event("UserPromptSubmit", {
             "hook_event_name": "UserPromptSubmit", "session_id": "copilot-resume-session",
@@ -78,14 +98,25 @@ class TestCopilotHookAdapter(FlowBase):
         binding = ST.session_binding("copilot-resume-session")
         self.assertIsNotNone(binding)
         self.assertEqual(binding["project"], str(self.proj))
+        self.assertEqual(binding["engine"], "copilot")
         status = json.loads(self.cli("status", "--json", "-p", "demo").stdout)
         self.assertEqual(status["status"], "active")
 
     def test_direct_user_approval_is_recorded(self):
         self.start()
         self.advance_to_approve()
-        self.copilot("UserPromptSubmit", prompt="onaylıyorum", timestamp="2026-10-09T10:00:00Z")
+        out = self.copilot("UserPromptSubmit", prompt="onaylıyorum", timestamp="2026-10-09T10:00:00Z")
+        self.assertIn("APPROVED", out.get("additionalContext", ""))
+        self.assertNotIn("Could not resolve the project", out.get("additionalContext", ""))
         self.phase_next()
+
+    def test_user_can_switch_an_active_run_to_manual_approval_mode(self):
+        self.start(approval_mode="autopilot")
+
+        self.copilot("UserPromptSubmit", prompt="Approve aşamasında onayı bana sor; ben karar verici olayım.")
+
+        state = json.loads(self.cli("status", "--json", "-p", "demo").stdout)
+        self.assertEqual(state["approval_mode"], "manual")
 
     def test_session_start_context_uses_copilot_output_shape(self):
         self.start()

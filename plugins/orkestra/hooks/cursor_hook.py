@@ -239,7 +239,10 @@ def _cursor_run_recent() -> bool:
 def _concerned(conv: str) -> bool:
     """Does (or did) this conversation drive an orkestra run, or is it a run's subagent?"""
     sessions = _home() / "sessions"
-    return (sessions / f"{_safe(PREFIX + conv)}.json").exists() or (sessions / "children" / f"{_safe(conv)}.json").exists()
+    key = _safe(PREFIX + conv)
+    return ((sessions / f"{key}.json").exists()
+            or (sessions / "known" / f"{key}.json").exists()
+            or (sessions / "children" / f"{_safe(conv)}.json").exists())
 
 
 def _light(name: str, ev: dict):
@@ -325,21 +328,70 @@ def session_key(conversation_id: str) -> str:
     return PREFIX + conversation_id if conversation_id and not conversation_id.startswith(PREFIX) else conversation_id
 
 
+def _message_text(row: dict) -> str:
+    """Plain text from one transcript JSONL row (user_query unwrap when present)."""
+    msg = row.get("message") if isinstance(row.get("message"), dict) else row
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        text = content
+    else:
+        text = " ".join(str(p.get("text") or "") if isinstance(p, dict) else str(p) for p in (content or []))
+    m = re.search(r"<user_query>(.*?)</user_query>", text, re.S)
+    return (m.group(1) if m else text).strip()
+
+
 def _first_message(path: str) -> str:
     """The first user message of a conversation transcript (the Task prompt, for a subagent)."""
     try:
         with open(path, "r", encoding="utf-8", errors="ignore") as fh:
             line = fh.readline(FIRST_LINE_MAX)
         row = json.loads(line)
-        content = ((row.get("message") or {}).get("content")) if isinstance(row, dict) else None
-        if isinstance(content, str):
-            text = content
-        else:
-            text = " ".join(str(p.get("text") or "") if isinstance(p, dict) else str(p) for p in (content or []))
-        m = re.search(r"<user_query>(.*?)</user_query>", text, re.S)
-        return (m.group(1) if m else text).strip()
+        return _message_text(row) if isinstance(row, dict) else ""
     except Exception:
         return ""
+
+
+def _last_human_message(path: str) -> str:
+    """Newest human/user text in a Cursor agent transcript. Fail soft; skip assistant/tool/handback rows."""
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 512_000))
+            data = fh.read().decode("utf-8", "ignore")
+    except OSError:
+        return ""
+    lines = data.splitlines()
+    if size > 512_000 and lines:
+        lines = lines[1:]
+    for line in reversed(lines[-400:]):
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        role = str(row.get("role") or row.get("type") or "").lower()
+        msg = row.get("message") if isinstance(row.get("message"), dict) else {}
+        msg_role = str(msg.get("role") or "").lower() if isinstance(msg, dict) else ""
+        if role in ("assistant", "tool", "system") or msg_role in ("assistant", "tool", "system"):
+            continue
+        text = _message_text(row)
+        if not text:
+            continue
+        if text.startswith(("<agent-message", "<task-notification", "[Subagent hand-back]")):
+            continue
+        if role in ("user", "human") or msg_role in ("user", "human") or "<user_query>" in (
+                str((msg or row).get("content") or "") if isinstance(msg or row, dict) else ""):
+            return text
+        if role in ("",) and msg_role in ("",) and not any(
+                k in row for k in ("tool_calls", "tool_call_id", "toolCallId")):
+            # Cursor sometimes omits role on the human row that still wraps <user_query>
+            if "<user_query>" in str(row):
+                return text
+    return ""
 
 
 def _cursor_home() -> Path:
@@ -372,6 +424,9 @@ def _open_cursor_runs(ev: dict):
         b = L.ST.session_binding(f.stem)
         if not b or (b["project"], b["run_id"]) in seen or not _related(str(b["project"]), ev):
             continue
+        # Paused/aborted/done must not blind-claim foreign chats (session_binding still returns paused).
+        if (b.get("state") or {}).get("status") not in ("active", "awaiting_user", "blocked"):
+            continue
         seen.add((b["project"], b["run_id"]))
         out.append((Path(b["project"]), b["run_id"], f.stem))
     return out
@@ -399,23 +454,55 @@ def _transcript(conv: str, ev: dict, runs) -> str:
 
 
 def _claim_child(conv: str, ev: dict):
-    """An unknown conversation while a Cursor-driven run has a subagent launch nobody has claimed yet."""
-    runs = _open_cursor_runs(ev)
+    """An unknown conversation while a Cursor-driven run has a subagent launch nobody has claimed yet.
+
+    Isolation (hard): never bind a chat to project B because project A has a waiting launch.
+    Prefer the parent conversation's bound run; with multiple open runs only accept a unique
+    prompt match — never an ambiguous/blind claim across projects.
+    """
+    if not conv:
+        return None
+    # Main bind already exists — never re-bind this conversation as a child of anyone.
+    if isinstance(_read(L.paths.sessions_dir() / f"{_safe(session_key(conv))}.json"), dict):
+        return None
+    parent_raw = str(ev.get("parent_conversation_id") or "").strip()
+    parent_sid = session_key(parent_raw) if parent_raw else ""
+    parent_b = L.ST.session_binding(parent_sid) if parent_sid else None
+    parent_status = ((parent_b or {}).get("state") or {}).get("status")
+    if parent_b and parent_status in ("active", "awaiting_user", "blocked"):
+        runs = [(Path(parent_b["project"]), parent_b["run_id"], parent_sid)]
+        allow_ambiguous = True
+    else:
+        runs = _open_cursor_runs(ev)
+        # Multi-root workspaces see every open run as "related". Blind/ambiguous claiming
+        # across them is what mixes sibling projects into foreign chats.
+        allow_ambiguous = len(runs) == 1
     if not runs:
         return None
     tpath = _transcript(conv, ev, runs)
     first = _first_message(tpath) if tpath else ""
+    definitive = []
     blind = None
-    for project, rid, _sid in runs:
+    for project, rid, sid in runs:
+        # Parent chat's bare conversation id must never be claimed as its own child.
+        bare = sid[len(PREFIX):] if sid.startswith(PREFIX) else sid
+        if conv == bare:
+            continue
         hit = L.activity.cursor_claim(project, rid, conv, first)
         if not hit:
             continue
         if hit.get("ambiguous"):    # role for THIS event only; asked again on the next one
-            blind = blind or {"parent": hit.get("sid") or "", "agent_type": str(hit.get("type") or "orkestra:unknown"),
-                              "project": str(project), "run_id": rid}
+            if allow_ambiguous and blind is None:
+                blind = {"parent": hit.get("sid") or "", "agent_type": str(hit.get("type") or "orkestra:unknown"),
+                         "project": str(project), "run_id": rid}
             continue
-        return L.ST.bind_child(conv, str(hit.get("sid") or ""), project, rid, str(hit.get("type") or "orkestra:unknown"))
-    return blind
+        definitive.append((project, rid, str(hit.get("sid") or sid), str(hit.get("type") or "orkestra:unknown")))
+    if len(definitive) == 1:
+        project, rid, psid, atype = definitive[0]
+        return L.ST.bind_child(conv, psid, project, rid, atype)
+    if len(definitive) > 1:
+        return None  # conflicting unique matches — do not guess
+    return blind if allow_ambiguous else None
 
 
 def actor(ev: dict):
@@ -566,7 +653,11 @@ def _take_note(sid: str) -> str:
 def _known(sid: str, cev: dict) -> bool:
     """Has this conversation (or its parent) ever driven a run? Then the every-session guards keep applying after
     the run has closed — a commit right after `phase next → done` is refused exactly as in Claude Code."""
-    return bool(cev.get("agent_type")) or isinstance(_read(L.paths.sessions_dir() / f"{_safe(sid)}.json"), dict)
+    if cev.get("agent_type"):
+        return True
+    sessions = L.paths.sessions_dir()
+    return (isinstance(_read(sessions / f"{_safe(sid)}.json"), dict)
+            or isinstance(_read(sessions / "known" / f"{_safe(sid)}.json"), dict))
 
 
 def _close_tasks(sid: str, b: dict) -> None:
@@ -701,6 +792,21 @@ def on_stop(ev: dict) -> dict:
     cev["stop_hook_active"] = False                 # dispatch counts its own nudges per prompt (prompt_id)
     b = L.ST.session_binding(cev["session_id"]) if cev["session_id"] else None
     if b:
+        # Stop follow-ups fire with a new generation_id and NO beforeSubmitPrompt — so off-topic
+        # unbind never ran for a human message that only exists in the transcript yet. Fail soft.
+        try:
+            from orkestra_core import intent as _intent
+            conv = _conv(ev)
+            tpath = _transcript(conv, ev, _open_cursor_runs(ev)) if conv else ""
+            last = _last_human_message(tpath) if tpath else ""
+            if last and _intent.off_topic_vs_project(
+                    last, Path(b["project"]), str(b["run_id"]), title=""):
+                L.ST.unbind_session(cev["session_id"])
+                L.activity.record(Path(b["project"]), b["run_id"], cev, "idle",
+                                  "tur bitti · transcript off-topic → oturum çözüldü")
+                return {}
+        except Exception:
+            pass
         _close_tasks(cev["session_id"], b)
     note = _take_note(cev["session_id"])
     for o in _capture(L.D.on_stop, cev):

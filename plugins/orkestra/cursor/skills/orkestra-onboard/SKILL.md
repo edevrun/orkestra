@@ -1,6 +1,6 @@
 ---
 name: orkestra-onboard
-description: "Build or refresh Orkestra's verified project memory (PROJECT.md, gates) for a project in ~/Projects so future runs start informed and cheap."
+description: "Build or refresh Orkestra's verified project memory (PROJECT.md, gates) for a project in ~/Projects so future runs start informed and cheap. Point new machines at `orkestra setup` (or `orkestra cursor install` / `orkestra copilot install`) when engines are not ready yet."
 ---
 [orkestra · Cursor engine] The instructions below were written for Claude Code. In Cursor:
 - A subagent `orkestra:<name>` is the Cursor subagent `orkestra-<name>`: launch it with the Task tool
@@ -23,5 +23,7 @@ description: "Build or refresh Orkestra's verified project memory (PROJECT.md, g
   `/orkestra-ship`. `orkestra` is on PATH. The same guards, gates and evidence rules apply as in Claude Code.
 
 Onboard the project for orkestra. Project hint: (what the user wrote with this command)
+
+If no engine is ready yet (`orkestra doctor`), tell the user to run `orkestra setup` (or `orkestra setup --yes`), or per-engine `orkestra cursor install` / `orkestra copilot install` — do not run those installs from this skill.
 
 Run `orkestra context` (with `-p <project>`), then follow `orkestra playbook onboard` exactly. Do not modify source code. Report in Turkish in ≤ 6 lines.

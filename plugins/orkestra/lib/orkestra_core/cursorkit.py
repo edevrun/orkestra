@@ -246,6 +246,26 @@ def shim_path() -> Path:
     return Path(os.environ.get("ORKESTRA_SHIM_DIR") or "~/.local/bin").expanduser() / "orkestra"
 
 
+def ensure_path_shim(*, dry: bool = False) -> List[str]:
+    """Ensure `orkestra` is reachable on PATH via a shim symlink (idempotent).
+
+    Uses `shim_path()` / `ORKESTRA_SHIM_DIR`. No-op when the parent directory is missing or
+    `orkestra` is already found on PATH (dangling shims are still renewed). Returns the same
+    style of action strings as `install`.
+    """
+    actions: List[str] = []
+    shim = shim_path()
+    if not shutil.which("orkestra") and shim.parent.is_dir():
+        dangling = shim.is_symlink() and not shim.exists()
+        if dangling or not os.path.lexists(shim):
+            actions.append(f"link {shim} → {BIN}  (Cursor's shell needs `orkestra` on PATH)")
+            if not dry:
+                if dangling:
+                    shim.unlink()
+                os.symlink(BIN, shim)
+    return actions
+
+
 def install(copy: bool = False, dry: bool = False) -> List[str]:
     """Idempotent. Returns what was (or with dry=True: would be) done."""
     actions: List[str] = []
@@ -262,15 +282,7 @@ def install(copy: bool = False, dry: bool = False) -> List[str]:
     if new != cur:
         _write_hooks(hp, new, actions, dry)
         actions.append(f"hooks.json: orkestra entries for {', '.join(HOOK_EVENTS)}")
-    shim = shim_path()
-    if not shutil.which("orkestra") and shim.parent.is_dir():
-        dangling = shim.is_symlink() and not shim.exists()
-        if dangling or not os.path.lexists(shim):
-            actions.append(f"link {shim} → {BIN}  (Cursor's shell needs `orkestra` on PATH)")
-            if not dry:
-                if dangling:
-                    shim.unlink()
-                os.symlink(BIN, shim)
+    actions.extend(ensure_path_shim(dry=dry))
     return actions
 
 

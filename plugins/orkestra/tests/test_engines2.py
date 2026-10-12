@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 import uuid
@@ -471,7 +472,7 @@ class TestHooksInTheLoop(Sub):
                     f"echo '{{}}' | python3 {helpers.CURSOR_HOOK} beforeSubmitPrompt",
                     f"PYTHONPATH={lib} python3 - <<'PY'\nfrom orkestra_core import runs\nPY"):
             self.assertTrue(self.no(self.shell(cmd)), cmd)
-        self.assertIn("APPROVED", EN.driver_prompt("cursor", CONV, "onay", str(self.proj)))   # the real driver
+        self.assertIn("APPROVED", helpers.driver_prompt("cursor", CONV, "onay", str(self.proj)))  # the real driver
 
 
 class TestSelfApproval(Sub):
@@ -563,11 +564,12 @@ class TestSelfApproval(Sub):
         self.advance_to_approve()
         os.environ.update(self.shell_env)
         try:
-            self.say("onay", gen="g1")
+            # Keep markers in the double-forked hook env (host-like tree, agent-like markers).
+            self.say("onay", gen="g1", keep_agent_env=True)
             self.assertFalse(self.approved())
             self.home.mkdir(parents=True, exist_ok=True)
             (self.home / "config.json").write_text(json.dumps({"engine": {"cursor": {"hooks_carry_agent_env": True}}}))
-            self.say("onay", gen="g2")
+            self.say("onay", gen="g2", keep_agent_env=True)
             self.assertTrue(self.approved())
         finally:
             for k in self.shell_env:
@@ -588,6 +590,7 @@ class TestHookEntryGuardPrecision(FlowBase):
                     "cat > /tmp/notes.md <<'EOF'\nwrite_grant() and bind_session() are documented\nEOF\npython3 -m unittest -q",
                     "python3 - <<'PY'\nfrom app.oauth import write_grant\nwrite_grant('x')\nPY",
                     "grep -rn orkestra_core docs/", "cat /x/plugins/orkestra/hooks/cursor_hook.py | head -40",
+                    "jq -r '.hooks' /x/plugins/orkestra/hooks/hooks.json",
                     "rg -n 'cursor_hook|orkestra_core' . 2>/dev/null | wc -l", "ls hooks/dispatch.py",
                     "echo 'see orkestra_core for details' >> /tmp/README.md", "git log --oneline hooks/dispatch.py",
                     "sed -n 1,5p hooks/dispatch.py", "awk '{print}' hooks/dispatch.py", "python3 hooks/dispatch.py --once",
@@ -601,7 +604,8 @@ class TestHookEntryGuardPrecision(FlowBase):
             self.assertFalse(self.denied(out), ok)
         # naming orkestra's own entry points in anything that runs or writes is refused…
         for cmd in ("python3 tools/cursor_hook.py", "echo 'import orkestra_core' > /tmp/x.py",
-                    "grep -rl x ~/Projects/orkestra/plugins/orkestra/hooks | xargs sed -i '' s/a/b/",
+                    "grep -rl x ~/Projects/demo/plugins/orkestra/hooks | xargs sed -i '' s/a/b/",
+                    "jq -r '.hooks' /x/plugins/orkestra/hooks/hooks.json > /tmp/hooks.json",
                     f"sed -i '' s/a/b/ {helpers.PLUGIN}/hooks/dispatch.py", f"vim {helpers.PLUGIN}/lib/orkestra_core/runs.py",
                     "cat > /tmp/f.py <<'EOF'\nfrom pathlib import Path\nH = Path('/x/orkestra/plugins/orkestra') / \"hooks\" / \"dispatch.py\"\nEOF",
                     "python3 -c 'import os; print(os.environ[\"CLAUDE_PLUGIN_ROOT\"] + \"/hooks/dispatch.py\")'"):
@@ -713,14 +717,50 @@ class TestLightPrompts(helpers.Sandbox):
              "orkestra_core.runs", "orkestra_core.activity")
 
     def run_hook(self, event, payload, env=None):
-        code = ("import sys, json; sys.path.insert(0, sys.argv[1]); sys.argv = ['cursor_hook.py', sys.argv[2]]\n"
-                "import cursor_hook as C\n"
-                "rc = C.main()\n"
-                f"sys.stdout.write('\\n' + json.dumps(sorted(m for m in sys.modules if m in {self.HEAVY!r})))\n")
-        cp = subprocess.run([sys.executable, "-c", code, str(helpers.PLUGIN / "hooks"), event], input=json.dumps(payload),
-                            capture_output=True, text=True, env=dict(os.environ, **(env or {})))
-        self.assertEqual(cp.returncode, 0, cp.stderr)
-        answer, modules = cp.stdout.rsplit("\n", 1)
+        # Same origin isolation as helpers.run_cursor_hook: under Cursor's agent shell a plain
+        # subprocess still has the agent wrapper as an ancestor, so GUARDED_ORIGIN events refuse
+        # before dispatch loads (heavy modules stay empty except incidental imports).
+        out_path = Path(tempfile.mkdtemp(prefix="orkestra-light-")) / "out.txt"
+        base_env = {k: v for k, v in os.environ.items() if k not in helpers._AGENT_ENV}
+        if env:
+            base_env.update(env)
+        code = (
+            "import os, sys, json, subprocess\n"
+            f"out = {str(out_path)!r}\n"
+            f"hooks = {str(helpers.PLUGIN / 'hooks')!r}\n"
+            f"event = {event!r}\n"
+            f"payload = {json.dumps(payload)!r}\n"
+            f"heavy = {self.HEAVY!r}\n"
+            "env = dict(os.environ)\n"
+            "body = ("
+            "\"import sys, json; sys.path.insert(0, sys.argv[1]); "
+            "sys.argv = ['cursor_hook.py', sys.argv[2]]; import cursor_hook as C; C.main(); "
+            "sys.stdout.write(chr(10) + json.dumps(sorted(m for m in sys.modules if m in \" + repr(heavy) + \")));\"\n"
+            ")\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    if os.fork() == 0:\n"
+            "        cp = subprocess.run([sys.executable, '-c', body, hooks, event],\n"
+            "                            input=payload, capture_output=True, text=True, env=env)\n"
+            "        open(out, 'w', encoding='utf-8').write("
+            "cp.stdout if cp.returncode == 0 else ('__ERR__\\n' + str(cp.returncode) + '\\n' + (cp.stderr or '')))\n"
+            "        os._exit(0)\n"
+            "    os._exit(0)\n"
+            "os.wait()\n"
+        )
+        subprocess.run([sys.executable, "-c", code], env=base_env, check=True, timeout=60)
+        deadline = time.time() + 60
+        while time.time() < deadline and not out_path.exists():
+            time.sleep(0.02)
+        self.assertTrue(out_path.exists(), f"cursor hook {event}: no output")
+        text = out_path.read_text(encoding="utf-8")
+        try:
+            out_path.unlink(missing_ok=True)
+            out_path.parent.rmdir()
+        except OSError:
+            pass
+        self.assertFalse(text.startswith("__ERR__\n"), text)
+        answer, modules = text.rsplit("\n", 1)
         return json.loads(answer), json.loads(modules)
 
     def setUp(self):

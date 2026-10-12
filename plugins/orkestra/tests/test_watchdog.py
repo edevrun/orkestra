@@ -145,7 +145,7 @@ class TestWatchdogScan(FlowBase):
         self.assertEqual(got["args"][:3], ["-p", "--resume", self.sid])        # the SAME session, never a new one
         self.assertEqual(got["prompt"], "/orkestra:resume demo")
         self.assertEqual(got["headless"], "1")
-        self.assertIn("watchdog auto-resume #1 (session sess-1", (self.fdir / "ledger.md").read_text())
+        self.assertIn("watchdog auto-resume #1 (claude session sess-1", (self.fdir / "ledger.md").read_text())
         # immediately afterwards: back-off (5 min) — nothing is started twice
         v = self.scan(in_future=1260)[0]
         self.assertFalse(v["auto_resume"]["resume"])

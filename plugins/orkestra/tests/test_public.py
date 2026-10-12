@@ -106,7 +106,7 @@ class TestPublicRepository(unittest.TestCase):
             root = Path(d)
             dirs[:] = [
                 name for name in dirs
-                if name not in ("__pycache__", ".git", "node_modules")
+                if name not in ("__pycache__", ".git", "node_modules", ".orkestra")
                 and not (root == ROOT and name in ("dist", "internal"))
             ]
             for n in names:
@@ -162,6 +162,24 @@ class TestPublicRepository(unittest.TestCase):
         for path in ("bridge/dist/package.json", "bridge/internal/guide.md"):
             cp = subprocess.run(["git", "check-ignore", "--no-index", "--quiet", "--", path], cwd=ROOT)
             self.assertEqual(cp.returncode, 1, f"{path} should not be ignored by the root-only rules")
+        # FR-005 / E8: personal sibling tokens banned in shipped plugin sources only
+        # (hooks/lib/agents/skills; vendor + tests/ out of scope — fixtures stay).
+        sibling = re.compile(r"other-app|sample-app", re.I)
+        sibling_hits = []
+        for area in ("hooks", "lib", "agents", "skills"):
+            base = helpers.PLUGIN / area
+            if not base.is_dir():
+                continue
+            for p in base.rglob("*"):
+                if not p.is_file() or not str(p).endswith(self.TEXT):
+                    continue
+                rel = str(p.relative_to(helpers.PLUGIN))
+                if "/vendor/" in f"/{rel}/" or rel.startswith("vendor/"):
+                    continue
+                for i, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+                    if sibling.search(line):
+                        sibling_hits.append(f"plugins/orkestra/{rel}:{i}: {line.strip()[:80]}")
+        self.assertEqual(sibling_hits[:15], [])
 
     def test_documents_point_at_files_that_exist(self):
         for doc in ("README.md", "README.tr.md", "ORKESTRA.md", "CONTRIBUTING.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md"):
@@ -174,5 +192,382 @@ class TestPublicRepository(unittest.TestCase):
                     self.assertTrue(hit or name.startswith(("<", "~")) or "*" in name, f"{doc} names missing file {name}")
 
 
+    def test_public_oss_placeholders_and_attribution(self):
+        """Canonical clone URL is public; other personal branding / home paths stay banned."""
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("https://github.com/soft-ai-solutions/orkestra.git", readme)
+        self.assertTrue((ROOT / "CODE_OF_CONDUCT.md").is_file())
+        self.assertTrue((ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").is_file())
+        self.assertTrue((ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.md").is_file())
+        self.assertTrue((ROOT / ".github" / "ISSUE_TEMPLATE" / "feature_request.md").is_file())
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        self.assertIn("Orkestra contributors", license_text)
+        self.assertEqual(license_text, (helpers.PLUGIN / "LICENSE").read_text(encoding="utf-8"))
+        ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+        for needle in ("*.p8", "*.pem", "*.mobileprovision", "credentials.json", ".secrets/",
+                       "CLAUDE.local.md", "*.key", ".env.*"):
+            self.assertIn(needle, ignore)
+        # Only the canonical GitHub clone path may mention firatkocabay; other personal
+        # branding and private home paths remain forbidden.
+        allowed_clone = re.compile(r"github\.com/firatkocabay/orkestra", re.I)
+        personal = re.compile(r"firatkocabay|yaln[ıi]z F[ıi]rat", re.I)
+        home_orkestra = re.compile(r"~/Projects/orkestra|~/Projects/n8n")
+        hits = []
+        for path in self.files():
+            rel = str(path.relative_to(ROOT))
+            if "/vendor/" in rel or rel.startswith(".orkestra/") or path.name == "test_public.py":
+                continue
+            body = path.read_text(encoding="utf-8", errors="replace")
+            for i, line in enumerate(body.splitlines(), 1):
+                if home_orkestra.search(line):
+                    hits.append(f"{rel}:{i}: {line.strip()[:80]}")
+                    continue
+                scrubbed = allowed_clone.sub("", line)
+                if personal.search(scrubbed):
+                    hits.append(f"{rel}:{i}: {line.strip()[:80]}")
+        self.assertEqual(hits[:20], [])
+        n8n = (ROOT / "bridge" / "n8n_import.py").read_text(encoding="utf-8")
+        self.assertIn("N8N_API_KEY", n8n)
+        self.assertIn("N8N_STATE", n8n)
+        self.assertNotIn('parent.parent / "n8n"', n8n)
+        self.assertNotIn("../n8n", (ROOT / "install.sh").read_text(encoding="utf-8"))
+        install = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("HAS_CLAUDE", install)
+        self.assertIn("Cursor-only", install)
+
+    def test_install_sh_mentions_cursor_and_copilot_paths(self):
+        """FR-005 / SC-004 / E6 / E9 / E11: install.sh Copilot detect/ask, readiness, epilog, doctor."""
+        install = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("HAS_CLAUDE", install)
+        self.assertIn("Cursor-only", install)
+        self.assertRegex(install, r"HAS_COPILOT|COPILOT_HOME|\.copilot")
+        self.assertRegex(install, r'ask\s+"[^"]*[Cc]opilot')
+        self.assertIn("copilot install", install)
+        self.assertRegex(install, r"\bsetup\b")
+        self.assertIn("--yes", install)
+        # Three-way readiness: warn only when Claude, Cursor, and Copilot are all unready
+        self.assertRegex(install, r"COPILOT_READY|copilot hooks", re.I)
+        self.assertIn(
+            '[ "$HAS_CLAUDE" = 0 ] && [ "$CURSOR_READY" = 0 ] && [ "$COPILOT_READY" = 0 ]',
+            install,
+        )
+        warn_block = "\n".join(
+            ln for ln in install.splitlines()
+            if "warn" in ln.lower() and ("Claude" in ln or "Cursor" in ln or "Copilot" in ln or "hazır" in ln)
+        )
+        self.assertRegex(warn_block, r"[Cc]opilot")
+        # Epilog lists setup and copilot install|status
+        self.assertRegex(install, r'bin/orkestra"\s+setup|orkestra setup')
+        self.assertRegex(install, r"copilot install \| status")
+        # Doctor after engine install steps (second invocation beyond the early advisory call)
+        doctor_calls = install.count('bin/orkestra" doctor')
+        self.assertGreaterEqual(doctor_calls, 2, "doctor should run early and again after engines")
+        # TR ask() preserved (E9)
+        self.assertIn('ask()  { # ask "question" default(y|n)', install)
+        # A1: --yes defaults only for *detected* engines (not “Claude absent ⇒ force y”)
+        self.assertNotIn(
+            '[ "$HAS_CLAUDE" = 0 ] && COPILOT_DEFAULT=y',
+            install,
+            "COPILOT_DEFAULT=y must not be forced solely because Claude is absent",
+        )
+        self.assertNotIn(
+            '[ "$HAS_CLAUDE" = 0 ] && CURSOR_DEFAULT=y',
+            install,
+            "CURSOR_DEFAULT=y must not be forced solely because Claude is absent",
+        )
+        self.assertRegex(
+            install,
+            r'\[ "\$HAS_COPILOT" = 1 \] && COPILOT_DEFAULT=y',
+            "Copilot --yes default must gate on HAS_COPILOT=1",
+        )
+        # CURSOR_DEFAULT=y only when Cursor is detected (HAS_CURSOR from agent and/or ~/.cursor)
+        self.assertRegex(
+            install,
+            r"HAS_CURSOR=0",
+            "install.sh must track Cursor detection via HAS_CURSOR",
+        )
+        self.assertRegex(
+            install,
+            r'\[ "\$HAS_CURSOR" = 1 \] && CURSOR_DEFAULT=y',
+            "CURSOR_DEFAULT=y must gate on HAS_CURSOR=1 (detected Cursor)",
+        )
+        # A2: do not claim ready when the three-way readiness warn fired
+        self.assertIn('ok "Orkestra hazır."', install)
+        ready_ok_idx = install.index('ok "Orkestra hazır."')
+        readiness_warn = (
+            '[ "$HAS_CLAUDE" = 0 ] && [ "$CURSOR_READY" = 0 ] && [ "$COPILOT_READY" = 0 ]'
+        )
+        self.assertIn(readiness_warn, install)
+        warn_idx = install.index(readiness_warn)
+        # Gate: "Orkestra hazır" must sit in an else/ready branch after the unready check,
+        # not run unconditionally after the warn block.
+        after_warn = install[warn_idx:ready_ok_idx]
+        self.assertRegex(
+            after_warn,
+            r"\belse\b|READY|hazır değil|not.?ready|kurulum hazır değil",
+            "ok Orkestra hazır must be gated (else/ready) when unready warn can fire",
+        )
+        self.assertRegex(
+            install,
+            r"hazır değil|not.?ready|kurulum hazır değil|Orkestra hazır değil",
+            "unready path must print a clear not-ready line (not only warn)",
+        )
+        # FR-002 / E4: PATH shim always runs even when Cursor ask is declined
+        self.assertRegex(
+            install,
+            r"ensure_path_shim|ORKESTRA_SHIM",
+            "install.sh must invoke ensure_path_shim (or ORKESTRA_SHIM) for PATH",
+        )
+        self.assertIn(
+            "ensure_path_shim",
+            install,
+            "install.sh must call cursorkit.ensure_path_shim / CLI path",
+        )
+        cursor_yes = re.search(
+            r'if ask "[^"]*[Cc]ursor[^"]*"[^\n]*; then\n(.*?)^fi\s*$',
+            install,
+            re.M | re.S,
+        )
+        self.assertIsNotNone(cursor_yes, "Cursor ask if-block must exist")
+        self.assertNotIn(
+            "ensure_path_shim",
+            cursor_yes.group(1),
+            "ensure_path_shim must not live only inside the Cursor-yes branch (E4)",
+        )
+
+    def test_openclaw_ci_logic_only_and_docs(self):
+        """FR-004 / E7 / SC-002: CI npm test is logic-only; e2e optional locally; docs honesty."""
+        pkg = json.loads(
+            (ROOT / "integrations" / "openclaw" / "plugin" / "package.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        scripts = pkg.get("scripts") or {}
+        self.assertIn("test", scripts)
+        self.assertIn("test:e2e", scripts)
+        self.assertIn("logic.test.js", scripts["test"])
+        self.assertNotIn(
+            "plugin.e2e.test.js",
+            scripts["test"],
+            "default npm test must not require Homebrew openclaw (logic-only)",
+        )
+        self.assertIn("plugin.e2e.test.js", scripts["test:e2e"])
+
+        e2e = (
+            ROOT / "integrations" / "openclaw" / "plugin" / "plugin.e2e.test.js"
+        ).read_text(encoding="utf-8")
+        self.assertIn("OPENCLAW_PKG", e2e)
+        self.assertRegex(
+            e2e,
+            r"existsSync\s*\(\s*OPENCLAW_PKG\s*\)|skip:.*OPENCLAW_PKG|missing.*OPENCLAW_PKG",
+            "e2e must skip (or exit 0) when OPENCLAW_PKG is absent",
+        )
+
+        workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        self.assertIn("openclaw", workflow)
+        self.assertRegex(
+            workflow,
+            r"integrations/openclaw/plugin && npm test",
+            "CI OpenClaw job must run default npm test (logic-only)",
+        )
+        self.assertNotIn(
+            "test:e2e",
+            workflow,
+            "CI must not run OpenClaw e2e (Homebrew openclaw)",
+        )
+        # A1: logic job is a hard required check — no continue-on-error
+        self.assertNotIn(
+            "continue-on-error",
+            workflow,
+            "OpenClaw logic CI job must be required (no continue-on-error)",
+        )
+
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        # A1: required CI logic job wording — must NOT brand logic npm test as optional/advisory
+        self.assertNotRegex(
+            readme,
+            re.compile(
+                r"optional\s*/\s*advisory.{0,80}[Oo]pen[Cc]law\s+logic|"
+                r"[Oo]pen[Cc]law\s+logic[^\n]{0,80}optional\s*/\s*advisory|"
+                r"advisory\s+[Oo]pen[Cc]law\s+logic|"
+                r"[Oo]pen[Cc]law\s+logic-only\s+\(optional",
+                re.I | re.S,
+            ),
+            "README must not call OpenClaw logic CI job optional/advisory (A1)",
+        )
+        self.assertRegex(
+            readme,
+            re.compile(
+                r"required.{0,60}[Oo]pen[Cc]law.{0,40}logic|"
+                r"[Oo]pen[Cc]law.{0,40}logic[^\n]{0,60}required|"
+                r"[Oo]pen[Cc]law\s+logic-only\s+job|"
+                r"logic-only\s*\(CI\)",
+                re.I,
+            ),
+            "README must describe OpenClaw logic npm test as a required CI job (A1)",
+        )
+        self.assertRegex(
+            readme,
+            r"test:e2e|logic\.test|logic-only|logic only",
+            "README must distinguish logic npm test from local e2e",
+        )
+        self.assertRegex(
+            readme,
+            re.compile(
+                r"(e2e|test:e2e).{0,40}(local|optional)|(local|optional).{0,40}(e2e|test:e2e)",
+                re.I,
+            ),
+            "README must call OpenClaw e2e local/optional (not the logic CI job)",
+        )
+
+        readme_tr = (ROOT / "README.tr.md").read_text(encoding="utf-8")
+        self.assertNotRegex(
+            readme_tr,
+            re.compile(
+                r"(isteğe bağlı|opsiyonel)\s*/\s*advisory.{0,80}[Oo]pen[Cc]law\s+logic|"
+                r"[Oo]pen[Cc]law\s+logic[^\n]{0,80}(isteğe bağlı|opsiyonel)\s*/\s*advisory|"
+                r"advisory\s+[Oo]pen[Cc]law\s+logic|"
+                r"[Oo]pen[Cc]law\s+logic\s+\((isteğe bağlı|opsiyonel)",
+                re.I | re.S,
+            ),
+            "README.tr must not call OpenClaw logic CI job optional/advisory (A1)",
+        )
+        self.assertRegex(
+            readme_tr,
+            re.compile(
+                r"(zorunlu|required|CI).{0,60}[Oo]pen[Cc]law.{0,40}logic|"
+                r"[Oo]pen[Cc]law.{0,40}logic[^\n]{0,60}(zorunlu|required|CI)",
+                re.I,
+            ),
+            "README.tr must describe OpenClaw logic npm test as required CI (A1)",
+        )
+        self.assertRegex(
+            readme_tr,
+            re.compile(
+                r"(e2e|test:e2e).{0,40}(yerel|isteğe bağlı|opsiyonel)|"
+                r"(yerel|isteğe bağlı|opsiyonel).{0,40}(e2e|test:e2e)",
+                re.I,
+            ),
+            "README.tr must call OpenClaw e2e local/optional",
+        )
+
+        contrib = (ROOT / "CONTRIBUTING.md").read_text(encoding="utf-8")
+        self.assertRegex(
+            contrib,
+            r"test:e2e|OPENCLAW_PKG|optional.*e2e|e2e.*optional",
+            "CONTRIBUTING must document local e2e (test:e2e / OPENCLAW_PKG)",
+        )
+
+    def test_doc_honesty_path_skip_fail_bridge_coc(self):
+        """FR-006 / FR-007 / FR-008 / FR-009 / E9 / E10 / SC-003: labelled doc honesty needles."""
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        readme_tr = (ROOT / "README.tr.md").read_text(encoding="utf-8")
+        onboarding = (ROOT / "ONBOARDING.md").read_text(encoding="utf-8")
+        security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
+        orkestra_md = (ROOT / "ORKESTRA.md").read_text(encoding="utf-8")
+        coc = (ROOT / "CODE_OF_CONDUCT.md").read_text(encoding="utf-8")
+
+        # FR-006 / E9: PATH shim + install.sh --skip-tests in README and ONBOARDING
+        for label, text in (("README.md", readme), ("ONBOARDING.md", onboarding)):
+            self.assertRegex(
+                text,
+                r"ORKESTRA_SHIM_DIR|~/\.local/bin",
+                f"FR-006: {label} must document PATH shim (~/.local/bin or ORKESTRA_SHIM_DIR)",
+            )
+            self.assertIn(
+                "--skip-tests",
+                text,
+                f"FR-006 / E9: {label} must document install.sh --skip-tests",
+            )
+
+        # FR-007: Claude/Cursor fail-open vs Copilot PreToolUse fail-closed (product keeps fail-open)
+        self.assertRegex(
+            security,
+            r"fail-open",
+            "FR-007: SECURITY.md must state Claude/Cursor fail-open",
+        )
+        self.assertRegex(
+            security,
+            r"fail-closed",
+            "FR-007: SECURITY.md must state Copilot PreToolUse fail-closed asymmetry",
+        )
+        self.assertRegex(
+            security,
+            r"[Cc]opilot.*[Pp]reToolUse|[Pp]reToolUse.*[Cc]opilot",
+            "FR-007: SECURITY.md must name Copilot PreToolUse for fail-closed",
+        )
+        self.assertRegex(
+            security,
+            r"[Cc]laude|[Cc]ursor",
+            "FR-007: SECURITY.md fail-open side must name Claude and/or Cursor",
+        )
+        limits = readme.split("## Limits you should know", 1)
+        self.assertEqual(len(limits), 2, "FR-007: README must keep a Limits section")
+        limits_body = limits[1].split("\n## ", 1)[0]
+        self.assertRegex(
+            limits_body,
+            r"fail-open|fail open",
+            "FR-007: README Limits must mention fail-open",
+        )
+        self.assertRegex(
+            limits_body,
+            r"fail-closed|fail closed",
+            "FR-007: README Limits must mention Copilot fail-closed asymmetry",
+        )
+        self.assertRegex(
+            limits_body,
+            r"[Cc]opilot",
+            "FR-007: README Limits must name Copilot in the asymmetry note",
+        )
+
+        # FR-008: bridge/workbench wording matches code (Copilot is a bridge engine)
+        kaps = orkestra_md.split("## Kapsam", 1)[1].split("## ", 1)[0]
+        self.assertNotRegex(
+            kaps,
+            r"[Cc]opilot[^\n.]{0,80}(kapsam d[ıi][şs][ıi]|out of scope)",
+            "FR-008: ORKESTRA.md must not claim Copilot bridge/engine is out of scope",
+        )
+        self.assertRegex(
+            kaps,
+            r"[Bb]ridge.*[Cc]opilot|[Cc]opilot.*[Bb]ridge",
+            "FR-008: ORKESTRA.md Kapsam must acknowledge Copilot on the bridge",
+        )
+        self.assertRegex(
+            readme,
+            r"workbench[^\n]{0,120}[Cc]opilot|[Cc]opilot[^\n]{0,80}workbench|"
+            r"Claude Code/[Cc]ursor/[Cc]opilot|Claude Code,?\s*[Cc]ursor,?\s*(and |or )?[Cc]opilot",
+            "FR-008: README workbench must include Copilot as a selectable engine",
+        )
+        self.assertNotRegex(
+            readme_tr,
+            r"Bridge Copilot'u desteklemez|Copilot engine bridge'de desteklenmiyor|"
+            r"Copilot bridge kapsam d[ıi][şs][ıi]",
+            "FR-008: README.tr must not deny Copilot on Telegram/bridge",
+        )
+        self.assertRegex(
+            readme_tr,
+            r"[Bb]ridge.*[Cc]opilot|[Cc]opilot.*[Bb]ridge|/yap[^\n]*copilot|"
+            r'"engine":\s*"copilot"',
+            "FR-008: README.tr must document Copilot bridge/Telegram usage",
+        )
+
+        # FR-009 / E10: CoC contact is GHSA / maintainer private report — no invented public email
+        self.assertRegex(
+            coc,
+            r"GitHub Security Advisories|GHSA",
+            "FR-009 / E10: CODE_OF_CONDUCT must point at GHSA / GitHub Security Advisories",
+        )
+        self.assertRegex(
+            coc,
+            r"private report|maintainers|repository maintainers",
+            "FR-009: CODE_OF_CONDUCT must allow maintainer private report",
+        )
+        self.assertNotRegex(
+            coc,
+            r"mailto:|@[\w.-]+\.(com|org|net|io)\b",
+            "FR-009 / E10: CODE_OF_CONDUCT must not invent a public contact email",
+        )
+
 if __name__ == "__main__":
     unittest.main()
+

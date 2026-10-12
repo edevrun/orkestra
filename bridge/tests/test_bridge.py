@@ -74,6 +74,8 @@ class BridgeTest(unittest.TestCase):
             "watchdog_interval": 0, "auto_resume_delays": [0, 0, 0],
             "telegram": {"bot_token": "", "allowed_chat_ids": ["42"]}}))
         env = dict(os.environ, ORKESTRA_HOME=str(cls.home), ORKESTRA_WORKSPACE=str(cls.ws))
+        for k in ("CLAUDECODE", "CURSOR_AGENT", "CURSOR_CONVERSATION_ID", "ORKESTRA_HEADLESS"):
+            env.pop(k, None)
         cls.proc = subprocess.Popen([sys.executable, str(BRIDGE), "serve"], env=env, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True)
         for _ in range(50):
@@ -154,12 +156,12 @@ class BridgeTest(unittest.TestCase):
         code, engines = self.call("GET", "/engines?project=demo")
         self.assertEqual(code, 200)
         self.assertEqual(engines["default"], "claude")
-        self.assertEqual({item["id"] for item in engines["engines"]}, {"claude", "cursor"})
+        self.assertEqual({item["id"] for item in engines["engines"]}, {"claude", "cursor", "copilot"})
         self.assertTrue(all(isinstance(item["available"], bool) for item in engines["engines"]))
         self.assertEqual(self.call("GET", "/engines?project=../etc")[0], 400)
 
     def test_0_job_can_be_cancelled_by_id(self):
-        code, job = self.call("POST", "/jobs", {"project": "demo3", "request": "öncelik ekle"})
+        code, job = self.call("POST", "/jobs", {"project": "demo3", "request": "öncelik ekle; ben karar verici olayım"})
         self.assertEqual(code, 202, job)
         self.wait_status(job["id"], "awaiting_user")
         self.assertEqual(self.call("POST", f"/jobs/{job['id']}/cancel", {}, token=False)[0], 401)
@@ -174,7 +176,7 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(code, 400, (bad, body))
 
     def test_3_job_lifecycle(self):
-        code, job = self.call("POST", "/jobs", {"project": "demo", "request": "öncelik ekle", "chat_id": "42"})
+        code, job = self.call("POST", "/jobs", {"project": "demo", "request": "öncelik ekle; ben karar verici olayım", "chat_id": "42"})
         self.assertEqual(code, 202, job)
         job = self.wait_status(job["id"], "awaiting_user")
         self.assertIn("Varsayılan öncelik", job["last_message"])
@@ -198,7 +200,7 @@ class BridgeTest(unittest.TestCase):
     def test_4_telegram_command_language(self):
         code, body = self.call("POST", "/telegram", {"chat_id": "42", "text": "/yap"})
         self.assertEqual(code, 200)
-        self.assertIn("Kullanım", body["message"])
+        self.assertIn("/yap claude:|cursor:|copilot:", body["message"])
         code, body = self.call("POST", "/telegram", {"chat_id": "42", "text": "/durum"})
         self.assertEqual(code, 200)
         self.assertIn("Canlı çalışmalar", body["message"])
@@ -216,7 +218,7 @@ class BridgeTest(unittest.TestCase):
         code, body = self.call("POST", "/jobs", {"project": "secret-proj", "request": "bir şey yap"})
         self.assertEqual(code, 400)
         self.assertIn("allowed_projects", body["error"])
-        code, job = self.call("POST", "/jobs", {"project": "demo2", "request": "öncelik ekle", "chat_id": "77"})
+        code, job = self.call("POST", "/jobs", {"project": "demo2", "request": "öncelik ekle; ben karar verici olayım", "chat_id": "77"})
         self.assertEqual(code, 202)
         self.wait_status(job["id"], "awaiting_user")
         code, _ = self.call("POST", f"/jobs/{job['id']}/reply", {"text": "- T2'yi çıkar"})
@@ -235,7 +237,8 @@ class BridgeTest(unittest.TestCase):
         env = dict(os.environ, ORKESTRA_HOME=str(self.home))
         def run(*a):
             return subprocess.run([sys.executable, str(client), *a], capture_output=True, text=True, env=env)
-        cp = run("start", "demo3", "bir", "şey", "yap", "--chat-id", "55", "--source", "openclaw")
+        cp = run("start", "demo3", "bir", "şey", "yap", "ben", "karar", "verici", "olayım",
+             "--chat-id", "55", "--source", "openclaw")
         self.assertEqual(cp.returncode, 0, cp.stdout + cp.stderr)
         job = json.loads(cp.stdout)
         out = run("wait", job["id"], "--timeout", "30").stdout
@@ -248,7 +251,7 @@ class BridgeTest(unittest.TestCase):
         self.assertIsInstance(json.loads(run("runs", "--json").stdout)["runs"], list)
 
     def test_7_stalled_job_is_resumed_on_the_same_session(self):
-        code, job = self.call("POST", "/jobs", {"project": "demo4", "request": "öncelik ekle", "chat_id": "81"})
+        code, job = self.call("POST", "/jobs", {"project": "demo4", "request": "öncelik ekle; ben karar verici olayım", "chat_id": "81"})
         self.assertEqual(code, 202, job)
         self.wait_status(job["id"], "awaiting_user")
         sid_before = json.loads((self.home / "bridge" / "jobs" / f"{job['id']}.json").read_text())["session_id"]
@@ -268,7 +271,7 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(j.get("auto_resumes"), 1)
 
     def test_8_auto_resume_is_capped_and_then_asks_the_user(self):
-        code, job = self.call("POST", "/jobs", {"project": "demo5", "request": "öncelik ekle", "chat_id": "82"})
+        code, job = self.call("POST", "/jobs", {"project": "demo5", "request": "öncelik ekle; ben karar verici olayım", "chat_id": "82"})
         self.assertEqual(code, 202, job)
         self.wait_status(job["id"], "awaiting_user")
         self.assertEqual(self.call("POST", f"/jobs/{job['id']}/reply", {"text": "hep takıl"})[0], 202)

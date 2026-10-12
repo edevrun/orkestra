@@ -19,17 +19,20 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
-ENGINES = ("claude", "cursor")
+ENGINES = ("claude", "cursor", "copilot")
 DEFAULT_ENGINE = "claude"
 AGENT_NAMES = ("scout", "researcher", "architect", "plan-critic", "implementer", "reviewer", "adversary", "verifier")
 SKILL_NAMES = ("run", "resume", "status", "onboard", "rollback", "ship")
 
 
 CURSOR_SID_PREFIX = "cursor-"    # key of a Cursor conversation in ~/.orkestra/sessions (see session_key)
+COPILOT_SID_PREFIX = "copilot-"
 
 
 class EngineError(Exception):
@@ -42,20 +45,26 @@ def session_key(engine: str, raw_id: str) -> str:
     copy loaded that way must never find (and act on) a Cursor session's binding or git grant."""
     if not raw_id:
         return ""
-    if engine == "cursor" and not raw_id.startswith(CURSOR_SID_PREFIX):
-        return CURSOR_SID_PREFIX + raw_id
+    prefix = {"cursor": CURSOR_SID_PREFIX, "copilot": COPILOT_SID_PREFIX}.get(engine)
+    if prefix and not raw_id.startswith(prefix):
+        return prefix + raw_id
     return raw_id
 
 
 def raw_session_id(session_id: str) -> str:
     """What the engine's CLI calls the session (`--resume <id>`)."""
     s = session_id or ""
-    return s[len(CURSOR_SID_PREFIX):] if s.startswith(CURSOR_SID_PREFIX) else s
+    for prefix in (CURSOR_SID_PREFIX, COPILOT_SID_PREFIX):
+        if s.startswith(prefix):
+            return s[len(prefix):]
+    return s
 
 
 def session_engine(session_id: str, binding: Optional[Mapping[str, Any]] = None) -> str:
     if (session_id or "").startswith(CURSOR_SID_PREFIX):
         return "cursor"
+    if (session_id or "").startswith(COPILOT_SID_PREFIX):
+        return "copilot"
     try:
         return normalize((binding or {}).get("engine"))
     except EngineError:
@@ -85,6 +94,9 @@ def detect_env(env: Optional[Mapping[str, str]] = None) -> Optional[str]:
     Cursor exports CURSOR_AGENT=1 and CURSOR_CONVERSATION_ID to the shell of its agent (IDE chat, CLI, subagents);
     Claude Code exports CLAUDECODE=1. None = an ordinary terminal."""
     env = os.environ if env is None else env
+    explicit = str(env.get("ORKESTRA_ENGINE") or "").strip().lower()
+    if explicit in ENGINES:
+        return explicit
     cursor = env.get("CURSOR_AGENT") == "1" or bool(env.get("CURSOR_CONVERSATION_ID"))
     claude = env.get("CLAUDECODE") == "1"
     if cursor and claude:           # one agent started from the other's shell: Claude Code sets its marker itself,
@@ -104,7 +116,7 @@ def binary(engine: str, cfg: Optional[Mapping[str, Any]] = None, hint: Optional[
     """Absolute path of the engine's CLI, or None. Order: env override → hint (bridge config) → config → PATH."""
     engine = normalize(engine)
     ecfg = ((cfg or {}).get("engine") or {}).get(engine) or {}
-    names = {"claude": ("claude",), "cursor": ("agent", "cursor-agent")}[engine]
+    names = {"claude": ("claude",), "cursor": ("agent", "cursor-agent"), "copilot": ("copilot",)}[engine]
     cands = [os.environ.get(f"ORKESTRA_{engine.upper()}_BIN"), hint, ecfg.get("bin"), *names]
     if engine == "cursor":      # a launchd / cron PATH rarely has the installer's directory
         cands += ["~/.local/bin/agent", "~/.local/bin/cursor-agent", "/usr/local/bin/cursor-agent",
@@ -125,7 +137,7 @@ def binary(engine: str, cfg: Optional[Mapping[str, Any]] = None, hint: Optional[
 
 def new_session(engine: str, bin_path: str, cwd: str) -> str:
     """A session id for the first headless turn. Claude takes any uuid (--session-id); Cursor hands one out."""
-    if normalize(engine) == "claude":
+    if normalize(engine) in ("claude", "copilot"):
         return str(uuid.uuid4())
     try:
         cp = subprocess.run([bin_path, "create-chat"], cwd=cwd, capture_output=True, text=True, timeout=60,
@@ -152,6 +164,21 @@ def headless_command(engine: str, bin_path: str, session_id: str, prompt: str, n
                 "--permission-mode", str(o.get("permission_mode") or "auto"),
                 "--output-format", "json", "--max-turns", str(o.get("max_turns") or 400)]
         return {"argv": argv + [str(x) for x in (o.get("extra_args") or [])], "stdin": prompt}
+    if engine == "copilot":
+        argv = [bin_path, "-p", "--output-format", "json", "--allow-all-tools"]
+        if o.get("approval_mode", "autopilot") != "manual":
+            argv += ["--autopilot", "--no-ask-user"]
+        if o.get("model"):
+            argv += ["--model", str(o["model"])]
+        if o.get("reasoning_effort"):
+            argv += ["--reasoning-effort", str(o["reasoning_effort"])]
+        if o.get("max_autopilot_continues"):
+            argv += ["--max-autopilot-continues", str(o["max_autopilot_continues"])]
+        plugin_dir = str(o.get("plugin_dir") or copilot_plugin_dir())
+        if plugin_dir:
+            argv += ["--plugin-dir", plugin_dir]
+        argv += ["--session-id" if new else "--resume", raw_session_id(session_id)]
+        return {"argv": argv + [str(x) for x in (o.get("extra_args") or [])] + [prompt], "stdin": None}
     argv = [bin_path, "-p", "--output-format", "json", "--force", "--trust", "--resume", session_id]
     if o.get("model"):
         argv += ["--model", str(o["model"])]
@@ -164,6 +191,18 @@ def headless_command(engine: str, bin_path: str, session_id: str, prompt: str, n
 def interactive_command(engine: str, bin_path: str, prompt: str, opts: Optional[Mapping[str, Any]] = None) -> List[str]:
     """Open the engine's own interactive terminal UI with the first prompt already submitted."""
     engine, o = normalize(engine), dict(opts or {})
+    if engine == "copilot":
+        argv = [bin_path, "-i", prompt, "--allow-all-tools"]
+        if o.get("approval_mode", "autopilot") != "manual":
+            argv += ["--autopilot", "--no-ask-user"]
+        if o.get("model"):
+            argv += ["--model", str(o["model"])]
+        if o.get("reasoning_effort"):
+            argv += ["--reasoning-effort", str(o["reasoning_effort"])]
+        plugin_dir = str(o.get("plugin_dir") or copilot_plugin_dir())
+        if plugin_dir:
+            argv += ["--plugin-dir", plugin_dir]
+        return argv + [str(x) for x in (o.get("interactive_args") or [])]
     argv = [bin_path]
     if engine == "cursor" and o.get("model"):
         argv += ["--model", str(o["model"])]
@@ -284,7 +323,11 @@ def with_notes(text: str, engine: Optional[str], agent: bool = False) -> str:
 def short_sid(session_id: str) -> str:
     """Eight characters that tell sessions apart in logs (a Cursor key starts with the same prefix for all)."""
     s = session_id or ""
-    return ("c:" + s[len(CURSOR_SID_PREFIX):][:8]) if s.startswith(CURSOR_SID_PREFIX) else s[:8]
+    if s.startswith(CURSOR_SID_PREFIX):
+        return "c:" + s[len(CURSOR_SID_PREFIX):][:8]
+    if s.startswith(COPILOT_SID_PREFIX):
+        return "cp:" + s[len(COPILOT_SID_PREFIX):][:8]
+    return s[:8]
 
 
 # ---------------------------------------------------------------- headless drivers (bridge, watchdog)
@@ -295,17 +338,95 @@ AGENT_MARKERS = ("CLAUDECODE", "CURSOR_AGENT", "CURSOR_CONVERSATION_ID")     # w
 
 
 def child_env(engine: str, env: Optional[Mapping[str, str]] = None) -> Dict[str, str]:
-    """Environment for an engine process a driver starts. Cursor's agent shell inherits it and has no plugin
-    mechanism that would put `orkestra` on PATH (Claude Code adds the plugin's bin/ itself)."""
+    """Environment for an engine process a driver starts."""
     out = dict(os.environ if env is None else env)
     out["ORKESTRA_HEADLESS"] = "1"
+    out["ORKESTRA_ENGINE"] = normalize(engine)
     for k in AGENT_MARKERS:                 # a driver started from inside some agent's shell: the child is its own agent
         out.pop(k, None)
-    if normalize(engine) == "cursor":
+    if normalize(engine) in ("cursor", "copilot"):
         parts = [p for p in str(out.get("PATH") or "").split(os.pathsep) if p]
         if str(PLUGIN_BIN) not in parts:
             out["PATH"] = os.pathsep.join([str(PLUGIN_BIN)] + parts)
     return out
+
+
+def copilot_plugin_dir(cfg: Optional[Mapping[str, Any]] = None) -> str:
+    """The installed Orkestra Copilot plugin, if present."""
+    configured = (((cfg or {}).get("engine") or {}).get("copilot") or {}).get("plugin_dir")
+    if configured:
+        return os.path.expanduser(str(configured))
+    home = Path(os.environ.get("COPILOT_HOME") or "~/.copilot").expanduser()
+    candidate = home / "plugins" / "orkestra"
+    return str(candidate) if candidate.is_dir() else ""
+
+
+def copilot_hooks_active(plugin_dir: str) -> bool:
+    """True only when the plugin registers Orkestra's prompt and tool guards."""
+    if not plugin_dir:
+        return False
+    root = Path(plugin_dir).expanduser()
+    candidates = (root / "com.github.copilot" / "hooks" / "hooks.json", root / "hooks" / "hooks.json")
+    for path in candidates:
+        try:
+            hooks = json.loads(path.read_text(encoding="utf-8")).get("hooks") or {}
+        except (OSError, ValueError, AttributeError):
+            continue
+        if all(any("copilot_hook.py" in json.dumps(entry) for entry in hooks.get(event, []))
+               for event in ("UserPromptSubmit", "PreToolUse", "PostToolUse")):
+            return True
+    return False
+
+
+# Copilot CLI model / effort words the user may name in the request. One clear hit wins; ambiguous → default.
+_COPILOT_MODELS = (
+    "gpt-6-luna", "gpt-6-astra", "gpt-5.4", "gpt-5.2", "gpt-5", "gpt-4.1", "gpt-4o", "o4-mini", "o3", "o3-mini",
+)
+_COPILOT_EFFORTS = ("max", "high", "medium", "low", "minimal")
+_MODEL_IN_REQUEST = re.compile(
+    r"(?i)(?:\b(?:use|with|model|modeli)\b[\s:=-]*)?(?:gpt[-\s]?6[-\s]?(?:luna|astra)|gpt[-\s]?5(?:\.\d)?|"
+    r"gpt[-\s]?4(?:\.1|o)?|\bo4-mini\b|\bo3(?:-mini)?\b)")
+_EFFORT_IN_REQUEST = re.compile(
+    r"(?i)(?:reasoning[\s-]*effort|effort|reasoning)[\s:=-]*(max|high|medium|low|minimal)"
+    r"|\b(max|high|medium|low|minimal)\s+reasoning(?:\s+effort)?\b")
+
+
+def _norm_copilot_model(token: str) -> str:
+    t = re.sub(r"[\s_]+", "-", (token or "").strip().lower())
+    t = t.replace("gpt6", "gpt-6").replace("gpt5", "gpt-5").replace("gpt4", "gpt-4")
+    aliases = {"gpt-6luna": "gpt-6-luna", "gpt-6astra": "gpt-6-astra", "gpt-4.1": "gpt-4.1", "gpt-4o": "gpt-4o"}
+    return aliases.get(t, t)
+
+
+def copilot_model_for_request(request: str, default: str = "gpt-6-luna") -> str:
+    """Pick one Copilot model from the request text, or keep the configured default.
+
+    A single explicit supported name wins (`use gpt-6-astra`). Several different names, or none, → default.
+    """
+    text = request or ""
+    found: List[str] = []
+    for m in _MODEL_IN_REQUEST.finditer(text):
+        name = _norm_copilot_model(m.group(0))
+        name = re.sub(r"^(?:use|with|model|modeli)[\s:=-]*", "", name)
+        name = _norm_copilot_model(name)
+        if name in _COPILOT_MODELS and name not in found:
+            found.append(name)
+    if len(found) == 1:
+        return found[0]
+    return default or "gpt-6-luna"
+
+
+def copilot_effort_for_request(request: str, default: str = "max") -> str:
+    """Pick one reasoning-effort word from the request, or keep the configured default."""
+    text = request or ""
+    found: List[str] = []
+    for m in _EFFORT_IN_REQUEST.finditer(text):
+        word = (m.group(1) or m.group(2) or "").lower()
+        if word in _COPILOT_EFFORTS and word not in found:
+            found.append(word)
+    if len(found) == 1:
+        return found[0]
+    return default or "max"
 
 
 def driver_prompt(engine: str, session_id: str, prompt: str, cwd: str) -> Optional[str]:
@@ -315,22 +436,58 @@ def driver_prompt(engine: str, session_id: str, prompt: str, cwd: str) -> Option
 
     Claude Code fires UserPromptSubmit in print mode. Cursor's print mode (`agent -p`) fires NO prompt hook
     (measured), so approval ("onay"), "the user replied" and the per-message git permission would never be seen:
-    the driver calls the Cursor hook itself, with the user's own words."""
+    the driver calls the Cursor hook itself, with the user's own words.
+
+    The hook runs in a short-lived reparented child (subprocess → double-fork), not by forking this process: the
+    bridge HTTP server may call us from a worker thread. Agent env markers are kept so a model that calls this
+    with CURSOR_AGENT set is still refused inside the hook.
+    """
     if normalize(engine) != "cursor":
         return ""
     payload = {"hook_event_name": "beforeSubmitPrompt", "conversation_id": raw_session_id(session_id),
                "prompt": prompt, "workspace_roots": [str(cwd)], "generation_id": "", "_driver": True}
-    # The environment is passed on as it is: a driver is never run from inside an agent's shell, and the hook refuses
-    # a driver call that carries an agent's markers (a model announcing "the user said onay" on its own behalf).
+    out_path = Path(tempfile.mkdtemp(prefix="orkestra-drv-")) / "out.json"
     try:
-        cp = subprocess.run([sys.executable, str(CURSOR_HOOK), "beforeSubmitPrompt"], input=json.dumps(payload),
-                            capture_output=True, text=True, timeout=30)
-        data = json.loads(cp.stdout or "{}")
+        script = (
+            "import os, sys, subprocess\n"
+            f"out = {str(out_path)!r}\n"
+            f"hook = {str(CURSOR_HOOK)!r}\n"
+            f"payload = {json.dumps(json.dumps(payload))}\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    if os.fork() == 0:\n"
+            "        cp = subprocess.run([sys.executable, hook, 'beforeSubmitPrompt'], input=payload,\n"
+            "                            capture_output=True, text=True, env=dict(os.environ), timeout=30)\n"
+            "        body = cp.stdout if cp.stdout.strip() else '{}'\n"
+            "        tmp = out + '.tmp'\n"
+            "        with open(tmp, 'w', encoding='utf-8') as fh:\n"
+            "            fh.write(body); fh.flush(); os.fsync(fh.fileno())\n"
+            "        os.replace(tmp, out)\n"
+            "        os._exit(0)\n"
+            "    os._exit(0)\n"
+            "os.wait()\n"
+        )
+        subprocess.run([sys.executable, "-c", script], check=True, timeout=45)
+        deadline = time.time() + 45
+        raw = ""
+        while time.time() < deadline:
+            if out_path.exists():
+                raw = out_path.read_text(encoding="utf-8")
+                if raw.strip():
+                    break
+            time.sleep(0.02)
+        data = json.loads(raw or "{}")
         if isinstance(data, dict) and data.get("refused"):
             return None
         return str(data.get("context") or "") if isinstance(data, dict) else ""
     except (OSError, ValueError, subprocess.SubprocessError):
         return ""
+    finally:
+        try:
+            out_path.unlink(missing_ok=True)
+            out_path.parent.rmdir()
+        except OSError:
+            pass
 
 
 def agent_type_from_cursor(subagent_type: str) -> str:

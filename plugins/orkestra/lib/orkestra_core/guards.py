@@ -206,6 +206,45 @@ def with_cwd(segs: List[sp.Segment], cwd: str) -> List[Tuple[sp.Segment, str]]:
     return out
 
 
+def _recursive_rm_targets(program: str, args: List[str]) -> Optional[List[str]]:
+    name = os.path.basename(program or "").casefold()
+    shells = {"bash", "sh", "zsh", "dash"}
+    wrappers = {"command", "env", "exec", "find", "nice", "nohup", "sudo", "stdbuf", "time", "xargs"}
+    if name in shells:
+        for index, arg in enumerate(args[:-1]):
+            if arg == "-c":
+                found = False
+                targets = []
+                for nested in sp.segments(args[index + 1]):
+                    result = _recursive_rm_targets(nested.program, nested.args)
+                    if result is not None:
+                        found = True
+                        targets.extend(result)
+                return targets if found else None
+        return None
+    if name in wrappers:
+        for index, arg in enumerate(args):
+            nested_name = os.path.basename(arg).casefold()
+            if nested_name == "rm" or nested_name in shells:
+                return _recursive_rm_targets(nested_name, args[index + 1:])
+        return None
+    if name != "rm":
+        return None
+    recursive = False
+    options = True
+    for arg in args:
+        if options and arg == "--":
+            options = False
+            continue
+        if not options or arg == "-" or not arg.startswith("-"):
+            continue
+        if arg.startswith("--"):
+            recursive = recursive or arg.split("=", 1)[0] == "--recursive"
+        else:
+            recursive = recursive or any(flag in arg[1:] for flag in "rR")
+    return sp.positional(args) if recursive else None
+
+
 def bash_write_targets(seg: sp.Segment, cwd: str) -> List[str]:
     """Best-effort list of absolute paths a segment writes. "<cwd>/*" means 'unknown files under cwd'."""
     targets: List[str] = []
@@ -944,12 +983,14 @@ INTERNALS_RE = re.compile(
     + re.escape(_PLUGIN_DIR) + r"(?![\w-])")
 READONLY_PROGRAMS = {"grep", "rg", "egrep", "fgrep", "cat", "head", "tail", "less", "more", "ls", "wc", "stat", "file",
                      "diff", "nl", "sort", "uniq", "cut", "bat", "cd", "true", ":", "echo", "printf", "orkestra", "pwd",
-                     "tree", "du", "which", "realpath", "basename", "dirname"}
+                     "tree", "du", "which", "realpath", "basename", "dirname", "jq"}
 GIT_LOOKS = {"log", "show", "diff", "grep", "blame", "status", "ls-files", "cat-file", "shortlog", "describe"}
 FORGERY_MSG = ("This names orkestra's own hook entry points or library. They are run by the agent host and the "
                "`orkestra` CLI only: a command or file of yours must not call, import or drive them — recording an "
                "approval or a permission that way is forging the user's consent (also when the user said not to ask "
-               "questions). Reading them is fine. If you need the user's approval: show the summary, run "
+               "questions). Read-only inspection is fine. Normal project commands in the plan (tests/builds) remain "
+               "allowed; do not retry this action through another interpreter. For run state use `orkestra status --json`, "
+               "`orkestra next --json` or `orkestra gate last`. If you need the user's approval: show the summary, run "
                "`orkestra await \"plan onayı\"` and end your turn.")
 
 
@@ -1091,6 +1132,18 @@ def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any
     if not own_repo and _names_internals_and_acts((event.get("tool_input") or {}).get("command") or "", segs):
         return deny("internals", FORGERY_MSG)
     for seg, scwd in with_cwd(segs, cwd):
+        recursive_targets = _recursive_rm_targets(seg.program, seg.args)
+        if recursive_targets is not None:
+            if not recursive_targets:
+                return deny("destructive", "Recursive deletion with unknown targets is blocked; remove only exact planned files.")
+            for target in recursive_targets:
+                resolved = str(resolve_path(target, scwd))
+                d = check_target(resolved, "bash:rm")
+                if d.denied:
+                    return d
+                if _classify(resolved, project, fdir) != "temp":
+                    return deny("destructive", "Recursive deletion is blocked outside a dedicated temporary subdirectory. "
+                                                   "Remove exact planned files instead.")
         sub = _cli_subcommand(seg)
         if sub is not None:
             if sub == "":

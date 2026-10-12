@@ -198,8 +198,27 @@ def on_user_prompt(ev: dict) -> None:
                 context_out("UserPromptSubmit", "[orkestra] The message above is a subagent report / task notification, "
                                                 "not the user (it approves nothing and grants nothing).\n" + hint)
         return
+    if (st.get("phase") != "approve"
+            and st.get("status") != "awaiting_user"
+            and not intent.manual_approval_requested(prompt)
+            and intent.off_topic_vs_project(prompt, project, st["run_id"], title=str(st.get("title") or ""))):
+        ST.unbind_session(sid)
+        activity.record(project, st["run_id"], ev, "note",
+                        f"oturum çözüldü · konu dışı prompt ({project.name} değil)")
+        context_out("UserPromptSubmit",
+                    f"[orkestra] This chat was bound to {st['run_id']} in {project.name}, but your message "
+                    f"is about another project. Unbound this session so Stop will not continue that run. "
+                    f"Use /orkestra-resume {project.name} only if you want to continue it.")
+        return
     activity.record(project, st["run_id"], ev, "user", " ".join(prompt.split())[:160])
-    if st.get("phase") == "approve" and not prompt.strip().startswith("/"):
+    manual_mode_changed = False
+    if intent.manual_approval_requested(prompt):
+        try:
+            manual_mode_changed = runs.set_approval_mode(project, st["run_id"], "manual", prompt)
+            st["approval_mode"] = "manual"
+        except Exception as exc:
+            log(f"manual approval mode change failed: {exc}")
+    if st.get("approval_mode", "autopilot") == "manual" and st.get("phase") == "approve" and not prompt.strip().startswith("/"):
         decision = intent.approval(prompt)
         if decision:
             runs.record_approval(project, st["run_id"], decision, "prompt", prompt[:300])
@@ -211,6 +230,9 @@ def on_user_prompt(ev: dict) -> None:
                                                 f"message as change requests: revise spec/plan (plan-critic again), then ask "
                                                 f"for approval again.")
             return
+    if manual_mode_changed:
+        context_out("UserPromptSubmit", "[orkestra] Manual plan-approval mode is now enabled for this run. "
+                                        "Continue autonomously through analysis and verification, then ask the user only at the plan approval gate.")
     if st.get("status") == "awaiting_user":
         # the user answered: the run is active again (Stop-hook continuation applies)
         runs.set_status(project, st["run_id"], "active", "user replied")
@@ -245,12 +267,15 @@ def on_pre_tool(ev: dict) -> None:
     ctx = git_context(ev)
     if ctx:
         ev = dict(ev, _git_ctx=ctx)
-    try:
-        d = _with_deadline(GUARD_DEADLINE_SECONDS, lambda: guards.pre_tool_decision(ev, cfg, b, grants))
-    except _Deadline:
-        # A hook that runs into Claude Code's timeout lets the call through UNCHECKED. Refusing is the safe answer.
-        d = guards.deny("complex", f"This call could not be analysed within {GUARD_DEADLINE_SECONDS} s. Split the "
-                                   f"command, or put it in a script file under the project and run that.")
+    if b and ev.get("tool_name") == "AskUserQuestion" and b["state"].get("approval_mode", "autopilot") != "manual":
+        d = guards.deny("approval", "This run is in autopilot mode. Record a conservative assumption and continue; do not wait for the user.")
+    else:
+        try:
+            d = _with_deadline(GUARD_DEADLINE_SECONDS, lambda: guards.pre_tool_decision(ev, cfg, b, grants))
+        except _Deadline:
+            # A hook that runs into Claude Code's timeout lets the call through UNCHECKED. Refusing is the safe answer.
+            d = guards.deny("complex", f"This call could not be analysed within {GUARD_DEADLINE_SECONDS} s. Split the "
+                                       f"command, or put it in a script file under the project and run that.")
     if d.denied:
         emit({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
                                      "permissionDecisionReason": f"[orkestra:{d.guard}] {d.reason}"}})
@@ -343,8 +368,17 @@ def on_post_tool(ev: dict) -> None:
         warnings = []
         for m in BIND_RE.finditer(text):
             bproj, brun = Path(m.group(1)), m.group(2)
+            try:
+                bst = ST.load_state(bproj, brun)
+            except Exception:
+                bst = {}
+            if (bst or {}).get("status") not in ("active", "awaiting_user", "blocked"):
+                continue  # never lease a chat to a paused/aborted/done run
             others = [s for s in ST.run_sessions(bproj, brun) if s["id"] != ST._safe(sid)]
-            ST.bind_session(sid, bproj, brun, engine=str(ev.get("_engine") or ""))
+            engine = str(ev.get("_engine") or "")
+            ST.bind_session(sid, bproj, brun, engine=engine)
+            if engine:
+                runs.record_engine_origin(bproj, brun, engine)
             activity.record(bproj, brun, ev, "bind", f"oturum bağlandı ({short_sid(sid)})")
             if others:
                 lease = int((paths.global_config().get("watchdog") or {}).get("lease_seconds") or 120)
@@ -544,11 +578,32 @@ def on_stop(ev: dict) -> None:
     def idle(why: str) -> None:
         activity.record(project, st["run_id"], ev, "idle", why)
 
-    if st.get("status") != "active" or st.get("phase") == "done":
+    sid = ev.get("session_id") or ""
+    if st.get("phase") == "done":
+        ST.unbind_session(sid)
+        idle("tur bitti · durum done")
+        return
+    if st.get("status") == "awaiting_user":
+        # Keep the bind: AskUserQuestion answers arrive on the next PostToolUse after Stop.
+        idle("tur bitti · durum awaiting_user (cevap için bağ korundu)")
+        return
+    if st.get("status") != "active":
+        # Paused/blocked must not keep a chat leased: a later resume would Stop-hijack it.
+        ST.unbind_session(sid)
         idle(f"tur bitti · durum {st.get('status')}")
         return
     if ev.get("stop_hook_active"):
         idle("tur bitti")
+        return
+    last_what = activity.last_user_what(project, st["run_id"], sid)
+    if last_what and intent.off_topic_vs_project(
+            last_what, project, st["run_id"], title=str(st.get("title") or "")):
+        ST.unbind_session(sid)
+        idle("tur bitti · son kullanıcı mesajı bound run dışı → oturum çözüldü")
+        return
+    if not activity.turn_drove_run(project, st["run_id"], sid):
+        ST.unbind_session(sid)
+        idle("tur bitti · bu tur bound run'ı sürmedi → oturum çözüldü")
         return
     cfg = paths.global_config()
     headless = paths.is_headless(st)        # also true for an interactive run the bridge / watchdog continues

@@ -2,9 +2,9 @@
 
 Goal: an independent, adversarial look at the whole change, with every finding triaged by you.
 
-1. In ONE message dispatch in parallel (XS: reviewer only), then end your turn (both reports arrive as messages):
+1. In ONE message dispatch in parallel (**XS/S: reviewer only** — no adversary), then end your turn (both reports arrive as messages):
    - `orkestra:reviewer` — `scope: final` (writes `reviews/final-review.md`)
-   - `orkestra:adversary` (writes `reviews/adversary.md`)
+   - `orkestra:adversary` (writes `reviews/adversary.md`) — **M/L only**
    (M/L touching auth/payments/data: also ask the researcher to double-check any platform/API claim the reviewers question.)
 2. Triage — you verify each finding yourself by reading the cited code (reviewer severities are advisory). Write `reviews/triage.md` (`orkestra template triage`): every finding gets `fix | defer | reject` and a note — including the minors carried from task reviews
    (`orkestra task list` prints them). `reject` needs a reason; `defer` goes to the report's "ertelenenler".

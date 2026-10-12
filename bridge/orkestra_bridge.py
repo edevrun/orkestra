@@ -51,7 +51,7 @@ from typing import Any, Dict, List, Optional
 HERE = Path(__file__).resolve().parent
 PLUGIN = HERE.parent / "plugins" / "orkestra"
 sys.path.insert(0, str(PLUGIN / "lib"))
-from orkestra_core import engines as EN  # noqa: E402  (stdlib-only module: engine names, command lines, prompts)
+from orkestra_core import engines as EN, intent as INTENT, paths as OP  # noqa: E402
 ORKESTRA_BIN = PLUGIN / "bin" / "orkestra"
 HOME = Path(os.environ.get("ORKESTRA_HOME") or "~/.orkestra").expanduser()
 CONFIG_PATH = HOME / "bridge.secret.json"
@@ -79,6 +79,12 @@ DEFAULTS: Dict[str, Any] = {
     "cursor_bin": "",                # "" = `agent` / `cursor-agent` on PATH or in ~/.local/bin
     "cursor_model": "",              # "" = the model selected in Cursor
     "cursor_extra_args": [],
+    "copilot_bin": "",
+    "copilot_plugin_dir": "",
+    "copilot_model": "",
+    "copilot_reasoning_effort": "",
+    "copilot_max_autopilot_continues": 0,
+    "copilot_extra_args": [],
     "permission_mode": "auto",
     "max_turns": 400,
     "extra_args": [],
@@ -226,7 +232,7 @@ def orkestra_cfg() -> Dict[str, Any]:
 
 
 def pick_engine(cfg: Dict[str, Any], name: Optional[str]) -> str:
-    """Engine of a new job: the one asked for, else the bridge default, else orkestra's (claude)."""
+    """Engine of a new job: the one asked for, else the bridge default, else Orkestra's default."""
     try:
         return EN.normalize(name or cfg.get("default_engine") or None, EN.default_engine(orkestra_cfg()))
     except EN.EngineError:
@@ -251,16 +257,53 @@ def cursor_ready(cfg: Dict[str, Any], project: Optional[Path] = None) -> str:
     return ""
 
 
+def copilot_bin(cfg: Dict[str, Any]) -> Optional[str]:
+    return EN.binary("copilot", orkestra_cfg(), hint=cfg.get("copilot_bin") or None)
+
+
+def copilot_options(cfg: Dict[str, Any], approval_mode: str = "autopilot", request: str = "",
+                    selected_model: str = "", selected_effort: str = "") -> Dict[str, Any]:
+    engine_cfg = dict(((OP.global_config().get("engine") or {}).get("copilot") or {}))
+    bridge_keys = {
+        "model": "copilot_model",
+        "reasoning_effort": "copilot_reasoning_effort",
+        "max_autopilot_continues": "copilot_max_autopilot_continues",
+        "plugin_dir": "copilot_plugin_dir",
+        "extra_args": "copilot_extra_args",
+    }
+    for option, key in bridge_keys.items():
+        if cfg.get(key):
+            engine_cfg[option] = cfg[key]
+    if not engine_cfg.get("plugin_dir"):
+        engine_cfg["plugin_dir"] = EN.copilot_plugin_dir({"engine": {"copilot": engine_cfg}})
+    engine_cfg["approval_mode"] = approval_mode
+    engine_cfg["model"] = EN.copilot_model_for_request(request, selected_model or str(engine_cfg.get("model") or "gpt-6-luna"))
+    engine_cfg["reasoning_effort"] = EN.copilot_effort_for_request(
+        request, selected_effort or str(engine_cfg.get("reasoning_effort") or "max"))
+    return engine_cfg
+
+
+def copilot_ready(cfg: Dict[str, Any]) -> str:
+    if not copilot_bin(cfg):
+        return "Copilot CLI bulunamadı (copilot_bin veya PATH'i denetle)"
+    options = copilot_options(cfg)
+    if not EN.copilot_hooks_active(str(options.get("plugin_dir") or "")):
+        return "Orkestra Copilot hook'ları kurulu değil; UserPromptSubmit, PreToolUse ve PostToolUse hook'ları gerekir"
+    return ""
+
+
 def ui_engines(cfg: Dict[str, Any], project_name: Optional[str] = None) -> Dict[str, Any]:
     project = resolve_project(cfg, project_name) if project_name else None
     claude = EN.binary("claude", orkestra_cfg(), hint=cfg.get("claude_bin") or None)
     cursor_error = cursor_ready(cfg, project)
+    copilot_error = copilot_ready(cfg)
     return {
         "default": pick_engine(cfg, None),
         "engines": [
             {"id": "claude", "label": "Claude Code", "available": bool(claude),
              "reason": "" if claude else "Claude Code CLI bulunamadı"},
             {"id": "cursor", "label": "Cursor", "available": not bool(cursor_error), "reason": cursor_error},
+            {"id": "copilot", "label": "GitHub Copilot", "available": not bool(copilot_error), "reason": copilot_error},
         ],
     }
 
@@ -339,8 +382,14 @@ def start_job(cfg: Dict[str, Any], project_name: str, request: str, chat_id: Opt
     if len(request) < 3:
         raise ValueError("istek boş")
     engine = pick_engine(cfg, engine)
+    approval_mode = "manual" if INTENT.manual_approval_requested(request) else "autopilot"
+    copilot_profile = copilot_options(cfg, approval_mode, request) if engine == "copilot" else {}
     if engine == "cursor":
         why = cursor_ready(cfg, project)
+        if why:
+            raise ValueError(why)
+    elif engine == "copilot":
+        why = copilot_ready(cfg)
         if why:
             raise ValueError(why)
     with _lock:
@@ -349,7 +398,11 @@ def start_job(cfg: Dict[str, Any], project_name: str, request: str, chat_id: Opt
                 raise ValueError(f"{project.name} için açık bir iş var ({j['id']}, {j['status']}). Önce onu bitir veya /iptal.")
         job = {"id": uuid.uuid4().hex[:12], "project": project.name, "project_path": str(project),
                "chat_id": chat_id, "session_id": str(uuid.uuid4()), "status": "queued", "created": now(),
-               "turns": [], "last_message": "", "engine": engine}
+             "turns": [], "last_message": "", "engine": engine,
+               "approval_mode": approval_mode}
+        if engine == "copilot":
+            job["copilot_model"] = copilot_profile["model"]
+            job["copilot_reasoning_effort"] = copilot_profile["reasoning_effort"]
         save_job(job)
     if engine == "cursor":
         try:        # Cursor hands the chat id out itself (claude takes the uuid above as --session-id)
@@ -372,6 +425,13 @@ def reply_job(cfg: Dict[str, Any], job: Dict[str, Any], text: str) -> Dict[str, 
         raise ValueError("iş hâlâ çalışıyor; bitince sana yazacağım")
     if job.get("status") in ("done", "error", "cancelled"):
         raise ValueError(f"iş kapandı ({job['status']}); yeni iş için /yap kullan")
+    if INTENT.manual_approval_requested(text):
+        job["approval_mode"] = "manual"
+    if job.get("engine") == "copilot":
+        default_model = str(job.get("copilot_model") or copilot_options(cfg).get("model") or "gpt-6-luna")
+        job["copilot_model"] = EN.copilot_model_for_request(text, default_model)
+        default_effort = str(job.get("copilot_reasoning_effort") or copilot_options(cfg).get("reasoning_effort") or "max")
+        job["copilot_reasoning_effort"] = EN.copilot_effort_for_request(text, default_effort)
     job["auto_resumes"] = 0                  # a human answered: the automatic-continuation budget starts over
     run_turn(cfg, job, text, new=False)
     return job
@@ -417,6 +477,18 @@ def run_turn(cfg: Dict[str, Any], job: Dict[str, Any], prompt: str, new: bool, s
             return
         spec = EN.headless_command("cursor", binary, job["session_id"], (ctx + "\n\n" if ctx else "") + prompt, new,
                                    {"model": cfg.get("cursor_model"), "extra_args": cfg.get("cursor_extra_args")})
+    elif engine == "copilot":
+        why = copilot_ready(cfg)
+        if why:
+            job["status"], job["last_message"] = "error", f"Copilot turu başlatılmadı: {why}"
+            save_job(job)
+            notify(cfg, job)
+            return
+        binary = copilot_bin(cfg)
+        options = copilot_options(cfg, str(job.get("approval_mode") or "autopilot"),
+                                  selected_model=str(job.get("copilot_model") or ""),
+                                  selected_effort=str(job.get("copilot_reasoning_effort") or ""))
+        spec = EN.headless_command("copilot", str(binary), job["session_id"], prompt, new, options)
     else:
         binary = str(cfg["claude_bin"])
         spec = EN.headless_command("claude", binary, job["session_id"], prompt, new,
@@ -582,16 +654,16 @@ def send_telegram(cfg: Dict[str, Any], chat_id: Any, text: str) -> None:
 
 # ====================================================================== command language
 
-USAGE = ("Orkestra komutları:\n/yap <proje> <istek> — yeni iş başlat (Claude)\n"
-         "/yap cursor <proje> <istek> — aynı işi Cursor ile (claude yazarsan Claude)\n/durum — işler + canlı durum (hangi iş nerede)\n/iptal — son işi durdur\n"
+USAGE = ("Orkestra komutları:\n/yap <proje> <istek> — yeni iş başlat (varsayılan engine)\n"
+         "/yap claude:|cursor:|copilot: <proje> <istek> — engine'i açıkça seç\n/durum — işler + canlı durum (hangi iş nerede)\n/iptal — son işi durdur\n"
          "Diğer her mesaj, seni bekleyen işe yanıt olarak gider (ör. \"onay\").")
 
 
 def split_engine(cfg: Dict[str, Any], first: str, rest: str):
-    """`/yap cursor <proje> <istek>` (also `cursor:` / `claude`) → (engine | None, project, request).
+    """`/yap <engine> <proje> <istek>` → (engine | None, project, request).
 
-    The first word is an engine only when a project follows it. A project that is itself called "cursor" or
-    "claude" still works: `/yap cursor <istek>` starts it with the default engine unless the next word is a project."""
+    The first word is an engine only when a project follows it. A project named after an engine still works unless
+    the user disambiguates explicitly with `engine:`."""
     word = first.rstrip(":").lower()
     if word not in EN.ENGINES:
         return None, first, rest
@@ -620,7 +692,7 @@ def handle_command(cfg: Dict[str, Any], chat_id: str, text: str) -> str:
     if m:
         engine, project, request = split_engine(cfg, m.group(2), m.group(3))
         if not request:
-            return "Kullanım: /yap [cursor|claude] <proje> <istek>"
+            return USAGE
         try:
             job = start_job(cfg, project, request, chat_id, "telegram", engine)
         except ValueError as exc:
@@ -628,7 +700,7 @@ def handle_command(cfg: Dict[str, Any], chat_id: str, text: str) -> str:
         return (f"Başladım: [{job['project']}] iş {job['id']}" + (f" · {job['engine']}" if job["engine"] != "claude" else "")
                 + ". Soru ya da onay gerektiğinde buraya yazacağım.")
     if re.match(r"^/(yap|run)\b", text):
-        return "Kullanım: /yap [cursor|claude] <proje> <istek>"
+        return USAGE
     if re.match(r"^/durum\b", text):
         jobs = list_jobs(chat_id)[-8:]
         head = ("Bu sohbetin işleri:\n" + "\n".join(

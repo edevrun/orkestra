@@ -18,7 +18,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "lib"))
 
 import dispatch  # noqa: E402
-from orkestra_core import paths, state as ST  # noqa: E402
+from orkestra_core import engines as EN, paths, state as ST  # noqa: E402
 from orkestra_core.util import file_lock, write_json_atomic  # noqa: E402
 
 EVENTS = {
@@ -50,6 +50,10 @@ TOOL_NAMES = {
 AGENT_ROLES = ("scout", "researcher", "architect", "plan-critic", "implementer", "reviewer", "adversary", "verifier")
 RESUME_COMMAND = re.compile(r"^\s*/orkestra(?::|-)resume\b", re.I)
 RUN_MARKER = re.compile(r"(?m)^\[orkestra:(?:bind|unbind)\] project=(.+?) run=(\S+)\s*$")
+
+
+def _copilot_session_id(value: Any) -> str:
+    return EN.session_key("copilot", str(value or ""))
 
 
 def _canonical_agent(value: Any) -> str:
@@ -136,7 +140,7 @@ def _active_role(session_id: str) -> Optional[str]:
 
 
 def _start_subagent(event: Dict[str, Any]) -> Dict[str, Any]:
-    session_id = str(event.get("session_id") or event.get("sessionId") or "")
+    session_id = _copilot_session_id(event.get("session_id") or event.get("sessionId"))
     role = _canonical_agent(event.get("agent_name") or event.get("agentName") or event.get("agent_display_name"))
     cwd = str(event.get("cwd") or os.getcwd())
     project = paths.find_project_root(cwd)
@@ -162,7 +166,7 @@ def _start_subagent(event: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _finish_subagent(event: Dict[str, Any]) -> None:
-    session_id = str(event.get("session_id") or event.get("sessionId") or "")
+    session_id = _copilot_session_id(event.get("session_id") or event.get("sessionId"))
     role = _canonical_agent(event.get("agent_type") or event.get("agent_name") or event.get("agent_display_name"))
     _change_role(session_id, role, -1)
     if session_id:
@@ -219,7 +223,7 @@ def _bind_explicit_resume(event: Dict[str, Any]) -> Optional[str]:
               if row["id"] != ST._safe(session_id) and row["age"] < lease]
     if others:
         return "[orkestra] Another live session is already driving this run. Do not resume here until it is closed."
-    ST.bind_session(session_id, project, run_id, engine="claude")
+    ST.bind_session(session_id, project, run_id, engine="copilot")
     dispatch.activity.record(project, run_id, event, "bind", "explicit Copilot /orkestra:resume")
     return f"[orkestra] Copilot session bound to {run_id} in {project}. Continue only after the CLI resume command succeeds."
 
@@ -248,7 +252,8 @@ def normalize_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
     """Map the documented VS Code-compatible Copilot payload to dispatch.py's Claude shape."""
     normalized = dict(event)
     normalized["hook_event_name"] = EVENTS.get(event_name, event_name)
-    normalized["session_id"] = event.get("session_id") or event.get("sessionId") or ""
+    normalized["session_id"] = _copilot_session_id(event.get("session_id") or event.get("sessionId"))
+    normalized["_engine"] = "copilot"
     normalized["cwd"] = event.get("cwd") or os.getcwd()
     child = ST.child_binding(normalized["session_id"])
     role = _active_role(normalized["session_id"])
@@ -329,7 +334,10 @@ def handle_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
     output: Dict[str, Any] = {}
     try:
         normalized = normalize_event(event_name, event)
-        resume_context = _bind_explicit_resume(normalized) if event_name == "UserPromptSubmit" else None
+        is_explicit_resume = event_name == "UserPromptSubmit" and RESUME_COMMAND.match(
+            str(normalized.get("prompt") or "")
+        )
+        resume_context = _bind_explicit_resume(normalized) if is_explicit_resume else None
         if event_name == "PreToolUse" and normalized.get("agent_type") and not ST.session_binding(normalized["session_id"]):
             return {"permissionDecision": "deny", "permissionDecisionReason":
                     "[orkestra:roles] Copilot subagent has no active run binding; tool call blocked."}

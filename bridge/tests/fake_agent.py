@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -32,14 +33,47 @@ HOOKS = json.loads((Path(os.environ["ORKESTRA_CURSOR_HOME"]) / "hooks.json").rea
 
 def fire(event, **fields):
     """Run the installed hooks for an event the way Cursor does: JSON on stdin, the host's environment (no agent
-    markers), every command of the event. Returns False when one of them refuses."""
+    markers), every command of the event. Returns False when one of them refuses.
+
+    Reparent each hook (double-fork): when this fake runs under an IDE agent shell in CI/tests, a plain
+    subprocess still has the agent wrapper as an ancestor and GUARDED_ORIGIN events (sessionEnd, …) are refused.
+    """
     payload = dict({"conversation_id": sid, "generation_id": sid, "session_id": sid, "hook_event_name": event,
                     "cursor_version": "fake", "workspace_roots": [os.getcwd()], "transcript_path": None}, **fields)
     ok = True
+    drop = ("CURSOR_AGENT", "CURSOR_CONVERSATION_ID", "CURSOR_INVOKED_AS", "CLAUDECODE")
     for entry in HOOKS.get(event, []):
-        cp = subprocess.run(entry["command"], shell=True, input=json.dumps(payload), capture_output=True, text=True)
+        out = Path(os.getcwd()) / f".hook-out-{os.getpid()}-{event}.txt"
         try:
-            ok = ok and json.loads(cp.stdout or "{}").get("permission") != "deny"
+            out.unlink(missing_ok=True)
+        except OSError:
+            pass
+        script = (
+            "import os, subprocess, sys, time\n"
+            f"out, cmd, payload = {str(out)!r}, {entry['command']!r}, {json.dumps(json.dumps(payload))}\n"
+            f"drop = {drop!r}\n"
+            "env = {k: v for k, v in os.environ.items() if k not in drop}\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    if os.fork() == 0:\n"
+            "        cp = subprocess.run(cmd, shell=True, input=payload, capture_output=True, text=True, env=env)\n"
+            "        open(out, 'w', encoding='utf-8').write(cp.stdout or '')\n"
+            "        os._exit(0)\n"
+            "    os._exit(0)\n"
+            "os.wait()\n"
+        )
+        subprocess.run([sys.executable, "-c", script], check=False, timeout=60)
+        for _ in range(200):
+            if out.exists():
+                break
+            time.sleep(0.01)
+        text = out.read_text(encoding="utf-8") if out.exists() else ""
+        try:
+            out.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            ok = ok and json.loads(text or "{}").get("permission") != "deny"
         except ValueError:
             pass
     return ok

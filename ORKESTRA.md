@@ -50,7 +50,7 @@ Sohbet içinde: `/orkestra:run <istek>`, `/orkestra:status`, `/orkestra:resume`,
 `/orkestra:rollback`, `/orkestra:ship` (commit + push; yalnız sen çağırırsın). Cursor'da aynıları tire ile:
 `/orkestra-run` … `/orkestra-ship`.
 
-Terminalde (`python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra …`; kısaltmak için README'deki `alias`):
+Terminalde (`python3 $ORKESTRA_ROOT/plugins/orkestra/bin/orkestra …` veya `./plugins/orkestra/bin/orkestra`; kısaltmak için README'deki `alias`):
 
 | Komut | İş |
 |---|---|
@@ -140,19 +140,22 @@ inceleme dosyalarından hesaplar; oturum kapansa, bağlam sıkışsa ya da yeni 
 
 ## Kapsam
 
-Orkestra yalnız Claude Code oturumlarında çalışır ve tam akış ancak bir run başlatıldığında devreye girer.
+Orkestra, hook'ları etkin Claude Code, Cursor ve GitHub Copilot oturumlarında çalışır; tam akış ancak bir run
+başlatıldığında devreye girer. İlk kurulum: `orkestra setup` (veya `cursor install` / `copilot install`).
 
-- `/orkestra:run` ile ve bridge üzerinden gelen istek: tam akış.
-- Claude Code'da run başlatmadan yazılan istek: yalnız "her oturumda" guard'ları. Plan, onay ve TDD yoktur.
+- `/orkestra:run` (Claude/Copilot) veya `/orkestra-run` (Cursor) ile ve bridge üzerinden gelen istek: tam akış.
+- Run başlatmadan yazılan istek: yalnız "her oturumda" guard'ları. Plan, onay ve TDD yoktur.
 - Açık run varken aynı projede run'a bağlı olmayan ikinci oturum: uyarı alır ama dosyaları değiştirebilir.
-- Cursor'ın kendi ajanı, Codex, Gemini CLI, Copilot, claude.ai sohbeti ve Cowork: kapsam dışı.
+- Hook'suz Copilot oturumu, Cursor'ın Orkestra dışı ajanı, Codex, Gemini CLI, claude.ai sohbeti ve Cowork: kapsam dışı.
+- Bridge (Telegram/n8n/OpenClaw/local workbench) Claude Code, Cursor ve Copilot motorlarını başlatır
+  (`/yap copilot: …`, `POST /runs` with `"engine": "copilot"`).
 
 ## Koordinasyon
 
 Bu klasörü üç agent günceller: orkestra-core (eklenti ve bridge), openclaw-agent (`integrations/openclaw/`),
 ecc-karpathy (`vendor/ecc`, `vendor/karpathy`, isteğe bağlı playbook'lar, bu belge). Kurallar `CONTRIBUTING.md`'de;
 en önemlileri: açık run varken eklenti dosyası değiştirilmez; değişiklikten önce yedek ve md5 alınır, iş ayrı bir
-kopyada yapılıp testler orada koşulur, canlı klasöre tek seferde aktarılır; commit, push ve branch yalnız depo sahibinin açık isteğiyle olur.
+kopyada yapılıp testler orada koşulur, canlı klasöre tek seferde aktarılır; commit, push ve branch yalnız insan kullanıcı / depo sahibinin açık isteğiyle yapılır.
 
 CLI'ye yeni seçenek ya da alt komut eklenirken tek yer `lib/orkestra_core/cliparse.py`'dir: guard'lar komut satırını
 oradaki ayrıştırıcıyla okur.
@@ -162,10 +165,10 @@ oradaki ayrıştırıcıyla okur.
 Test:
 
 ```bash
-cd ~/Projects/orkestra/plugins/orkestra/tests && python3 -m unittest discover -s . -q   # 357 test
-cd ~/Projects/orkestra/bridge/tests && python3 -m unittest discover -s . -q             # 19 test
-cd ~/Projects/orkestra/integrations/openclaw/plugin && npm test                          # 15 test
-python3 ~/Projects/orkestra/plugins/orkestra/bin/orkestra doctor
+cd ./plugins/orkestra/tests && python3 -m unittest discover -s . -q   # 357 test
+cd ./bridge/tests && python3 -m unittest discover -s . -q             # 19 test
+cd ./integrations/openclaw/plugin && npm test                          # 15 test
+python3 ./plugins/orkestra/bin/orkestra doctor
 ```
 
 Eklenti yerinde yüklendiği için kod değişikliği için kurulum gerekmez: hook'lar ve CLI her çağrıda diskteki dosyayı

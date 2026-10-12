@@ -47,6 +47,108 @@ def assert_cpu_under(test, seconds: float, fn, msg: str = ""):
     return result
 
 
+_AGENT_ENV = ("CURSOR_AGENT", "CURSOR_CONVERSATION_ID", "CURSOR_INVOKED_AS", "CLAUDECODE")
+
+
+def run_cursor_hook(event: str, payload_json: str, timeout: float = 60.0,
+                    *, keep_agent_env: bool = False) -> subprocess.CompletedProcess:
+    """Invoke cursor_hook.py as the Cursor host would: not under the agent shell tree.
+
+    When the suite runs inside Cursor's agent shell, a plain subprocess still has an ancestor whose command
+    contains `builtin eval \"$1\" < /dev/null`, so started_by_an_agent_command refuses GUARDED_ORIGIN events.
+    Double-fork reparents the hook away from that tree (CI / a plain terminal needs no reparent; fork still works).
+
+    keep_agent_env=True: leave CURSOR_AGENT / CLAUDECODE markers in the child env (tests for the
+    hooks_carry_agent_env escape hatch). Default strips them so the suite looks like the real host.
+    """
+    env = {k: v for k, v in os.environ.items() if keep_agent_env or k not in _AGENT_ENV}
+    out_path = Path(tempfile.mkdtemp(prefix="orkestra-chook-")) / "out.json"
+    try:
+        script = (
+            "import os, sys, subprocess\n"
+            f"out = {str(out_path)!r}\n"
+            f"event = {event!r}\n"
+            f"hook = {str(CURSOR_HOOK)!r}\n"
+            f"payload = {payload_json!r}\n"
+            "env = dict(os.environ)\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    if os.fork() == 0:\n"
+            "        cp = subprocess.run([sys.executable, hook, event], input=payload,\n"
+            "                            capture_output=True, text=True, env=env)\n"
+            "        body = (cp.stdout if cp.returncode == 0 and cp.stdout.strip() else "
+            "('__ERR__\\n' + str(cp.returncode) + '\\n' + (cp.stderr or '') + '\\n' + (cp.stdout or '')))\n"
+            "        tmp = out + '.tmp'\n"
+            "        with open(tmp, 'w', encoding='utf-8') as fh:\n"
+            "            fh.write(body); fh.flush(); os.fsync(fh.fileno())\n"
+            "        os.replace(tmp, out)\n"
+            "        os._exit(0)\n"
+            "    os._exit(0)\n"
+            "os.wait()\n"
+        )
+        subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=timeout)
+        deadline = time.time() + timeout
+        text = ""
+        while time.time() < deadline:
+            if out_path.exists():
+                text = out_path.read_text(encoding="utf-8")
+                if text.strip():
+                    break
+            time.sleep(0.02)
+        if not text.strip():
+            raise AssertionError(f"cursor hook {event}: no output file")
+        if text.startswith("__ERR__\n"):
+            parts = text.split("\n", 3)
+            code = int(parts[1]) if len(parts) > 1 else 1
+            err = parts[2] if len(parts) > 2 else ""
+            out = parts[3] if len(parts) > 3 else ""
+            return subprocess.CompletedProcess([str(CURSOR_HOOK), event], code, out, err)
+        return subprocess.CompletedProcess([str(CURSOR_HOOK), event], 0, text, "")
+    finally:
+        try:
+            out_path.unlink(missing_ok=True)
+            out_path.parent.rmdir()
+        except OSError:
+            pass
+
+
+def driver_prompt(engine: str, session_id: str, prompt: str, cwd: str):
+    """engines.driver_prompt outside the agent process tree (the API itself refuses under an agent shell)."""
+    env = {k: v for k, v in os.environ.items() if k not in _AGENT_ENV}
+    out_path = Path(tempfile.mkdtemp(prefix="orkestra-drv-")) / "out.txt"
+    try:
+        script = (
+            "import os, sys\n"
+            f"sys.path.insert(0, {str(LIB)!r})\n"
+            f"out = {str(out_path)!r}\n"
+            "if os.fork() == 0:\n"
+            "    os.setsid()\n"
+            "    if os.fork() == 0:\n"
+            "        from orkestra_core import engines\n"
+            f"        r = engines.driver_prompt({engine!r}, {session_id!r}, {prompt!r}, {cwd!r})\n"
+            "        open(out, 'w', encoding='utf-8').write('' if r is None else ('\\0' + r))\n"
+            "        os._exit(0)\n"
+            "    os._exit(0)\n"
+            "os.wait()\n"
+        )
+        subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=60)
+        deadline = time.time() + 60
+        while time.time() < deadline and not out_path.exists():
+            time.sleep(0.02)
+        if not out_path.exists():
+            raise AssertionError("driver_prompt: no output")
+        text = out_path.read_text(encoding="utf-8")
+        if text == "":
+            return None
+        return text[1:] if text.startswith("\0") else text
+    finally:
+        try:
+            out_path.unlink(missing_ok=True)
+            out_path.parent.rmdir()
+        except OSError:
+            pass
+
+
 class Sandbox(unittest.TestCase):
     """Isolated ORKESTRA_HOME + workspace + a git project with a tiny passing test gate."""
 

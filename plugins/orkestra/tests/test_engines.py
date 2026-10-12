@@ -6,6 +6,7 @@ conversation of its own, a follow-up runs under a new generation id.
 """
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -33,6 +34,7 @@ class TestEngineUnits(unittest.TestCase):
     def test_names_and_session_keys(self):
         self.assertEqual(EN.normalize(None), "claude")
         self.assertEqual(EN.normalize(" Cursor "), "cursor")
+        self.assertEqual(EN.normalize(" Copilot "), "copilot")
         self.assertRaises(EN.EngineError, EN.normalize, "gemini")
         self.assertEqual(EN.default_engine({}), "claude")
         self.assertEqual(EN.default_engine({"engine": {"default": "cursor"}}), "cursor")
@@ -40,15 +42,19 @@ class TestEngineUnits(unittest.TestCase):
         self.assertEqual(EN.session_key("claude", "abc"), "abc")
         self.assertEqual(EN.session_key("cursor", "abc"), "cursor-abc")
         self.assertEqual(EN.session_key("cursor", "cursor-abc"), "cursor-abc")
+        self.assertEqual(EN.session_key("copilot", "abc"), "copilot-abc")
         self.assertEqual(EN.raw_session_id("cursor-abc"), "abc")
+        self.assertEqual(EN.raw_session_id("copilot-abc"), "abc")
         self.assertEqual(EN.raw_session_id("abc"), "abc")
         self.assertEqual(EN.session_engine("cursor-abc"), "cursor")
+        self.assertEqual(EN.session_engine("copilot-abc"), "copilot")
         self.assertEqual(EN.session_engine("abc"), "claude")
 
     def test_environment_tells_which_agent_is_asking(self):
         self.assertIsNone(EN.detect_env({}))
         self.assertEqual(EN.detect_env({"CLAUDECODE": "1"}), "claude")
         self.assertEqual(EN.detect_env({"CURSOR_AGENT": "1", "CURSOR_CONVERSATION_ID": "c"}), "cursor")
+        self.assertEqual(EN.detect_env({"ORKESTRA_ENGINE": "copilot"}), "copilot")
         self.assertEqual(EN.env_session_id({"CURSOR_AGENT": "1", "CURSOR_CONVERSATION_ID": "c"}), "c")
         self.assertEqual(EN.env_session_id({"CLAUDECODE": "1"}), "")
 
@@ -67,6 +73,36 @@ class TestEngineUnits(unittest.TestCase):
                                         "--resume", "C1", "--model", "gpt-x", "do it"])
         self.assertIsNone(spec["stdin"])                        # the prompt is the last argument, never stdin
         self.assertNotIn("--model", EN.headless_command("cursor", "/bin/agent", "C1", "p", False, {})["argv"])
+
+    def test_copilot_model_and_effort_from_request_text(self):
+        self.assertEqual(EN.copilot_model_for_request("use gpt-6-astra with reasoning effort high"), "gpt-6-astra")
+        self.assertEqual(EN.copilot_effort_for_request("use gpt-6-astra with reasoning effort high"), "high")
+        self.assertEqual(EN.copilot_model_for_request("no model here"), "gpt-6-luna")
+        self.assertEqual(EN.copilot_effort_for_request("no effort here"), "max")
+        self.assertEqual(EN.copilot_model_for_request("use gpt-6-luna and gpt-6-astra"), "gpt-6-luna")  # ambiguous
+
+    def test_copilot_command_line_uses_the_requested_model_and_autopilot_policy(self):
+        opts = {"model": "gpt-6-luna", "reasoning_effort": "max", "plugin_dir": "/plugins/orkestra",
+                "approval_mode": "autopilot", "max_autopilot_continues": 7}
+        spec = EN.headless_command("copilot", "/bin/copilot", "copilot-S1", "do it", True, opts)
+        self.assertEqual(spec["argv"], ["/bin/copilot", "-p", "--output-format", "json", "--allow-all-tools",
+                                        "--autopilot", "--no-ask-user", "--model", "gpt-6-luna",
+                                        "--reasoning-effort", "max", "--max-autopilot-continues", "7",
+                                        "--plugin-dir", "/plugins/orkestra", "--session-id", "S1", "do it"])
+        self.assertIsNone(spec["stdin"])
+        manual = EN.headless_command("copilot", "/bin/copilot", "copilot-S1", "p", False,
+                                     dict(opts, approval_mode="manual"))["argv"]
+        self.assertNotIn("--autopilot", manual)
+        self.assertNotIn("--no-ask-user", manual)
+        self.assertIn("--resume", manual)
+
+    def test_copilot_interactive_command_has_autopilot_model_and_effort(self):
+        argv = EN.interactive_command("copilot", "/bin/copilot", "start", {
+            "model": "gpt-6-luna", "reasoning_effort": "max", "plugin_dir": "/plugins/orkestra",
+            "approval_mode": "autopilot",
+        })
+        self.assertEqual(argv, ["/bin/copilot", "-i", "start", "--allow-all-tools", "--autopilot", "--no-ask-user",
+                                "--model", "gpt-6-luna", "--reasoning-effort", "max", "--plugin-dir", "/plugins/orkestra"])
 
     def test_prompts(self):
         self.assertEqual(EN.run_prompt("claude", "x yap"), "/orkestra:run x yap")
@@ -130,6 +166,19 @@ class TestBinaries(helpers.Sandbox):
         self.assertRaises(EN.EngineError, EN.new_session, "cursor", str(bad), str(self.tmp))
         self.assertRaises(EN.EngineError, EN.new_session, "cursor", str(self.tmp / "missing"), str(self.tmp))
 
+    def test_copilot_hooks_must_cover_prompt_and_tool_guards(self):
+        plugin = self.tmp / "plugins" / "orkestra"
+        hooks_path = plugin / "com.github.copilot" / "hooks" / "hooks.json"
+        hooks_path.parent.mkdir(parents=True)
+        hooks = {event: [{"command": f"python copilot_hook.py {event}"}]
+                 for event in ("UserPromptSubmit", "PreToolUse", "PostToolUse")}
+        hooks_path.write_text(json.dumps({"hooks": hooks}))
+        self.assertTrue(EN.copilot_hooks_active(str(plugin)))
+
+        hooks.pop("PreToolUse")
+        hooks_path.write_text(json.dumps({"hooks": hooks}))
+        self.assertFalse(EN.copilot_hooks_active(str(plugin)))
+
 
 class CursorBase(FlowBase):
     """A run driven from a Cursor conversation; hook events go through hooks/cursor_hook.py."""
@@ -142,14 +191,13 @@ class CursorBase(FlowBase):
         self.conv, self.sid = conv, "cursor-" + conv
         self.shell_env = {"CURSOR_AGENT": "1", "CURSOR_CONVERSATION_ID": conv, "CURSOR_INVOKED_AS": "agent"}
 
-    def chook(self, event, conv=None, gen="gen-1", **kw):
+    def chook(self, event, conv=None, gen="gen-1", *, keep_agent_env=False, **kw):
         conv = conv or self.conv
         payload = {"conversation_id": conv, "generation_id": gen, "model": "default", "session_id": conv,
                    "hook_event_name": event, "cursor_version": "2026.10.01-14929f9",
                    "workspace_roots": [str(self.proj)], "user_email": "user@example.com", "transcript_path": None}
         payload.update(kw)
-        cp = subprocess.run([sys.executable, str(helpers.CURSOR_HOOK), event], input=json.dumps(payload),
-                            capture_output=True, text=True, env=dict(os.environ))
+        cp = helpers.run_cursor_hook(event, json.dumps(payload), keep_agent_env=keep_agent_env)
         self.assertEqual(cp.returncode, 0, cp.stderr)
         self.assertTrue(cp.stdout.strip(), "Cursor needs a JSON answer for every hook")
         return json.loads(cp.stdout)
@@ -178,6 +226,7 @@ class CursorBase(FlowBase):
         self.assertEqual(self.shell(f'orkestra start -p demo --title "{title}" --request "sub fonksiyonu ekle" --size S'),
                          {"permission": "allow"})   # the preToolUse hook sees the command before it runs
         out = self.cli("start", "-p", "demo", "--title", title, "--request", "sub fonksiyonu ekle", "--size", "S",
+                   "--approval-mode", "manual",
                        env=self.shell_env).stdout
         self.rid = out.split("run=")[-1].split()[0]
         self.fdir = self.proj / ".orkestra" / "features" / self.rid
@@ -204,7 +253,7 @@ class TestCursorSession(CursorBase):
         self.assertEqual((b["run_id"], b["engine"]), (self.rid, "cursor"))
         self.assertEqual(self.state()["engine"], "cursor")
         self.assertIn("- motor: cursor", (self.fdir / "request.md").read_text())
-        self.assertIn("engine cursor", self.cli("status", "-p", "demo").stdout)
+        self.assertEqual(json.loads(self.cli("status", "--json", "-p", "demo").stdout)["engine"], "cursor")
         # a Claude Code session id can never collide with it (no binding under the bare id)
         self.assertFalse((self.home / "sessions" / f"{CONV}.json").exists())
 
@@ -301,20 +350,20 @@ class TestCursorSession(CursorBase):
         commit = "git add -A && git commit -m wip"
         # `agent -p`: no prompt hook, generation id == conversation id on every turn
         self.assertTrue(self.no(self.shell(commit, gen=CONV)))
-        ctx = EN.driver_prompt("cursor", CONV, "commitle", str(self.proj))
+        ctx = helpers.driver_prompt("cursor", CONV, "commitle", str(self.proj))
         self.assertEqual(ctx, "")
         self.assertEqual(self.shell(commit, gen=CONV), {"permission": "allow"})
         self.assertEqual(self.chook("sessionEnd", gen=CONV, reason="completed", final_status="completed"), {})
         self.assertTrue(self.no(self.shell(commit, gen=CONV)))                          # a hand-started later turn
-        EN.driver_prompt("cursor", "cursor-" + CONV, "/orkestra-resume demo", str(self.proj))
+        helpers.driver_prompt("cursor", "cursor-" + CONV, "/orkestra-resume demo", str(self.proj))
         self.assertTrue(self.no(self.shell(commit, gen=CONV)))                          # an automatic turn asks nothing
-        EN.driver_prompt("claude", CONV, "commitle", str(self.proj))                    # no-op for claude
+        helpers.driver_prompt("claude", CONV, "commitle", str(self.proj))               # no-op for claude
         self.assertTrue(self.no(self.shell(commit, gen=CONV)))
 
     def test_driver_gets_the_approval_note_for_its_prompt(self):
         self.start()
         self.advance_to_approve()
-        ctx = EN.driver_prompt("cursor", CONV, "onaylıyorum", str(self.proj))
+        ctx = helpers.driver_prompt("cursor", CONV, "onaylıyorum", str(self.proj))
         self.assertIn("APPROVED", ctx)
         self.assertIn("orkestra phase next", ctx)
         self.assertNotIn("additional_context", self.after("Shell", {"command": "ls", "cwd": ""}, {"output": "", "exitCode": 0},
@@ -324,6 +373,7 @@ class TestCursorSession(CursorBase):
     def test_stop_becomes_a_followup_at_most_twice_per_prompt(self):
         self.start()
         self.say("devam", gen="g1")
+        self.shell("ls", gen="g1")                                                      # this turn must drive the run
         out = self.chook("stop", gen="g1", status="completed", loop_count=0)
         self.assertIn("still in phase", out["followup_message"])
         self.assertNotIn("/orkestra:", out["followup_message"])
@@ -334,10 +384,32 @@ class TestCursorSession(CursorBase):
         self.shell("ls", gen="g3")
         self.assertEqual(self.chook("stop", gen="g3", status="completed", loop_count=2), {})   # limit: the turn may end
         self.say("devam et", gen="g4")                                                  # a new prompt, a new budget
+        self.shell("ls", gen="g4")
         self.assertIn("followup_message", self.chook("stop", gen="g4", status="completed", loop_count=0))
         for status in ("aborted", "error"):
             self.say("x", gen="g5")
             self.assertEqual(self.chook("stop", gen="g5", status=status, loop_count=0), {})    # never push those on
+
+    def test_stop_no_followup_when_transcript_last_human_is_off_topic(self):
+        """Cursor Stop follow-ups skip beforeSubmitPrompt — transcript off-topic must unbind, no nudge."""
+        self.start()
+        self.say("devam", gen="g-drive")
+        self.shell("ls", gen="g-drive")
+        self.assertTrue((self.home / "sessions" / f"{self.sid}.json").exists())
+        root = self.tmp / "cursor-home" / "projects" / "tmp-demo" / "agent-transcripts"
+        tp = root / CONV / f"{CONV}.jsonl"
+        tp.parent.mkdir(parents=True, exist_ok=True)
+        tp.write_text(
+            json.dumps({"role": "user", "message": {"content": [
+                {"type": "text", "text": "<user_query>\ndevam\n</user_query>"}]}}) + "\n"
+            + json.dumps({"role": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}}) + "\n"
+            + json.dumps({"role": "user", "message": {"content": [
+                {"type": "text", "text":
+                 "<user_query>\nprepare orkestra for public github, scrub local paths\n</user_query>"}]}}) + "\n",
+            encoding="utf-8")
+        out = self.chook("stop", gen="g-off", status="completed", loop_count=0, transcript_path=str(tp))
+        self.assertEqual(out, {})
+        self.assertFalse((self.home / "sessions" / f"{self.sid}.json").exists())
 
     def test_session_start_tells_a_chat_about_the_run(self):
         out = self.chook("sessionStart", gen=CONV, is_background_agent=False)
@@ -511,8 +583,8 @@ class TestRecordedCursorRun(CursorBase):
 
     def send(self, name, **over):
         data = self.fx(name, **over)
-        cp = subprocess.run([sys.executable, str(helpers.CURSOR_HOOK), data["hook_event_name"]], input=json.dumps(data),
-                            capture_output=True, text=True, env=dict(os.environ))
+        # Host-like origin (double-fork): under Cursor's agent shell a plain subprocess is refused.
+        cp = helpers.run_cursor_hook(data["hook_event_name"], json.dumps(data))
         self.assertEqual(cp.returncode, 0, cp.stderr)
         return json.loads(cp.stdout)
 
@@ -545,7 +617,8 @@ class TestRecordedCursorRun(CursorBase):
         main = self.fx("print_pre_task")["conversation_id"]
         child = self.fx("child_pre_write")["conversation_id"]
         self.use(main)
-        out = self.cli("start", "-p", "demo", "--title", "Add sub function", "--request", "sub ekle", "--size", "XS").stdout
+        out = self.cli("start", "-p", "demo", "--title", "Add sub function", "--request", "sub ekle",
+                       "--size", "XS", "--approval-mode", "manual").stdout
         self.rid = out.split("run=")[-1].split()[0]
         self.assertEqual(self.rid, "001-add-sub-function")                      # the recorded bind line names this run
         self.fdir = self.proj / ".orkestra" / "features" / self.rid
@@ -555,7 +628,7 @@ class TestRecordedCursorRun(CursorBase):
         self.assertEqual((b["run_id"], b["engine"]), (self.rid, "cursor"))
         self.advance_to_approve()
         self.assertTrue(self.no(self.send("child_pre_write", conversation_id=main, session_id=main)))    # not approved yet
-        self.assertIn("APPROVED", EN.driver_prompt("cursor", main, "onay", str(self.proj)))
+        self.assertIn("APPROVED", helpers.driver_prompt("cursor", main, "onay", str(self.proj)))
         self.phase_next()
         self.assertEqual(self.send("print_pre_task"), {"permission": "allow"})
         # the subagent's first batch of calls arrives before its transcript exists
@@ -828,6 +901,64 @@ class TestCursorKit(helpers.Sandbox):
         self.assertNotIn("$ARGUMENTS", skill)
         self.assertIn('`subagent_type: "orkestra-<name>"`', skill)
         self.assertIn("A subagent `orkestra:<name>` is the Cursor subagent `orkestra-<name>`", skill)
+        # FR-008: onboard skill heads + cursor build mention setup / copilot install
+        onboard = (CK.ASSETS / "skills" / "orkestra-onboard" / "SKILL.md").read_text()
+        self.assertIn("name: orkestra-onboard", onboard.split("---")[1])
+        self.assertRegex(onboard, r"\bsetup\b")
+        self.assertIn("copilot install", onboard)
+        # FR-008: ORKESTRA.md Kapsam — Copilot engine in scope (bridge-Copilot may stay out)
+        kaps = (helpers.PLUGIN.parent.parent / "ORKESTRA.md").read_text()
+        section = kaps.split("## Kapsam", 1)[1].split("## ", 1)[0]
+        self.assertNotIn("Copilot, claude.ai", section)  # old bundled "out of scope" list
+        self.assertRegex(section, r"\bsetup\b")
+        self.assertIn("copilot install", section)
+
+    def test_ensure_path_shim_creates_fixes_dangling_and_noops(self):
+        """FR-001 / E1–E3 / SC-001: ensure_path_shim is the single PATH shim API; install uses it."""
+        from orkestra_core import cursorkit as CK
+        import inspect
+        path_no_orkestra = os.pathsep.join([str(self.shim), "/usr/bin", "/bin", str(Path(sys.executable).parent)])
+        os.environ["PATH"] = path_no_orkestra
+        self.assertIsNone(shutil.which("orkestra"))
+
+        # SC-001 / happy: shim dir on PATH, no orkestra → symlink to BIN
+        done = CK.ensure_path_shim()
+        self.assertTrue((self.shim / "orkestra").is_symlink())
+        self.assertEqual(os.path.realpath(self.shim / "orkestra"), os.path.realpath(helpers.BIN))
+        self.assertTrue(any("link" in a and str(helpers.BIN) in a for a in done))
+        # second call is harmless (idempotent)
+        self.assertEqual(CK.ensure_path_shim(), [])
+
+        # E2: dangling symlink is renewed
+        (self.shim / "orkestra").unlink()
+        os.symlink(self.tmp / "gone" / "orkestra", self.shim / "orkestra")
+        self.assertTrue((self.shim / "orkestra").is_symlink())
+        self.assertFalse((self.shim / "orkestra").exists())
+        fixed = CK.ensure_path_shim()
+        self.assertEqual(os.path.realpath(self.shim / "orkestra"), os.path.realpath(helpers.BIN))
+        self.assertTrue(any("link" in a for a in fixed))
+
+        # E1: parent missing → no-op, no crash
+        missing_parent = self.tmp / "no-parent-dir" / "bin"
+        os.environ["ORKESTRA_SHIM_DIR"] = str(missing_parent)
+        self.assertFalse(missing_parent.exists())
+        self.assertEqual(CK.ensure_path_shim(), [])
+        self.assertFalse((missing_parent / "orkestra").exists())
+        os.environ["ORKESTRA_SHIM_DIR"] = str(self.shim)
+
+        # E3: orkestra already on PATH → new link not required
+        other = self.tmp / "other-bin"
+        other.mkdir()
+        target = other / "orkestra"
+        os.symlink(helpers.BIN, target)
+        os.environ["PATH"] = os.pathsep.join([str(other), path_no_orkestra])
+        (self.shim / "orkestra").unlink(missing_ok=True)
+        self.assertIsNotNone(shutil.which("orkestra"))
+        self.assertEqual(CK.ensure_path_shim(), [])
+        self.assertFalse(os.path.lexists(self.shim / "orkestra"))
+
+        # install uses the same API
+        self.assertIn("ensure_path_shim", inspect.getsource(CK.install))
 
     def test_install_keeps_the_users_own_hooks_and_is_idempotent(self):
         mine = {"version": 1, "hooks": {
@@ -934,6 +1065,123 @@ class TestCursorKit(helpers.Sandbox):
         self.assertNotEqual(cp.returncode, 0)
         self.assertIn("[!!] hooks.json entries — 0/8 events", cp.stdout)
         self.assertIn("[OK] generated assets current", cp.stdout)
+
+
+class TestCopilotKit(helpers.Sandbox):
+    """FR-003 / SC-002 / E3 / E4: materialize Copilot hooks under $COPILOT_HOME/plugins/orkestra."""
+
+    def setUp(self):
+        super().setUp()
+        self.cophome = self.tmp / "copilot-home"
+        self._copilot_home = os.environ.get("COPILOT_HOME")
+        os.environ["COPILOT_HOME"] = str(self.cophome)
+
+    def tearDown(self):
+        if self._copilot_home is None:
+            os.environ.pop("COPILOT_HOME", None)
+        else:
+            os.environ["COPILOT_HOME"] = self._copilot_home
+        super().tearDown()
+
+    def hooks_path(self) -> Path:
+        return self.cophome / "plugins" / "orkestra" / "com.github.copilot" / "hooks" / "hooks.json"
+
+    def test_install_activates_hooks_idempotent_dry_run_and_uninstall(self):
+        from orkestra_core import copilotkit as CK
+
+        mine = {"version": 1, "hooks": {
+            "UserPromptSubmit": [{"command": "./hooks/other.py"}],
+            "SessionStart": [{"command": "echo keep"}],
+        }, "extra": {"keep": 1}}
+        self.hooks_path().parent.mkdir(parents=True)
+        self.hooks_path().write_text(json.dumps(mine))
+
+        dry = CK.install(dry=True)
+        self.assertTrue(dry)
+        self.assertEqual(json.loads(self.hooks_path().read_text()), mine)
+
+        rows = CK.status()
+        labels = {label: ok for ok, label, _ in rows}
+        self.assertFalse(labels.get("copilot hooks"))
+
+        actions = CK.install()
+        self.assertTrue(actions)
+        plugin = EN.copilot_plugin_dir()
+        self.assertTrue(plugin)
+        self.assertTrue(EN.copilot_hooks_active(plugin))
+        self.assertTrue(CK.hooks_active())
+        doc = json.loads(self.hooks_path().read_text())
+        self.assertEqual(doc["extra"], {"keep": 1})
+        self.assertEqual(doc["hooks"]["UserPromptSubmit"][0], mine["hooks"]["UserPromptSubmit"][0])
+        self.assertEqual(doc["hooks"]["SessionStart"][0], mine["hooks"]["SessionStart"][0])
+        for event in ("UserPromptSubmit", "PreToolUse", "PostToolUse"):
+            ours = [e for e in doc["hooks"][event] if "copilot_hook.py" in e["command"]]
+            self.assertEqual(len(ours), 1, event)
+            self.assertTrue(ours[0]["command"].endswith(event))
+            self.assertEqual(doc["hooks"][event][-1], ours[0])
+        backups = list(self.hooks_path().parent.glob("hooks.json.orkestra-backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(json.loads(backups[0].read_text()), mine)
+
+        again = CK.install()
+        self.assertEqual(again, [])
+        self.assertEqual(len(list(self.hooks_path().parent.glob("hooks.json.orkestra-backup-*"))), 1)
+        self.assertTrue(EN.copilot_hooks_active(EN.copilot_plugin_dir()))
+
+        rows = CK.status()
+        labels = {label: ok for ok, label, _ in rows}
+        self.assertTrue(labels.get("copilot hooks"))
+
+        CK.uninstall()
+        doc = json.loads(self.hooks_path().read_text())
+        self.assertEqual(doc["hooks"], mine["hooks"])
+        self.assertEqual(doc["extra"], {"keep": 1})
+        self.assertFalse(EN.copilot_hooks_active(EN.copilot_plugin_dir()))
+        self.assertFalse(CK.hooks_active())
+
+    def test_broken_hooks_json_is_not_touched(self):
+        from orkestra_core import copilotkit as CK
+
+        self.hooks_path().parent.mkdir(parents=True)
+        self.hooks_path().write_text("{ not json")
+        before = self.hooks_path().read_bytes()
+        with self.assertRaises(EN.EngineError):
+            CK.install(dry=True)
+        self.assertEqual(self.hooks_path().read_bytes(), before)
+        with self.assertRaises(EN.EngineError):
+            CK.install()
+        self.assertEqual(self.hooks_path().read_bytes(), before)
+
+    def test_cli_install_and_asker_refusal(self):
+        """FR-003 / E5: terminal install|status|uninstall; agent shell must refuse."""
+        from orkestra_core import cliparse as CP
+        from orkestra_core import copilotkit as CK
+        from orkestra_core import cli as CLI
+
+        self.assertIn("copilot", CP.SUB_ACTION)
+        self.assertIs(CLI.HANDLERS.get("copilot"), CLI.cmd_copilot)
+
+        missing = self.cli("copilot", "status", check=False)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("[!!] copilot hooks", missing.stdout)
+
+        out = self.cli("copilot", "install").stdout
+        self.assertIn("copilot", out.lower())
+        self.assertTrue(EN.copilot_hooks_active(EN.copilot_plugin_dir()))
+        self.assertTrue(CK.hooks_active())
+
+        ok = all(good is not False for good, _, _ in CK.status())
+        status = self.cli("copilot", "status", check=False)
+        self.assertEqual(status.returncode, 0 if ok else 1)
+        self.assertIn("[OK] copilot hooks", status.stdout)
+
+        self.cli("copilot", "uninstall")
+        self.assertFalse(CK.hooks_active())
+
+        refused = self.cli("copilot", "install", check=False, env={"ORKESTRA_ENGINE": "copilot"})
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("terminal", (refused.stderr + refused.stdout).lower())
+        self.assertFalse(CK.hooks_active())
 
 
 FAKE_AGENT = """#!/usr/bin/env python3

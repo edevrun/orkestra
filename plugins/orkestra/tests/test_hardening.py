@@ -163,6 +163,7 @@ class TestCliOptionParsing(unittest.TestCase):
             (["tdd", "green", "T001", "--why", "x", "-p", "demo", "--", "npm", "test"], ("tdd", ["npm", "test"])),
             (["evidence", "smoke", "touch", "A", "--"], ("evidence", ["touch", "A"])),
             (["evidence", "x", "--help"], ("evidence", ["--help"])),                # in the REMAINDER it is the command
+            (["copilot", "install"], ("copilot:install", [])),
         ]
         for argv, want in table:
             self.assertEqual(CP.inspect(argv)[:2], want, argv)

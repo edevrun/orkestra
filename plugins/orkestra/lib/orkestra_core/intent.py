@@ -148,6 +148,27 @@ _APPROVE_QUESTION = re.compile(
 
 _EXPLICIT_REJECT = re.compile(r"(onaylamıyorum|onay\s+vermiyorum|reddet\w*|\bhayır\b|\biptal\b|vazgeç\w*|değiştir\w*|"
                               r"revize|düzelt\w*|\bçıkar\w*|\bekle(?!me)\w*\s|\breject\w*|\bcancel\w*|\bchange\w*|\bama\b|\bbut\b)", re.I)
+_MANUAL_APPROVAL_REQUEST = re.compile(
+    r"\b(?:ben\s+karar\s+verici(?:\s+ol(?:ayım|malıyım|mak\s+istiyorum))?|"
+    r"karar(?:ı|ları)\s+ben\s+ver(?:eyim|meliyim|mek\s+istiyorum)|"
+    r"(?:onayı|onayları|onay)\s+bana\s+sor\w*|bana\s+onay\s+sor\w*|benden\s+onay\s+al\w*|"
+    r"i\s+want\s+to\s+(?:decide|approve|be\s+the\s+decision\s+maker)|"
+    r"let\s+me\s+(?:decide|approve)|ask\s+me\s+for\s+approval)\b",
+    re.I,
+)
+_MANUAL_APPROVAL_NEGATION = re.compile(
+    r"\b(?:don'?t|do\s+not|never|no\s+need\s+to)\b.{0,60}\b(?:ask|approval|approve|decide)\w*|"
+    r"\b(?:sorma|sormana\s+gerek\s+yok|onay\s+bekleme|onay\s+isteme)\b|"
+    r"\b(?:unless|if|when|whenever|only\s+if|eğer|şayet|kullanıcı\s+isterse|"
+    r"user\s+(?:wants|asks|says))\b.{0,100}\b(?:ben|bana|me|let\s+me|karar|onay|approve)\b",
+    re.I,
+)
+
+
+def manual_approval_requested(prompt: str) -> bool:
+    """Whether the user clearly asks to retain the plan-approval decision."""
+    text = norm_lower(prompt or "")
+    return bool(_MANUAL_APPROVAL_REQUEST.search(text)) and not bool(_MANUAL_APPROVAL_NEGATION.search(text))
 
 
 def approval(prompt: str) -> Optional[str]:
@@ -179,3 +200,193 @@ def approval_answer(answer: str) -> Optional[str]:
     if _APPROVE_EXACT.match(a) and not _NEG_HINT.search(a):
         return "approve"
     return "reject"
+
+
+# --- run size (XS/S finish fast; M/L keep the full pipeline) -----------------
+
+SIZES = ("XS", "S", "M", "L")
+
+_EXPLICIT_SIZE = re.compile(
+    r"(?:(?:--)?size|boyut)\s*[:=]?\s*(XS|S|M|L)\b|\b(XS|S|M|L)\s*(?:boyut|size)\b",
+    re.I,
+)
+_L_SIZE = re.compile(
+    r"\b(migrat(?:e|ion|ing)?|bulk|çoklu\s+platform|multi[- ]?platform|"
+    r"tüm\s+(sistem|uygulama|proje|kod|modül)|rewrite\s+the\s+whole|"
+    r"büyük\s+(iş|özellik|refactor|değişiklik)|end[- ]to[- ]end|"
+    r"across\s+(all|every)|her\s+(platform|ekran|modül)|"
+    r"full\s+rewrite|kapsamlı\s+refactor)\b",
+    re.I,
+)
+_RISK_FLOOR_M = re.compile(
+    r"\b(auth(?:entication|orization)?|oauth|payment|billing|stripe|revenuecat|"
+    r"deploy|store\s+submit|testflight|play\s+console|schema\s+change|"
+    r"security|kvkk|gdpr|credential|secret|encryption|rls|"
+    r"permission|pci|hipaa)\b",
+    re.I,
+)
+_XS_SIZE = re.compile(
+    r"\b(typo|yazım\s*hatası|rename|yeniden\s*adlandır|one[- ]line|tek\s*satır|"
+    r"trivial|çok\s*basit|çok\s*küçük|minik|nit\b|cosmetic|"
+    r"fix\s+the\s+typo|sadece\s+(şunu|bunu)\s+değiştir|"
+    r"tek\s+kelime|one\s+word)\b",
+    re.I,
+)
+_S_SIZE = re.compile(
+    r"\b(küçük|basit|small\s+(fix|change|bug|tweak)|bug\s*fix|hotfix|"
+    r"bir\s+dosya|tek\s+dosya|few\s+files|birkaç\s+dosya|"
+    r"add\s+(a\s+)?(test|helper|function|method)|"
+    r"(fonksiyon|function|metod|method)\s+ekle|"
+    r"sub\s+fonksiyonu|düzelt(?:me)?\b|fix\s+(this|the|a)\b)\b",
+    re.I,
+)
+_M_SIZE = re.compile(
+    r"\b(feature|özellik|ekran|screen|endpoint|api\s+ekle|yeni\s+(modül|ekran|sayfa)|"
+    r"refactor\b|yeniden\s+yapılandır|dark\s+mode|yeni\s+özellik)\b",
+    re.I,
+)
+
+
+def skips_plan_critic(size: str) -> bool:
+    """XS/S: no opus plan-critic round — plan check + final review still apply."""
+    return (size or "") in ("XS", "S")
+
+
+def skips_adversary(size: str) -> bool:
+    """XS/S: final reviewer only; adversary is reserved for M/L."""
+    return (size or "") in ("XS", "S")
+
+
+def min_context_chars(size: str) -> int:
+    """Discovery note floor: XS can be a short self-written note."""
+    return 80 if (size or "") == "XS" else 200
+
+
+def infer_size(request: str) -> str:
+    """Pick XS/S/M/L from the user's request text. Prefer smaller when clearly safe; floor at M on risk.
+
+    Explicit `--size` / `boyut: S` in the text wins. Unclear feature work stays M (full pipeline).
+    """
+    text = (request or "").strip()
+    if not text:
+        return "M"
+    m = _EXPLICIT_SIZE.search(text)
+    if m:
+        return (m.group(1) or m.group(2) or "M").upper()
+    low = norm_lower(text)
+    n = len(low)
+    if _L_SIZE.search(low):
+        return "L"
+    if _RISK_FLOOR_M.search(low):
+        return "M"
+    if _XS_SIZE.search(low) and n < 220:
+        return "XS"
+    if _M_SIZE.search(low) or n > 480:
+        return "M"
+    if _S_SIZE.search(low) or n < 140:
+        return "S"
+    return "M"
+
+
+_CONTINUE_INTENT = re.compile(
+    r"(?:"
+    r"\bdevam(?:\s*et\w*|\s*edelim)?\b|"
+    r"\bcontinue\b|\bresume\b|"
+    r"/orkestra[-:]?resume\b|"
+    r"\b(?:sonraki|next)\s+(?:g[oö]rev|task|ad[iı]m|step)\b|"
+    r"\borkestra\s+(?:next|status)\b|"
+    r"\b(?:durum(?:\s+ne)?|status|ne\s+oluyor)\b|"
+    r"\bkald[iı][gğ][iı]n\s+yerden\b|"
+    r"\bT\d{3}\b"
+    r")",
+    re.I,
+)
+# In-run operational asks (tests/gates/git/skills) keep the bind; they are not a new feature request.
+_RUN_OPS_INTENT = re.compile(
+    r"(?:"
+    r"\b(?:test(?:ler(?:i)?)?|tests|gate|kapı|build|lint|typecheck|verify|coverage)\b|"
+    r"\b(?:çalıştır|koş(?:tur)?|run\s+(?:the\s+)?tests?|run\s+(?:the\s+)?gate)\b|"
+    r"\b(?:commitle|pushla|commit\s+et|push\s+et)\b|"
+    r"/orkestra[-:]?\w+|"
+    r"^\s*(?:uygula|apply)\b"
+    r")",
+    re.I,
+)
+
+
+def _mentions_bound_project(text: str, project, run_id: str = "", title: str = "") -> bool:
+    from pathlib import Path as _Path
+    project = _Path(project)
+    pname = project.name.lower()
+    if pname and re.search(rf"(?<![a-z0-9_-]){re.escape(pname)}(?![a-z0-9_-])", text):
+        return True
+    rid = str(run_id or "").lower()
+    if rid and re.search(rf"(?<![a-z0-9_-]){re.escape(rid)}(?![a-z0-9_-])", text):
+        return True
+    try:
+        if str(project.resolve(strict=False)).lower() in text:
+            return True
+    except Exception:
+        pass
+    for w in re.findall(r"[a-z0-9_-]{4,}", norm_lower(title or "")):
+        if w in ("feature", "implement", "fix", "bug", "with", "from", "that", "this", "have", "into"):
+            continue
+        if re.search(rf"(?<![a-z0-9_-]){re.escape(w)}(?![a-z0-9_-])", text):
+            return True
+    return False
+
+
+def _mentions_other_workspace_project(text: str, project) -> bool:
+    from pathlib import Path as _Path
+    project = _Path(project)
+    pname = project.name.lower()
+    try:
+        from . import paths as _paths
+        root = _paths.workspace_root()
+    except Exception:
+        return False
+    if not root.is_dir():
+        return False
+    for p in root.iterdir():
+        if not p.is_dir() or p.name.startswith("."):
+            continue
+        n = p.name.lower()
+        if n == pname or len(n) < 3:
+            continue
+        if re.search(rf"(?<![a-z0-9_-]){re.escape(n)}(?![a-z0-9_-])", text):
+            return True
+    return False
+
+
+def off_topic_vs_project(prompt: str, project, run_id: str = "", title: str = "") -> bool:
+    """True when the user's message is not about the bound run (another project, or no bound cue).
+
+    On-topic: names the bound project / run_id / path / title keywords, or an explicit continue
+    (devam/continue/resume/orkestra-resume/next task/T0xx) or plan approval wording.
+    Off-topic: names a different workspace project, OR (v1) has none of the on-topic cues — so
+    "make this dashboard friendlier" while still bound does not keep Stop driving the old run.
+    """
+    from pathlib import Path as _Path
+    project = _Path(project)
+    text = norm_lower(prompt or "")
+    if not text.strip():
+        return False
+    if _mentions_bound_project(text, project, run_id, title):
+        return False
+    if _CONTINUE_INTENT.search(text):
+        return False
+    # Git permission / run-ops lines ("şimdi commit et", "testleri çalıştır") are about the
+    # bound run — unbinding would drop the grant and open a hole in the quiet path.
+    if git_grants(prompt) or _RUN_OPS_INTENT.search(text):
+        return False
+    # Only clear approvals keep the bind. Reject heuristics match words like "düzelt" in
+    # unrelated requests — those must still unbind.
+    if approval(text) == "approve":
+        return False
+    if manual_approval_requested(prompt):
+        return False
+    if re.fullmatch(r"(hayır|iptal|reject|vazgeç\.?|no)", text.strip()):
+        return False
+    if _mentions_other_workspace_project(text, project):
+        return True
+    return True

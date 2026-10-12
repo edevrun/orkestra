@@ -7,6 +7,13 @@ bridge.secret.json
 !.env.sample
 !.env.template
 /.claude/settings.local.json
+CLAUDE.local.md
+.secrets/
+credentials.json
+*.p8
+*.pem
+*.mobileprovision
+*.key
 
 # Python bytecode, environments, and test/analysis output
 __pycache__/
