@@ -9,9 +9,6 @@ from helpers import Sandbox
 import orkestra_core.artifacts as ART
 import orkestra_core.paths as P
 import orkestra_core.runs as R
-from orkestra_core.state import OrkestraError
-
-
 class TestArtifactCleanup(Sandbox):
     def setUp(self) -> None:
         super().setUp()
@@ -94,25 +91,21 @@ class TestArtifactCleanup(Sandbox):
         st["phase"] = "deliver"
         st["status"] = "active"
         st["approval_mode"] = "autopilot"
-        (rdir / "report.md").write_text("# Report\n\n## Evidence\n\nok\n", encoding="utf-8")
-        (fdir / "report.md").write_text("# Report\n\n## Evidence\n\nok\n", encoding="utf-8")
+        (rdir / "state.json").write_text(json.dumps(st), encoding="utf-8")
         (fdir / "verification.md").write_text("# Verification\n", encoding="utf-8")
         (fdir / "reviews").mkdir(parents=True, exist_ok=True)
         (fdir / "reviews" / "triage.md").write_text("none\n", encoding="utf-8")
-        (rdir / "state.json").write_text(json.dumps(st), encoding="utf-8")
-        reached_done = False
-        try:
-            cur, target = R.phase_next(self.proj, rid)
-            self.assertEqual((cur, target), ("deliver", "done"))
-            reached_done = True
-        except OrkestraError:
-            # Fixture may miss a deliver→done precondition; cleanup wiring is still covered below.
-            ART.clean_after_run(self.proj)
+        (fdir / "report.md").write_text("# Teslim raporu\n" + ("detay " * 80), encoding="utf-8")
+        self.cli("memory", "feature-add", "-p", "demo", "--title", "Cleanup",
+                 "--summary", "artifact cleanup on done", "--capabilities", "cleanup")
+        self.cli("report", "evidence", "--write", "-p", "demo")
+        # Must prove runs.phase_next(deliver→done) invokes cleanup — no OrkestraError fallback.
+        cur, target = R.phase_next(self.proj, rid)
+        self.assertEqual((cur, target), ("deliver", "done"))
         self.assertFalse((self.proj / "test-results").exists())
         self.assertTrue(planted["keep"].is_file())
-        if reached_done:
-            ledger = (fdir / "ledger.md").read_text(encoding="utf-8")
-            self.assertIn("artifact cleanup", ledger)
+        ledger = (fdir / "ledger.md").read_text(encoding="utf-8")
+        self.assertIn("artifact cleanup", ledger)
 
     def test_cli_clean_dry_run(self):
         self._plant()
