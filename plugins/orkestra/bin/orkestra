@@ -1,5 +1,27 @@
-#!/usr/bin/env python3
-"""orkestra CLI launcher (added to PATH by Claude Code via the plugin's bin/ directory)."""
+#!/bin/sh
+# orkestra CLI launcher (added to PATH by Claude Code via the plugin's bin/ directory).
+#
+# This one file is valid POSIX sh AND valid Python, so the same launcher works where `python3` is not a command
+# (Windows, under Git Bash: python.org installs provide `python` and the `py` launcher, and `python3` may be the
+# Microsoft Store stub that opens the Store). The sh part finds a Python 3 and re-runs this very file with it; Python
+# itself sees the sh part as a plain string and skips it. For cmd.exe / PowerShell see orkestra.cmd next to this file.
+#
+# Order: python3, python, py -3. macOS / Linux exec python3 at once (no probe); Windows probes each candidate first
+# (it runs and is Python 3.9+), so a stub is skipped.
+""""eval '
+windows=
+if [ "${OS:-}" = "Windows_NT" ] || [ -n "${MSYSTEM:-}" ]; then windows=1; fi
+probe="import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)"
+if [ -z "$windows" ] && command -v python3 >/dev/null 2>&1; then exec python3 "$0" "$@"; fi
+for py in python3 python; do
+  command -v "$py" >/dev/null 2>&1 || continue
+  "$py" -c "$probe" >/dev/null 2>&1 || continue
+  exec "$py" "$0" "$@"
+done
+if command -v py >/dev/null 2>&1 && py -3 -c "$probe" >/dev/null 2>&1; then exec py -3 "$0" "$@"; fi
+echo "orkestra: no Python 3.9+ found (tried python3, python and py -3). Install it from https://www.python.org/downloads/ and reopen the terminal." >&2
+exit 127
+' # """
 import os
 import sys
 

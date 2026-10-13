@@ -12,11 +12,9 @@ import re
 from pathlib import Path
 from typing import Dict, List
 
+from . import i18n
 from . import paths
 from .util import read_text, today, write_text_atomic
-
-FEATURES_HEADER = ("# Features\n\nOne line per delivered orkestra run (newest last). Details live in "
-                   "`.orkestra/features/<id>/`.\n\n| id | başlık | tarih | yetenekler | özet |\n|---|---|---|---|---|\n")
 
 
 def _clean(cell: str) -> str:
@@ -26,8 +24,8 @@ def _clean(cell: str) -> str:
 def feature_add(project: Path, run_id: str, title: str, summary: str, capabilities: List[str]) -> None:
     path = paths.memory_dir(project) / "FEATURES.md"
     text = read_text(path)
-    if "| id |" not in text:
-        text = FEATURES_HEADER + ("\n" + text if text.strip() and not text.startswith("# Features") else "")
+    if "| id |" not in text:                        # no table yet (the template normally brings it): current language
+        text = i18n.t("runs.features_header") + ("\n" + text if text.strip() and not text.startswith("# Features") else "")
     lines = [ln for ln in text.splitlines() if not ln.startswith(f"| {run_id} |")]
     row = f"| {run_id} | {_clean(title)} | {today()} | {_clean(', '.join(capabilities))} | {_clean(summary)[:220]} |"
     lines.append(row)

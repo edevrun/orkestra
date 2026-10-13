@@ -1,5 +1,5 @@
 {
-  "name": "Orkestra · Webhook ile iş başlat",
+  "name": "Orkestra · Start a job via webhook",
   "nodes": [
     {
       "parameters": {
@@ -65,7 +65,7 @@
         "options": {}
       },
       "id": "f7af5a94-9a27-4905-80f4-fbead794f802",
-      "name": "Yanıt",
+      "name": "Respond",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
@@ -90,7 +90,7 @@
       "main": [
         [
           {
-            "node": "Yanıt",
+            "node": "Respond",
             "type": "main",
             "index": 0
           }

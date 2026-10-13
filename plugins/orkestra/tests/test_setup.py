@@ -107,6 +107,92 @@ class TestSetupWizard(helpers.Sandbox):
         cursor.assert_not_called()
         copilot.assert_not_called()
 
+    def fake_claude(self, listing="", failing=()):
+        """A `claude` on PATH that logs its arguments, prints `listing` for `plugin marketplace list`, and exits 1 for the
+        subcommands named in `failing` (for example "plugin install")."""
+        bindir = self.tmp / "fakeclaude"
+        bindir.mkdir(exist_ok=True)
+        self.log = self.tmp / "claude.log"
+        self.log.write_text("")
+        script = bindir / "claude"
+        script.write_text(
+            "#!/bin/sh\necho \"$*\" >> '%s'\ncase \"$*\" in\n  \"plugin marketplace list\") printf '%%s\\n' '%s';;\n  --version) echo 9;;\nesac\n"
+            "%sexit 0\n" % (self.log, listing.replace("'", ""), "".join(
+                'case "$*" in "%s"*) exit 1;; esac\n' % f for f in failing)))
+        script.chmod(0o755)
+        os.environ["PATH"] = os.pathsep.join([str(bindir), self.safe_path])
+        self.assertIsNotNone(shutil.which("claude"))
+
+    def claude_calls(self):
+        return [line for line in self.log.read_text().splitlines() if line != "plugin marketplace list"]
+
+    def run_setup(self, lang="en"):
+        out = io.StringIO()
+        with mock.patch.object(CLI, "_ASKER", None), mock.patch.dict(os.environ, {"ORKESTRA_LANG": lang}), \
+                mock.patch("sys.stdout", out):
+            code = CLI.cmd_setup(argparse.Namespace(yes=True))
+        return code, out.getvalue()
+
+    @unittest.skipIf(os.name == "nt", "#!/bin/sh claude stub")
+    def test_a_failing_claude_command_is_a_failed_setup_not_done(self):
+        self.fake_claude(failing=("plugin install", "plugin marketplace add"))
+        for lang, failed, done in (("en", "FAILED", "done"), ("tr", "BAŞARISIZ", "tamam")):
+            with self.subTest(lang=lang):
+                code, out = self.run_setup(lang)
+                self.assertEqual(code, 1, out)
+                self.assertIn(failed, out)
+                self.assertNotIn(f"Claude marketplace/plugin {done}", out)
+                self.assertIn("claude plugin install orkestra@orkestra-local -s user", out)       # what to run by hand
+
+    @unittest.skipIf(os.name == "nt", "#!/bin/sh claude stub")
+    def test_a_claude_that_accepts_every_step_is_done(self):
+        self.fake_claude()
+        code, out = self.run_setup()
+        self.assertEqual(code, 0, out)
+        self.assertIn("Claude marketplace/plugin done", out)
+        self.assertEqual(self.claude_calls(), ["plugin marketplace add %s" % CLI.PLUGIN_ROOT.parent.parent,
+                                               "plugin install orkestra@orkestra-local -s user"])
+
+    @unittest.skipIf(os.name == "nt", "#!/bin/sh claude stub")
+    def test_a_marketplace_registered_from_another_checkout_is_registered_again_for_this_one(self):
+        root = CLI.PLUGIN_ROOT.parent.parent
+        self.fake_claude(listing="orkestra-local\n  Source: Directory (/somewhere/else/orkestra)")
+        code, out = self.run_setup()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.claude_calls(), ["plugin marketplace remove orkestra-local",
+                                               "plugin marketplace add %s" % root,
+                                               "plugin install orkestra@orkestra-local -s user"])
+        self.fake_claude(listing="orkestra-local\n  Source: Directory (%s)" % root)       # this checkout: just refreshed
+        code, out = self.run_setup()
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.claude_calls(), ["plugin marketplace update orkestra-local",
+                                               "plugin install orkestra@orkestra-local -s user"])
+
+    def test_a_yes_is_a_whole_word_not_a_first_letter(self):
+        """`exit`, `error`, `yeah` (English) and `yok`, `yapma` (Turkish: none, don't) must not install anything."""
+        def ask(answer, lang, default="y"):
+            with mock.patch.dict(os.environ, {"ORKESTRA_LANG": lang}), mock.patch("builtins.input", return_value=answer):
+                return CLI._ask_yn("q", default)
+
+        for answer in ("exit", "error", "yeah", "yep", "nope", "n", "no", "yok", "yapma", "hayır", "evetçe"):
+            for lang in ("en", "tr"):
+                with self.subTest(answer=answer, lang=lang):
+                    self.assertFalse(ask(answer, lang))
+        for answer in ("y", "Y", "yes", "YES", " yes "):
+            for lang in ("en", "tr"):
+                with self.subTest(answer=answer, lang=lang):
+                    self.assertTrue(ask(answer, lang))
+        for answer in ("e", "E", "evet", "Evet", "EVET"):
+            with self.subTest(answer=answer):
+                self.assertTrue(ask(answer, "tr"))
+                self.assertFalse(ask(answer, "en"), "`e` is a yes only at the Turkish prompt [E/h]")
+        for lang in ("en", "tr"):                                   # Enter takes the default; no terminal means the default
+            self.assertTrue(ask("", lang, "y"))
+            self.assertFalse(ask("", lang, "n"))
+        with mock.patch("builtins.input", side_effect=EOFError):
+            self.assertFalse(CLI._ask_yn("q", "n"))
+            self.assertTrue(CLI._ask_yn("q", "y"))
+
     def test_asker_refuses(self):
         """E6 / FR-003: setup from an agent shell raises OrkestraError; shim not attempted."""
         self.assertTrue(hasattr(CLI, "cmd_setup"), "cmd_setup missing")

@@ -14,18 +14,22 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import activity as A
+from . import i18n
 from . import intent
 from . import paths
 from . import planparse as PP
+from .messages import protocol as PR
 from .state import PHASES
-from .util import read_json, read_text
+from .util import read_json, read_text, write_json_atomic
 
 # thresholds live in ~/.orkestra/config.json → "watchdog" (defaults: paths.DEFAULT_GLOBAL_CONFIG)
 WD_DEFAULTS: Dict[str, Any] = {"dead_wait_seconds": 90, "hung_command_seconds": 900, "gate_command_seconds": 1800,
                                "silent_seconds": 600, "user_wait_notify_seconds": 300, "loop_repeats": 3,
-                               "agent_max_minutes": 60}
-MAX_REVIEW_ROUNDS = 3                    # the 3rd FAIL goes to the user (run skill: "same task fails review 3×")
-WAIT_CMD_RE = re.compile(r"\bsleep\s+\d|time\.sleep\(|while\s+time\.time\(\)")
+                               "agent_max_minutes": 60, "agent_silent_seconds": 150}
+MAX_REVIEW_ROUNDS = 3                    # the 3rd FAIL goes to the user (manual) / to defer or block (autopilot)
+MAX_DISPATCHES = 3                       # identical dispatches without new evidence before `next` escalates (tempo.max_dispatches)
+DUE_REPORT_SECONDS = 60                  # a stopped subagent's report that has not arrived after this long is a dead wait
+WAIT_CMD_RE = re.compile(r"\bsleep\s+\d|time\.sleep\(|while\s+time\.time\(\)|\borkestra\s+wait\b")
 OPEN_TASK = ("pending", "in_progress", "blocked")
 
 
@@ -55,20 +59,54 @@ def dur(seconds: Optional[float]) -> str:
 
 
 def dur_tr(seconds: Optional[float]) -> str:
-    if seconds is None:
-        return "?"
-    s = int(max(0, seconds))
-    if s < 90:
-        return f"{s} sn"
-    if s < 3600:
-        return f"{s // 60} dk"
-    return f"{s // 3600} sa {s % 3600 // 60} dk"
+    """Duration for a human, in the current language (the name is historical: it began as the Turkish formatter,
+    `45 sn` · `12 dk` · `2 sa 5 dk`; English reads `45s` · `12m` · `2h 5m`). `dur` stays the fixed form the model reads."""
+    return i18n.duration(seconds)
 
 
 # ---------------------------------------------------------------- per-task sub-step (derived, never stored)
 
 def reopen_count(t: Dict[str, Any]) -> int:
-    return sum(1 for n in (t.get("notes") or []) if str(n).startswith("reopened"))
+    """Review rounds spent: reopens by a review FAIL. A red-evidence-missing reopen is bookkeeping, not a round."""
+    return sum(1 for n in (t.get("notes") or []) if str(n).startswith("reopened") and not str(n).startswith(RED_MISSING))
+
+
+RED_MISSING = "reopened(red-missing)"
+CAP_BLOCK = "blocked: review round limit"      # note of a task parked by the round cap in autopilot
+
+
+def is_autopilot(st: Dict[str, Any]) -> bool:
+    return st.get("approval_mode", "autopilot") == "autopilot"
+
+
+def p_arg(project: Path) -> str:
+    """`-p <name>` when the folder sits directly in the workspace (the CLI resolves a bare name there), else the
+    absolute path: shorter hints, same meaning."""
+    try:
+        name = Path(project).name
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", name) and \
+                (paths.workspace_root() / name).resolve(strict=False) == Path(project).resolve(strict=False):
+            return f"-p {name}"
+    except Exception:
+        pass
+    return f"-p {project}"
+
+
+def once_per_run(project: Path, run_id: str, key: str) -> bool:
+    """True the first time `key` is asked for in this run, False afterwards (prefaces the model must read once, not on
+    every call). A marker file in the run folder, so the state file's mtime (a liveness signal) is left alone."""
+    try:
+        path = paths.run_dir(project, run_id) / "prefaces.json"
+        seen = read_json(path, default={}) or {}
+        if not isinstance(seen, dict):
+            seen = {}
+        if key in seen:
+            return False
+        seen[key] = time.time()
+        write_json_atomic(path, seen)
+        return True
+    except Exception:
+        return True                       # cannot remember: say it again rather than drop it
 
 
 def task_review(fdir: Path, tid: str) -> Dict[str, Any]:
@@ -162,19 +200,43 @@ def next_task(st: Dict[str, Any]) -> Optional[str]:
 # ---------------------------------------------------------------- background subagents: running or lost?
 
 def agents_quiet(rows: List[Dict[str, Any]], pending: List[Dict[str, Any]], now: float,
-                 wd: Dict[str, Any]) -> Optional[float]:
-    """Seconds since any subagent showed life, when that is longer than silent_seconds — else None.
+                 wd: Dict[str, Any], key: str = "silent_seconds", life: float = 0.0) -> Optional[float]:
+    """Seconds since any subagent showed life, when that is longer than the `key` threshold — else None.
 
     A working subagent writes a row for every tool call. Registered agents with no row and no open command for that
-    long are lost (killed, or their session crashed): waiting for them would park the run."""
+    long are lost (killed, or their session crashed): waiting for them would park the run. `key` is
+    watchdog.silent_seconds for the stall classification (600 s) and watchdog.agent_silent_seconds for the hooks,
+    the wait guard and `next` (150 s); `life` is any other sign of life (a subagent transcript still being written)."""
     if not pending:
         return None
     if any(agent != "main" for agent, _, _ in _running_commands(rows)):
         return None
     last = max([float(a.get("at") or 0) for a in pending]
-               + [float(r.get("ts") or 0) for r in rows if (r.get("agent") or "main") != "main"])
+               + [float(r.get("ts") or 0) for r in rows if (r.get("agent") or "main") != "main"] + [float(life or 0)])
     gap = now - last
-    return gap if gap > float(wd.get("silent_seconds") or 600) else None
+    default = 150 if key == "agent_silent_seconds" else 600
+    return gap if gap > float(wd.get(key) or default) else None
+
+
+def transcript_life(pending: List[Dict[str, Any]]) -> float:
+    """Newest write time of a registered subagent's own transcript (best effort, 0.0 = unknown). A thinking subagent
+    writes no tool-call rows but still writes its transcript, so it is not declared lost."""
+    best = 0.0
+    try:
+        from . import usage as _U
+        for a in pending:
+            sid, aid = str(a.get("sid") or ""), str(a.get("id") or "")
+            if not sid or not aid or aid.startswith("?"):
+                continue
+            for path, is_main in _U._locate(sid):
+                if not is_main and aid in Path(path).stem:
+                    try:
+                        best = max(best, Path(path).stat().st_mtime)
+                    except OSError:
+                        continue
+    except Exception:
+        return 0.0
+    return best
 
 
 def live_agents(project: Path, run_id: str, now: Optional[float] = None, wd: Optional[Dict[str, Any]] = None,
@@ -187,7 +249,9 @@ def live_agents(project: Path, run_id: str, now: Optional[float] = None, wd: Opt
     if not pending:
         return [], []
     rows = A.read_rows(project, run_id) if rows is None else rows
-    if agents_quiet(rows, pending, now, wd) is None:
+    if agents_quiet(rows, pending, now, wd, "agent_silent_seconds") is None:
+        return pending, []
+    if agents_quiet(rows, pending, now, wd, "agent_silent_seconds", transcript_life(pending)) is None:
         return pending, []
     return [], pending
 
@@ -200,16 +264,85 @@ def _n(action: str, text: str, why: str = "", cmd: str = "", **extra: Any) -> Di
     return d
 
 
+def max_dispatches() -> int:
+    try:
+        return max(1, int((paths.global_config().get("tempo") or {}).get("max_dispatches") or MAX_DISPATCHES))
+    except (TypeError, ValueError):
+        return MAX_DISPATCHES
+
+
+def dispatches_since(project: Path, run_id: str, kinds: Tuple[str, ...], since: float, tid: str = "",
+                     untasked: bool = False) -> int:
+    """How many launches of these agent kinds (short names: `implementer`, `reviewer` …) were recorded after `since`
+    (for one task when `tid` is given). Foreground and background launches alike, from the launch ring."""
+    n = 0
+    for x in A.launches(project, run_id):
+        if float(x.get("at") or 0) <= since or A.short_agent(str(x.get("type") or "")) not in kinds:
+            continue
+        if tid and tid not in (x.get("tasks") or []):
+            continue
+        if untasked and x.get("tasks"):
+            continue                                  # a task-scoped launch (a FIX review) is not the final review
+        n += 1
+    return n
+
+
+def _task_since(t: Dict[str, Any], *extra: Any) -> float:
+    """Start of the window in which dispatches count: the task's (re)start, its newest red/green evidence, and any
+    extra timestamp (a review file). New evidence or a reopen therefore restarts the count."""
+    marks = [_ts(t.get("started")) or 0.0, _ts((t.get("red") or {}).get("at")) or 0.0,
+             _ts((t.get("green") or {}).get("at")) or 0.0, float(t.get("last_reopen_at") or 0.0)]
+    marks += [float(x or 0.0) for x in extra]
+    return max(marks)
+
+
+def _escalate(st: Dict[str, Any], what: str, n: int, block_cmd: str, base: Dict[str, Any]) -> Dict[str, Any]:
+    """The same dispatch has been made `n` times with nothing to show for it: stop repeating it."""
+    auto = is_autopilot(st)
+    tail = ("pick a materially different approach, `orkestra task defer` it (the final review triages it) or "
+            "`orkestra block \"<why>\"`" if auto else "choose a different approach with the user, defer it or `orkestra block`")
+    return _n("escalate", f"{what} dispatched {n}x with no new evidence → do NOT dispatch it again: `{block_cmd}`, then {tail}",
+              f"{n} identical dispatches without progress (tempo.max_dispatches)", block_cmd, **base)
+
+
+def _phase_loop(project: Path, st: Dict[str, Any], phase: str, kinds: Tuple[str, ...], limit: int, what: str,
+                why: str, p: str) -> Optional[Dict[str, Any]]:
+    """A phase-level agent (scouts, architect, critic, verifier, final review) launched `limit` times since the run
+    entered this phase and the artifact it should have produced is still missing: escalate instead of dispatching again."""
+    entered = max([_ts(h.get("at")) or 0.0 for h in (st.get("history") or []) if h.get("to") == phase] or [0.0])
+    n = dispatches_since(project, st["run_id"], kinds, entered, untasked=(phase == "review"))
+    if n < limit:
+        return None
+    return _escalate(st, f"{what}", n, f"orkestra block \"{why}\" {p}", {"phase_agent": "/".join(kinds)})
+
+
 def _task_action(project: Path, st: Dict[str, Any], tid: str, deep: bool) -> Dict[str, Any]:
     s = task_step(project, st, tid, deep)
-    step, p = s["step"], f"-p {project}"
+    step, p = s["step"], p_arg(project)
     small = st.get("size") in ("XS", "S")
     base = {"task": tid, "step": step}
+    auto = is_autopilot(st)
+    t = (st.get("tasks") or {}).get(tid) or {}
+    limit = max_dispatches()
+    exit_cmds = f"`orkestra task defer {tid} \"<why>\" {p}` (the final review triages it) or `orkestra block \"<why>\" {p}`"
+    if step in ("started", "red"):
+        n = dispatches_since(project, st["run_id"], ("implementer",), _task_since(t), tid)
+        if n >= limit:
+            return _escalate(st, f"{tid}: implementer", n, f"orkestra task block {tid} \"no progress\" {p}", base)
+    if step == "review_pending" and not small:
+        n = dispatches_since(project, st["run_id"], ("reviewer",), _task_since(t), tid)
+        if n >= limit:
+            return _escalate(st, f"{tid}: reviewer", n, f"orkestra task block {tid} \"no review written\" {p}", base)
     if step == "started":
         return _n("dispatch", f"{tid}: no evidence yet → dispatch orkestra:implementer with the output of `orkestra brief {tid} {p}` "
                               f"(same brief as before — do not start another task for it)",
                   "task is in progress, no red/green recorded", f"orkestra brief {tid} {p}", **base)
     if step == "blocked_note":
+        if auto:
+            return _n("work", f"{tid}: the implementer reported {s.get('note')} → autopilot: decide from spec/context with the "
+                              f"most conservative option, record it with `orkestra task note {tid} \"decision: …\" {p}` and "
+                              f"dispatch the implementer again; with no safe default: {exit_cmds}",
+                      "the task's last note is BLOCKED — sending the same brief again would fail the same way", **base)
         return _n("ask_user", f"{tid}: the implementer reported {s.get('note')} → decide from spec/context or ask the user; "
                               f"record it with `orkestra task note {tid} \"decision: …\" {p}` and dispatch the implementer "
                               f"again with that decision (or `orkestra task block {tid} \"<why>\" {p}`)",
@@ -234,10 +367,14 @@ def _task_action(project: Path, st: Dict[str, Any], tid: str, deep: bool) -> Dic
             return _n("cli", f"{tid}: green recorded → `orkestra task done {tid} {p} \"final review covers it (XS/S)\"`",
                       "XS/S runs may skip the per-task review", f"orkestra task done {tid} {p} \"final review covers it (XS/S)\"", **base)
         return _n("dispatch", f"{tid}: green recorded, no review of this round → dispatch orkestra:reviewer (scope: task {tid}; "
-                              f"it writes reviews/{tid}.review.md)", "evidence is in; the task review is the only missing step", **base)
+                              f"it writes reviews/{tid}.review.md; start it from `orkestra brief --review {tid} {p}`)",
+                  "evidence is in; the task review is the only missing step", **base)
     if step.startswith("review_fail"):
         rnd = s["round"]
         if rnd >= MAX_REVIEW_ROUNDS:
+            if auto:
+                return _n("cli", f"{tid}: review FAILED {rnd} times → autopilot has no user to rule on it: {exit_cmds}",
+                          f"round limit ({MAX_REVIEW_ROUNDS}) reached — defer or block, never reopen", f"orkestra task defer {tid} \"review failed {rnd} rounds\" {p}", **base)
             return _n("ask_user", f"{tid}: review FAILED {rnd} times → stop; explain the trade-off to the user (AskUserQuestion), "
                                   f"then `orkestra task reopen {tid} --force \"<the user's ruling>\" {p}` or `orkestra task defer {tid} \"<why>\" {p}`",
                       f"round limit ({MAX_REVIEW_ROUNDS}) reached — the user decides", **base)
@@ -252,6 +389,13 @@ def _task_action(project: Path, st: Dict[str, Any], tid: str, deep: bool) -> Dic
                   "the verdict on file is PASS and has not been applied", f"orkestra task done {tid} {p} \"{note}\"", **base)
     if step == "blocked":
         notes = (st["tasks"][tid].get("notes") or ["?"])
+        if str(notes[-1]).startswith(CAP_BLOCK):
+            return _n("cli", f"{tid}: review failed {reopen_count(t) + 1} rounds and autopilot has no user to rule on it → {exit_cmds}",
+                      "round limit reached — defer or block, never reopen", f"orkestra task defer {tid} \"review failed\" {p}", **base)
+        if auto:
+            return _n("work", f"{tid} is blocked ({str(notes[-1])[:120]}) → autopilot: resolve it from spec/context with the most "
+                              f"conservative option, then `orkestra task start {tid} {p}`; with no safe default: {exit_cmds}",
+                      "a blocked task needs a decision", **base)
         return _n("ask_user", f"{tid} is blocked ({str(notes[-1])[:120]}) → decide from spec/context, or ask the user; then "
                               f"`orkestra task start {tid} {p}`", "a blocked task needs a decision", **base)
     return _n("cli", f"{tid}: `orkestra task start {tid} {p}` → `orkestra brief {tid} {p}` → dispatch orkestra:implementer",
@@ -274,6 +418,10 @@ def _open_tasks_action(project: Path, st: Dict[str, Any], deep: bool) -> Optiona
         return _task_action(project, st, blocked[0], deep)
     stuck = sorted(t for t, v in tasks.items() if v.get("status") == "pending")
     if stuck:
+        if is_autopilot(st):
+            return _n("work", f"{stuck[0]} cannot start: its dependencies are not done/deferred → autopilot: `orkestra task defer "
+                              f"{stuck[0]} \"<why>\" {p_arg(project)}` (or defer the blocking dependency); with no safe way on: "
+                              f"`orkestra block \"<why>\" {p_arg(project)}`", "dependency deadlock")
         return _n("ask_user", f"{stuck[0]} cannot start: its dependencies are not done/deferred — fix the plan order or defer it",
                   "dependency deadlock")
     return None
@@ -285,7 +433,7 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
     now = time.time() if now is None else now
     project = Path(project)
     rid, phase, status = st["run_id"], st.get("phase", "intake"), st.get("status")
-    fdir, rdir, p = paths.feature_dir(project, rid), paths.run_dir(project, rid), f"-p {project}"
+    fdir, rdir, p = paths.feature_dir(project, rid), paths.run_dir(project, rid), p_arg(project)
     head = {"run": rid, "phase": phase, "status": status}
 
     def done(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -311,8 +459,8 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
         if paths.is_headless(st):
             # `claude -p` exits with its turn and takes its subagents with it: here the wait happens inside the turn
             return done(_n("wait_agents", f"{len(pending)} subagent(s) still running ({who}) → headless run: do NOT end the "
-                                          f"turn (the process would exit and kill them). Wait for their reports inside this "
-                                          f"turn; do not re-dispatch.",
+                                          f"turn (the process would exit and kill them). Wait inside it with ONE blocking call "
+                                          f"`orkestra wait {p}` (Bash timeout 600000, no tokens while it waits); do not re-dispatch.",
                            "background subagents report back on their own", agents=pending[:8]))
         return done(_n("wait_agents", f"{len(pending)} subagent(s) still running ({who}) → END YOUR TURN now; each hand-back "
                                       f"arrives as a message and resumes you. Do not poll, sleep or re-dispatch.",
@@ -323,9 +471,9 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
     spec, plan = read_text(fdir / "spec.md"), read_text(fdir / "plan.md")
     act: Optional[Dict[str, Any]] = None
     if phase == "intake":
-        if "## Sınıflandırma" not in read_text(fdir / "request.md"):
-            act = _n("work", "classify the request: append `## Sınıflandırma` to request.md (`orkestra playbook intake`)",
-                     "request.md has no classification yet")
+        if not PP.has_heading(read_text(fdir / "request.md"), "classification"):     # either language's heading counts
+            act = _n("work", f"classify the request: append `## {i18n.heading('classification')}` to request.md "
+                             "(`orkestra playbook intake`)", "request.md has no classification yet")
     elif phase == "discover":
         size = st.get("size") or "M"
         need = intent.min_context_chars(size)
@@ -339,23 +487,25 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
                                  f"(≥{need} chars), then continue (`orkestra playbook discover`)",
                          "context.md is missing or too thin")
             else:
-                act = _n("dispatch", "dispatch the scouts in ONE message (+ researcher if third-party APIs), then merge their notes "
-                                     "into context.md (`orkestra playbook discover`)", "context.md is missing or too thin")
+                act = _phase_loop(project, st, "discover", ("scout", "researcher"), 2 * max_dispatches(), "scouts", "scouts wrote no context", p) \
+                    or _n("dispatch", "dispatch the scouts in ONE message (+ researcher if third-party APIs), then merge their notes "
+                                      "into context.md (`orkestra playbook discover`)", "context.md is missing or too thin")
         elif not (rdir / "gates-baseline.json").exists():
             act = _n("cli", f"`orkestra gate baseline {p}`", "the baseline gates are not recorded", f"orkestra gate baseline {p}")
     elif phase == "clarify":
         if not spec.strip():
             if st.get("approval_mode", "autopilot") == "autopilot":
                 act = _n("work", "Autopilot: infer conservative defaults from the request, codebase and project memory; record "
-                                 "each material assumption in `spec.md` → `## Netleştirmeler`, then continue without asking the user.",
-                         "spec.md does not exist")
+                                 f"each material assumption in `spec.md` → `## {i18n.heading('clarifications')}`, then continue "
+                                 "without asking the user.", "spec.md does not exist")
             else:
                 act = _n("work", "ask only the outcome-changing questions (AskUserQuestion, ≤ 4), then write spec.md with "
-                                 "`## Netleştirmeler` (`orkestra playbook clarify`)", "spec.md does not exist")
-        elif not PP.has_section(spec, "Netleştirmeler", "Clarifications") or not PP.spec_ids(spec):
-            act = _n("work", ("Autopilot: finish spec.md with FR-###/SC-### ids, a `## Netleştirmeler` section and "
-                               "conservative assumptions; do not ask the user." if autopilot_user_wait else
-                               "finish spec.md: FR-###/SC-### ids and a `## Netleştirmeler` section"), "spec.md is incomplete")
+                                 f"`## {i18n.heading('clarifications')}` (`orkestra playbook clarify`)", "spec.md does not exist")
+        elif not PP.has_heading(spec, "clarifications") or not PP.spec_ids(spec):
+            clar = i18n.heading("clarifications")
+            act = _n("work", (f"Autopilot: finish spec.md with FR-###/SC-### ids, a `## {clar}` section and "
+                              "conservative assumptions; do not ask the user." if autopilot_user_wait else
+                              f"finish spec.md: FR-###/SC-### ids and a `## {clar}` section"), "spec.md is incomplete")
     elif phase == "plan":
         critic = PP.verdict(read_text(fdir / "reviews" / "plan-critic.md"))
         size = st.get("size") or "M"
@@ -364,12 +514,18 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
                 act = _n("work", f"{size}: write a short plan.md yourself (1–3 tasks), then `orkestra plan check` "
                                  "(`orkestra playbook plan`)", "plan.md does not exist")
             else:
-                act = _n("dispatch", "dispatch orkestra:architect to write plan.md (`orkestra playbook plan`)", "plan.md does not exist")
+                act = _phase_loop(project, st, "plan", ("architect",), max_dispatches(), "orkestra:architect", "architect wrote no plan", p) \
+                    or _n("dispatch", "dispatch orkestra:architect to write plan.md (`orkestra playbook plan`)", "plan.md does not exist")
         elif not intent.skips_plan_critic(size) and critic is None:
-            act = _n("dispatch", "dispatch orkestra:plan-critic (it writes reviews/plan-critic.md)", "the plan has no critic verdict")
+            act = _phase_loop(project, st, "plan", ("plan-critic",), max_dispatches(), "orkestra:plan-critic", "plan-critic wrote no verdict", p) \
+                or _n("dispatch", "dispatch orkestra:plan-critic (it writes reviews/plan-critic.md)", "the plan has no critic verdict")
         elif not intent.skips_plan_critic(size) and critic == "FAIL":
-            act = _n("dispatch", "plan-critic FAILED → send its blockers to the architect, then run the critic again "
-                                 "(max 3 rounds, then ask the user)", "reviews/plan-critic.md ends with VERDICT: FAIL")
+            act = _phase_loop(project, st, "plan", ("plan-critic",), max_dispatches() + 1, "orkestra:plan-critic (still FAIL)",
+                              "plan-critic keeps failing the plan", p) \
+                or _n("dispatch", "plan-critic FAILED → send its blockers to the architect, then run the critic again "
+                                  "(max 3 rounds, then "
+                                  + ("`orkestra block \"<why>\"`: autopilot has no user to ask)" if autopilot_user_wait
+                                     else "ask the user)"), "reviews/plan-critic.md ends with VERDICT: FAIL")
     elif phase == "approve":
         appr = read_json(rdir / "approval.json")
         if not isinstance(appr, dict):
@@ -377,8 +533,9 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
                 act = _n("cli", f"Autopilot: the plan and critic passed. Run `orkestra phase next {p}` to record the hash-bound "
                                  "policy approval and continue.", "no policy approval is recorded", f"orkestra phase next {p}")
             else:
-                act = _n("ask_user", "show the plan summary and ask for approval — ONE AskUserQuestion with header `Plan onayı` and "
-                                     "nothing else in that call.", "no approval is recorded")
+                act = _n("ask_user", "show the plan summary and ask for approval — ONE AskUserQuestion "
+                                     f"({PR.prompt_spec('approve', i18n.lang())}) and nothing else in that call.",
+                         "no approval is recorded")
         elif appr.get("decision") != "approve":
             act = _n("work", "the user asked for changes: apply them to spec/plan, `orkestra plan check`, then ask for approval "
                              "again", f"last decision: {appr.get('decision')} ({str(appr.get('detail') or '')[:80]})")
@@ -414,7 +571,8 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
                             f"(never the test), then verify again", "the last `gate verify` is not green",
                      f"orkestra gate last {p}")
         elif act is None and ver is None:
-            act = _n("dispatch", "dispatch orkestra:verifier (it writes verification.md)", "gates are green; verification.md is missing")
+            act = _phase_loop(project, st, "verify", ("verifier",), max_dispatches(), "orkestra:verifier", "verifier wrote no verification.md", p) \
+                or _n("dispatch", "dispatch orkestra:verifier (it writes verification.md)", "gates are green; verification.md is missing")
         elif act is None and ver not in ("PASS", "PASS_WITH_NOTES"):
             act = _n("work", "verification FAILED → fix the failing ids through an implementer "
                              f"(`orkestra phase back implement --reason \"verification\" {p}`), then verify again",
@@ -427,7 +585,8 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
             has_adv = any("adversary" in n for n in names)
             tri = read_text(fdir / "reviews" / "triage.md")
             if not has_final or (not intent.skips_adversary(st.get("size") or "") and not has_adv):
-                act = _n("dispatch", "dispatch orkestra:reviewer (scope: final → reviews/final-review.md)"
+                act = _phase_loop(project, st, "review", ("reviewer", "adversary"), 2 * max_dispatches(), "final review", "final review not written", p) \
+                    or _n("dispatch", "dispatch orkestra:reviewer (scope: final → reviews/final-review.md)"
                                      + ("" if intent.skips_adversary(st.get("size") or "") else
                                         " and orkestra:adversary (→ reviews/adversary.md) in ONE message"),
                          "the final review has not been written")
@@ -530,7 +689,9 @@ def flags(project: Path, st: Dict[str, Any], rows: Optional[List[Dict[str, Any]]
     for tid in sorted(tasks):
         t = tasks[tid]
         if t.get("status") in OPEN_TASK and reopen_count(t) >= MAX_REVIEW_ROUNDS - 1:
-            out.append(f"{tid}: review round {reopen_count(t) + 1} — if it fails again, ask the user instead of reopening")
+            out.append(f"{tid}: review round {reopen_count(t) + 1} — if it fails again, "
+                       + ("`orkestra task defer` or `orkestra block` instead of reopening (autopilot has no user)"
+                          if is_autopilot(st) else "ask the user instead of reopening"))
     in_prog = sorted(t for t, v in tasks.items() if v.get("status") == "in_progress")
     for i, tid in enumerate(in_prog):
         for other, shared in overlap(tasks, tid, in_prog[i + 1:]):
@@ -538,6 +699,20 @@ def flags(project: Path, st: Dict[str, Any], rows: Optional[List[Dict[str, Any]]
     if rows:
         out.extend(loop_flags(rows, int(wd.get("loop_repeats") or 3)))
     return out
+
+
+WAIT_MIN_BLOCK = 3.0     # a wait that returned sooner than this did not wait (interactive, idle, run not active)
+
+
+def _wait_blocked(rows: List[Dict[str, Any]], idx: int) -> Optional[bool]:
+    """Did the `orkestra wait` call at rows[idx] really block? The gap to the same agent's next row tells; None when
+    there is no later row (the call is still running). An instant return, repeated, is a hot loop that costs a model
+    turn each time."""
+    agent, ts = str(rows[idx].get("agent") or "main"), float(rows[idx].get("ts") or 0)
+    for nxt in rows[idx + 1:]:
+        if str(nxt.get("agent") or "main") == agent:
+            return float(nxt.get("ts") or 0) - ts >= WAIT_MIN_BLOCK
+    return None
 
 
 def loop_flags(rows: List[Dict[str, Any]], repeats: int = 3) -> List[str]:
@@ -552,9 +727,16 @@ def loop_flags(rows: List[Dict[str, Any]], repeats: int = 3) -> List[str]:
         if n >= repeats:
             out.append(f"{A.short_agent(agent)} hit the same guard {n}×: {what[:70]} — change the approach, do not retry")
     last_cmd: Dict[str, Tuple[str, int]] = {}
-    for r in recent:
+    for idx, r in enumerate(recent):
         if r.get("kind") == "tool" and r.get("tool") == "Bash":
             agent, what = str(r.get("agent") or "main"), str(r.get("what") or "")
+            if WAIT_CMD_RE.search(what) and re.search(r"\borkestra\s+wait\b", what):
+                blocked = _wait_blocked(recent, idx)
+                if blocked is None:
+                    continue                              # still running: neither a repeat nor a reset
+                if blocked:
+                    last_cmd.pop(agent, None)             # `orkestra wait` repeated is the intended wait, not a loop
+                    continue
             prev = last_cmd.get(agent)
             last_cmd[agent] = (what, prev[1] + 1) if prev and prev[0] == what else (what, 1)
         elif r.get("kind") == "tool":
@@ -582,29 +764,64 @@ def tempo_line(project: Path, st: Dict[str, Any], now: Optional[float] = None,
 
 # ---------------------------------------------------------------- stall classification (read-only)
 
+BATCH_MARGIN = 3.0       # tool calls of one parallel batch land within this many seconds of each other
+
+
 def _running_commands(rows: List[Dict[str, Any]]) -> List[Tuple[str, float, str]]:
-    """Per agent: a Bash call that started and has no `end` row yet."""
+    """Per agent: a Bash call that started and has no `end` row yet.
+
+    Hooks never fire for interrupted or cancelled tool calls, so an `end` row alone would leave such a command open
+    for ever: any LATER row of the same agent (more than a parallel batch later) proves that agent moved on, the
+    main session's `idle` row ends the session (every open command with it), and an agent's stop closes its own."""
     open_: Dict[str, Tuple[str, float, str]] = {}
     for r in rows:
         agent = str(r.get("agent") or "main")
         key = str(r.get("aid") or agent)            # two implementers are two agents: one stopping must not close
-        if r.get("tool") == "Bash" and r.get("kind") == "tool":       # the other one's running command
-            open_[key] = (agent, float(r.get("ts") or 0), str(r.get("what") or ""))
-        elif r.get("kind") in ("end", "deny") and r.get("tool") == "Bash":
+        kind, ts = r.get("kind"), float(r.get("ts") or 0)
+        if r.get("tool") == "Bash" and kind == "tool":                # the other one's running command
+            open_[key] = (agent, ts, str(r.get("what") or ""))
+        elif kind in ("end", "deny") and r.get("tool") == "Bash":
             open_.pop(key, None)
-        elif r.get("kind") == "agent_done":
+        elif kind == "agent_done":
             if open_.pop(key, None) is None:        # rows written before agent ids were recorded are keyed by type
                 open_.pop(agent, None)
-        elif agent == "main" and r.get("kind") in ("idle", "wait_agents", "user"):
+        elif agent == "main" and kind == "idle":
+            open_.clear()                           # the session's turn is over: nothing of it is still running
+        elif agent == "main" and kind in ("wait_agents", "user"):
             open_.pop("main", None)
+        elif kind not in ("nudge", "status", "bind") and key in open_ and ts > open_[key][1] + BATCH_MARGIN:
+            open_.pop(key, None)                    # the same agent did something else afterwards: it is not stuck there
     return list(open_.values())
+
+
+def _is_wait_row(r: Dict[str, Any]) -> bool:
+    return (r.get("agent") or "main") == "main" and r.get("tool") == "Bash" and r.get("kind") == "tool" \
+        and bool(WAIT_CMD_RE.search(str(r.get("what") or "")))
+
+
+def last_activity(rows: List[Dict[str, Any]], ignore_end: bool = False) -> float:
+    """Newest row of ANY agent that is real run activity: not the Stop hook's own bookkeeping, not the main session's
+    wait commands (polling is waiting, not working); `end` rows only count when ignore_end is False."""
+    best = 0.0
+    for r in rows:
+        kind = r.get("kind")
+        if kind in ("nudge", "wait_agents") or (ignore_end and kind == "end") or _is_wait_row(r):
+            continue
+        best = max(best, float(r.get("ts") or 0))
+    return best
 
 
 def classify(st: Dict[str, Any], rows: List[Dict[str, Any]], pending: Optional[List[Dict[str, Any]]] = None,
              now: Optional[float] = None, wd: Optional[Dict[str, Any]] = None,
-             state_mtime: Optional[float] = None) -> Dict[str, Any]:
+             state_mtime: Optional[float] = None, reports_due: Optional[List[Dict[str, Any]]] = None,
+             proc_alive: Optional[bool] = None) -> Dict[str, Any]:
     """cls: 0 working · 1 waiting for the user (legitimate) · 2 dead wait · 3 hung command · 4 silent session.
-    `loops` (class 5) is reported next to any of them."""
+    `loops` (class 5) is reported next to any of them.
+
+    Only deterministic predicates decide a stall (a thinking model is not one): `hung` needs an open command older than
+    its limit AND no row of any agent since it started (and `proc_alive` not True: an optional child-process / CPU
+    signal the caller may pass); `dead_wait` needs a stopped subagent whose report (activity.agents_reports_due,
+    passed as `reports_due`) is older than DUE_REPORT_SECONDS while the whole run was silent since."""
     now = time.time() if now is None else now
     wd = wd or wd_cfg()
     pending = pending or []
@@ -614,59 +831,70 @@ def classify(st: Dict[str, Any], rows: List[Dict[str, Any]], pending: Optional[L
     loops += [f"{tid}: {reopen_count(t)} review rounds" for tid, t in sorted(tasks.items())
               if t.get("status") in OPEN_TASK and reopen_count(t) >= MAX_REVIEW_ROUNDS]
 
-    def res(cls: int, key: str, since: float, tr: str) -> Dict[str, Any]:
-        return {"cls": cls, "key": key, "since": int(max(0, now - since)) if since else None, "text": tr, "loops": loops}
+    def res(cls: int, key: str, since: float, text: str) -> Dict[str, Any]:
+        # cls / key are machine values (never translated); `text` is the sentence a human reads, in the current language
+        return {"cls": cls, "key": key, "since": int(max(0, now - since)) if since else None, "text": text, "loops": loops}
 
     if status in ("done", "aborted"):
-        return res(0, "closed", 0, "kapalı")
+        return res(0, "closed", 0, i18n.t("tempo.stall_closed"))
     if status == "awaiting_user":
         at = _ts((st.get("awaiting") or {}).get("at")) or 0
-        return res(1, "user", at, f"kullanıcı bekleniyor — {(st.get('awaiting') or {}).get('question') or 'soru'}")
+        return res(1, "user", at, i18n.t("tempo.stall_user_waiting",
+                                         what=(st.get("awaiting") or {}).get("question") or i18n.t("tempo.question_word")))
     if status == "blocked":
         return res(1, "blocked", _ts((st.get("blocked") or {}).get("at")) or 0,
-                   f"bloke — {(st.get('blocked') or {}).get('reason') or ''}")
+                   i18n.t("tempo.stall_blocked", reason=(st.get("blocked") or {}).get("reason") or ""))
     if status == "paused":
-        return res(1, "paused", 0, "duraklatıldı")
+        return res(1, "paused", 0, i18n.t("tempo.stall_paused"))
     q = A.pending_question(rows)
     if q:
         ts = next((float(r.get("ts") or 0) for r in reversed(rows) if r.get("tool") == "AskUserQuestion"), 0)
-        return res(1, "user", ts, f"kullanıcı bekleniyor — açık soru ({q})")
+        return res(1, "user", ts, i18n.t("tempo.stall_open_question", question=q))
     main_rows = [r for r in rows if (r.get("agent") or "main") == "main" and r.get("kind") not in ("end", "nudge")]
     main_last = main_rows[-1] if main_rows else None
     state_ts = float(state_mtime or 0)
     if main_last and main_last.get("kind") == "idle" and state_ts <= float(main_last.get("ts") or 0):
-        return res(1, "turn_ended", float(main_last.get("ts") or 0), "tur bitti — kullanıcının mesajı bekleniyor")
+        return res(1, "turn_ended", float(main_last.get("ts") or 0), i18n.t("tempo.stall_turn_ended"))
     for agent, ts, what in _running_commands(rows):
         limit = float(wd["gate_command_seconds"] if re.search(r"\borkestra\s+(\S+\s+)*(gate|tdd|evidence)\b", what)
                       else wd["hung_command_seconds"])
         if now - ts > limit and not (agent == "main" and WAIT_CMD_RE.search(what)):
-            return res(3, "hung", ts, f"asılı komut ({A.short_agent(agent)}, {dur_tr(now - ts)}): {what[:80]} — komut "
-                                      f"takılmış ya da oturum komut sırasında kapanmış olabilir")
+            if last_activity(rows) > ts or proc_alive is True:
+                continue                  # a slow command while the run moves on (or the process lives) is working
+            return res(3, "hung", ts, i18n.t("tempo.stall_hung", agent=A.short_agent(agent), dur=dur_tr(now - ts),
+                                             cmd=what[:80]))
     quiet = agents_quiet(rows, pending, now, wd)
     if pending and quiet is None:
         who = ", ".join(A.short_agent(str(a.get("type") or "")) for a in pending[:4])
-        return res(0, "agents", float(pending[0].get("at") or now), f"alt-ajan çalışıyor: {who}")
+        return res(0, "agents", float(pending[0].get("at") or now), i18n.t("tempo.stall_agents", who=who))
     done_ts = max([float(r.get("ts") or 0) for r in rows if r.get("kind") == "agent_done"] or [0.0])
-    if done_ts:
-        progressed = any(float(r.get("ts") or 0) > done_ts and r.get("kind") in ("tool", "answer", "deny", "result", "user")
-                         and not (r.get("tool") == "Bash" and WAIT_CMD_RE.search(str(r.get("what") or "")))
-                         for r in main_rows)
-        main_waiting = any(a == "main" and WAIT_CMD_RE.search(w) for a, _, w in _running_commands(rows))
-        got_report = any(float(r.get("ts") or 0) > done_ts and r.get("kind") == "handback" for r in main_rows)
-        if not progressed and (main_waiting or not got_report) and now - done_ts > float(wd["dead_wait_seconds"]):
-            why = "ana oturum bekleme komutunda" if main_waiting else "alt-ajan raporu ana oturuma ulaşmadı"
-            return res(2, "dead_wait", done_ts, f"ölü bekleme — alt-ajan {dur_tr(now - done_ts)} önce bitti, {why}")
+    handback_ts = max([float(r.get("ts") or 0) for r in main_rows if r.get("kind") == "handback"] or [0.0])
+    wait_limit = min(float(wd["dead_wait_seconds"]), float(DUE_REPORT_SECONDS))
+    main_waiting = any(a == "main" and WAIT_CMD_RE.search(w) for a, _, w in _running_commands(rows))
+    if reports_due is not None:
+        # keyed on the registry: a report that is due and has not arrived (a hand-back row settles it)
+        due_at = [float(d.get("at") or 0) for d in reports_due if not handback_ts or float(d.get("at") or 0) > handback_ts]
+        since: Optional[float] = min(due_at) if due_at else None
+    else:
+        since = done_ts if done_ts and (handback_ts <= done_ts or main_waiting) else None
+    if since is not None:
+        progressed = any(float(r.get("ts") or 0) > since and r.get("kind") in ("tool", "answer", "deny", "result", "user")
+                         and not _is_wait_row(r) for r in main_rows)
+        quiet_since = max(since, last_activity(rows, ignore_end=True))
+        if not progressed and now - quiet_since > wait_limit:
+            why = i18n.t("tempo.dead_why_wait_cmd" if main_waiting else "tempo.dead_why_no_report")
+            return res(2, "dead_wait", since, i18n.t("tempo.stall_dead_wait", ago=i18n.ago(now - since), why=why))
     activity_ts = max([float(r.get("ts") or 0) for r in rows] or [0.0])
     last_ts = max(activity_ts, state_ts)
     if last_ts and now - last_ts > float(wd["silent_seconds"]) and not _running_commands(rows):
-        lost = f" ({len(pending)} alt-ajan kaydı var ama {dur_tr(quiet)} hiçbir iz yok)" if pending and quiet else ""
+        lost = " " + i18n.t("tempo.lost_agents", n=len(pending), dur=dur_tr(quiet)) if pending and quiet else ""
         if state_ts > activity_ts:
-            hook_activity = f"son hook aktivitesi {dur_tr(now - activity_ts)} önce" if activity_ts else "henüz hook aktivitesi yok"
-            return res(4, "silent", last_ts, f"sessiz oturum — run state {dur_tr(now - state_ts)} önce güncellendi; "
-                       f"{hook_activity}; canlılık hook kayıtlarından doğrulanamıyor{lost}")
-        return res(4, "silent", last_ts, f"sessiz oturum — {dur_tr(now - last_ts)} kayıt yok; oturum kapanmış ya da çökmüş "
-                                         f"olabilir{lost}")
-    return res(0, "working", last_ts, "çalışıyor")
+            hook_activity = i18n.t("tempo.hook_last", ago=i18n.ago(now - activity_ts)) if activity_ts \
+                else i18n.t("tempo.hook_none")
+            return res(4, "silent", last_ts, i18n.t("tempo.stall_silent_state", ago=i18n.ago(now - state_ts),
+                                                    hook=hook_activity, lost=lost))
+        return res(4, "silent", last_ts, i18n.t("tempo.stall_silent", dur=dur_tr(now - last_ts), lost=lost))
+    return res(0, "working", last_ts, i18n.t("tempo.stall_working"))
 
 
 def dead_wait_share(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -695,3 +923,69 @@ def dead_wait_share(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                 longest = max(longest, gap)
             waiting_since = None
     return {"window": window, "dead": dead, "share": (dead / window) if window else 0.0, "count": count, "longest": longest}
+
+
+# ---------------------------------------------------------------- waiting without a model (orkestra wait)
+
+WAIT_POLL = 2.0              # seconds between looks at the registry, the state and the review files
+WAIT_MAX = 540               # default cap: below the 600 s a Bash call may run
+
+
+def _artifact_stamp(project: Path, run_id: str) -> float:
+    """Newest write time among the files a subagent hands its result over in: reviews/*.md and tasks/*.report.md."""
+    fdir, best = paths.feature_dir(project, run_id), 0.0
+    for sub, pat in (("reviews", "*.md"), ("tasks", "*.report.md")):
+        d = fdir / sub
+        if not d.is_dir():
+            continue
+        try:
+            for f in d.glob(pat):
+                best = max(best, f.stat().st_mtime)
+        except OSError:
+            continue
+    return best
+
+
+def wait_for(project: Path, run_id: str, max_seconds: float = WAIT_MAX, poll: float = WAIT_POLL,
+             sleep: Any = time.sleep, clock: Any = time.monotonic, wall: Any = time.time) -> Dict[str, Any]:
+    """Block INSIDE this process (no model turn, no tokens) until something the orchestrator must react to happens.
+
+    Returns {"reason", "waited"}: `idle` no subagent is pending (also at once, when none was) · `reports` another
+    subagent stopped during the wait (its report is on its way) · `handback` a hand-back reached the main session · `status` the run left
+    `active` · `artifact` a review / task report file changed · `timeout` the cap passed. Never longer than
+    max_seconds (+ one poll). Clocks are injectable for tests."""
+    from .state import load_state                      # late: keeps tempo importable by state-free callers
+    t0 = clock()
+    seen_artifact = _artifact_stamp(project, run_id)
+    seen_handback = A.last_handback_at(project, run_id)
+    seen_due = {str(d.get("id")) for d in A.agents_reports_due(project, run_id, now=wall())}   # already known: no thrash
+    max_seconds = max(0.0, float(max_seconds))
+    while True:
+        waited = clock() - t0
+        st = load_state(project, run_id)
+        if st.get("status") != "active":
+            return {"reason": "status", "waited": waited}
+        running, _lost = live_agents(project, run_id, now=wall())
+        if not running:
+            return {"reason": "idle", "waited": waited}
+        if any(str(d.get("id")) not in seen_due for d in A.agents_reports_due(project, run_id, now=wall())):
+            return {"reason": "reports", "waited": waited}
+        if A.last_handback_at(project, run_id) > seen_handback:
+            return {"reason": "handback", "waited": waited}
+        if _artifact_stamp(project, run_id) > seen_artifact:
+            return {"reason": "artifact", "waited": waited}
+        if waited >= max_seconds:
+            return {"reason": "timeout", "waited": waited}
+        sleep(max(0.0, min(poll, max_seconds - waited)))
+
+
+def stop_tail(project: Path, st: Dict[str, Any]) -> str:
+    """The closing sentence of the Stop nudge, by mode: autopilot never sends the model to AskUserQuestion / await."""
+    p = p_arg(project)
+    if is_autopilot(st):
+        return (f"Autopilot has no user to ask: take the most conservative option and continue; with no safe default run "
+                f"`orkestra task defer <TID> \"<why>\" {p}` or `orkestra block \"<reason>\" {p}` and explain. If the user "
+                f"changed topic and this chat drives the run, run `orkestra pause {p}` first.")
+    return (f"If you must wait for the user, ask with AskUserQuestion, or run `orkestra await \"<question>\" {p}` "
+            f"(headless). If truly blocked, run `orkestra block \"<reason>\" {p}` and explain. If the user "
+            f"changed topic and this chat drives the run, run `orkestra pause {p}` first.")

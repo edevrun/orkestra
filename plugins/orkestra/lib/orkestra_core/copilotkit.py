@@ -10,12 +10,13 @@ import json
 import os
 import re
 import shutil
-import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import engines as EN
+from . import i18n
+from .util import hook_python, replace_file
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent
 HOOK_SCRIPT = PLUGIN_ROOT / "hooks" / "copilot_hook.py"
@@ -46,12 +47,8 @@ def hooks_path() -> Path:
 
 
 def _python() -> str:
-    """The interpreter the hook commands name. Not a virtualenv's (it disappears with the venv): its base."""
-    if getattr(sys, "base_prefix", sys.prefix) != sys.prefix:
-        base = Path(sys.base_prefix) / "bin" / "python3"
-        if base.exists():
-            return str(base)
-    return shutil.which("python3") or sys.executable or "python3"
+    """The interpreter the hook commands name (util.hook_python: not a virtualenv's, never the Windows Store stub)."""
+    return hook_python()
 
 
 def hook_command(event: str, python: Optional[str] = None) -> str:
@@ -67,13 +64,13 @@ def _check_shape(doc: Any, where: str = "hooks.json") -> None:
     if doc is None:
         return
     if not isinstance(doc, dict):
-        raise EN.EngineError(f"{where} is not a JSON object — fix it first (nothing was changed)")
+        raise EN.EngineError(i18n.t("cli.kit_not_object", where=where))
     hooks = doc.get("hooks")
     if hooks is not None and not isinstance(hooks, dict):
-        raise EN.EngineError(f"{where}: \"hooks\" is not an object — fix it first (nothing was changed)")
+        raise EN.EngineError(i18n.t("cli.kit_hooks_not_object", where=where))
     for event, entries in (hooks or {}).items():
         if not isinstance(entries, list):
-            raise EN.EngineError(f"{where}: hooks.{event} is not a list — fix it first (nothing was changed)")
+            raise EN.EngineError(i18n.t("cli.kit_event_not_list", where=where, event=event))
 
 
 def _kept_python(entries: List[Any], event: str) -> Optional[str]:
@@ -129,15 +126,16 @@ def _write_hooks(hp: Path, doc: Dict[str, Any], actions: List[str], dry: bool) -
         while backup.exists():
             n += 1
             backup = target.with_name(f"hooks.json.orkestra-backup-{stamp}-{n}")
-        actions.append(f"backup {target} → {backup.name}")
+        actions.append(i18n.t("cli.kit_backup", target=target, backup=backup.name))
         if not dry:
             shutil.copy2(target, backup)
     if dry:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, target)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    replace_file(tmp, target)
 
 
 def install(dry: bool = False) -> List[str]:
@@ -146,11 +144,11 @@ def install(dry: bool = False) -> List[str]:
     hp = hooks_path()
     cur = _read_json(hp)
     if (hp.exists() or hp.is_symlink()) and not isinstance(cur, dict):
-        raise EN.EngineError(f"{hp} is not valid JSON — fix it first (nothing was changed)")
+        raise EN.EngineError(i18n.t("cli.kit_bad_json", path=hp))
     new = merge_hooks(cur)
     if new != cur:
         _write_hooks(hp, new, actions, dry)
-        actions.append(f"hooks.json: orkestra entries for {', '.join(HOOK_EVENTS)}")
+        actions.append(i18n.t("cli.kit_hooks_added", events=", ".join(HOOK_EVENTS)))
     return actions
 
 
@@ -158,10 +156,12 @@ def uninstall(dry: bool = False) -> List[str]:
     actions: List[str] = []
     hp = hooks_path()
     cur = _read_json(hp)
+    if (hp.exists() or hp.is_symlink()) and not isinstance(cur, dict):
+        raise EN.EngineError(i18n.t("cli.kit_bad_json", path=hp))
     new = strip_hooks(cur) if isinstance(cur, dict) else None
     if new is not None and new != cur:
         _write_hooks(hp, new, actions, dry)
-        actions.append("hooks.json: orkestra entries removed")
+        actions.append(i18n.t("cli.kit_hooks_removed"))
     return actions
 
 
@@ -174,7 +174,7 @@ def status(cfg: Optional[Dict[str, Any]] = None) -> List[Tuple[Optional[bool], s
     """[(ok | None = information only, label, detail)] — read-only."""
     rows: List[Tuple[Optional[bool], str, str]] = []
     b = EN.binary("copilot", cfg)
-    rows.append((bool(b), "copilot CLI", b or "not found"))
+    rows.append((bool(b), "copilot CLI", b or i18n.t("cli.kit_not_found")))
     active = hooks_active()
-    rows.append((active, "copilot hooks", "active" if active else "not installed"))
+    rows.append((active, "copilot hooks", i18n.t("cli.kit_active" if active else "cli.kit_not_installed")))
     return rows

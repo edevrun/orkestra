@@ -1,49 +1,53 @@
 <!doctype html>
-<html lang="tr">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
-  <title>Orkestra — Yerel çalışma alanı</title>
+  <title data-i18n="page.title">Orkestra · Local workspace</title>
   <link rel="stylesheet" href="/app.css">
+  <script defer src="/i18n.js"></script>
   <script defer src="/app.js"></script>
 </head>
 <body>
+  <!-- Text: English here (the default and the no-script fallback); app.js swaps in the language chosen by i18n.js
+       through data-i18n (text), data-i18n-rich (text with `code`), data-i18n-attr (attribute:key;...). -->
   <header class="topbar">
-    <a class="brand" href="/" aria-label="Orkestra ana sayfa">
+    <a class="brand" href="/" aria-label="Orkestra home" data-i18n-attr="aria-label:brand.aria">
       <span class="brand-mark">O</span>
       <span>orkestra</span>
-      <span class="local-tag">LOCAL</span>
+      <span class="local-tag" data-i18n="brand.local">LOCAL</span>
     </a>
     <div class="top-actions">
-      <span id="connection-status" class="connection-status" role="status">Bağlı değil</span>
-      <button id="disconnect-button" class="button button-quiet" type="button" hidden>Bağlantıyı kes</button>
+      <span id="connection-status" class="connection-status" role="status">Not connected</span>
+      <button id="lang-button" class="button button-quiet" type="button" title="Switch the interface language" data-i18n-attr="title:lang.title">T&uuml;rk&ccedil;e</button>
+      <button id="disconnect-button" class="button button-quiet" type="button" data-i18n="disconnect.button" hidden>Disconnect</button>
     </div>
   </header>
 
   <main class="shell">
     <section class="hero">
-      <p class="eyebrow">CONTROLLED AGENT WORKFLOW · LOCALHOST ONLY</p>
-      <h1>İsteğini yaz.<br><span>Kontrollü akışa bırak.</span></h1>
-      <p class="hero-copy">Proje ve çalışma motorunu seç; Orkestra keşif, plan, onay, uygulama ve doğrulama adımlarını yönetir.</p>
-      <div class="phase-strip" aria-label="Orkestra akışı">
-        <span>Keşif</span><i></i><span>Plan</span><i></i><span>Onay</span><i></i><span>Uygulama</span><i></i><span>Doğrulama</span>
+      <p class="eyebrow" data-i18n="hero.eyebrow">CONTROLLED AGENT WORKFLOW · LOCALHOST ONLY</p>
+      <h1><span class="plain" data-i18n="hero.title_a">Write your request.</span><br><span data-i18n="hero.title_b">Leave it to a controlled flow.</span></h1>
+      <p class="hero-copy" data-i18n="hero.copy">Pick the project and the agent engine; Orkestra runs discovery, planning, approval, implementation and verification.</p>
+      <div class="phase-strip" aria-label="Orkestra flow" data-i18n-attr="aria-label:hero.strip_aria">
+        <span data-i18n="hero.p1">Discovery</span><i></i><span data-i18n="hero.p2">Plan</span><i></i><span data-i18n="hero.p3">Approval</span><i></i><span data-i18n="hero.p4">Implementation</span><i></i><span data-i18n="hero.p5">Verification</span>
       </div>
     </section>
 
     <section id="connect-panel" class="panel connect-panel">
       <div>
-        <p class="eyebrow">YEREL BRIDGE</p>
-        <h2>Güvenli şekilde bağlan</h2>
-        <p>Token yalnız bu sekmenin belleğinde tutulur; URL’ye veya tarayıcı depolamasına yazılmaz. Sayfayı yenileyince yeniden girmen gerekir.</p>
+        <p class="eyebrow" data-i18n="connect.eyebrow">LOCAL BRIDGE</p>
+        <h2 data-i18n="connect.title">Connect securely</h2>
+        <p data-i18n="connect.copy">The token stays in this tab's memory only; it is never written to the URL or to browser storage. Reloading the page asks for it again.</p>
       </div>
       <form id="connect-form" class="connect-form">
-        <label for="bridge-token">Bridge token</label>
+        <label for="bridge-token" data-i18n="connect.label">Bridge token</label>
         <div class="input-row">
           <input id="bridge-token" type="password" name="bridge-token" autocomplete="off" spellcheck="false" required>
-          <button class="button button-primary" type="submit">Bağlan</button>
+          <button class="button button-primary" type="submit" data-i18n="connect.button">Connect</button>
         </div>
-        <p class="field-hint">Yerel dosya: <code>~/.orkestra/bridge.secret.json</code> içindeki <code>token</code> alanı.</p>
+        <p class="field-hint" data-i18n-rich="connect.hint">Local file: <code>~/.orkestra/bridge.secret.json</code>, field <code>token</code>.</p>
         <p id="connect-error" class="error-message" role="alert" hidden></p>
       </form>
     </section>
@@ -53,58 +57,59 @@
         <section class="panel composer">
           <div class="panel-heading">
             <div>
-              <p class="eyebrow">YENİ ÇALIŞMA</p>
-              <h2>Ne yapmak istiyorsun?</h2>
+              <p class="eyebrow" data-i18n="composer.eyebrow">NEW RUN</p>
+              <h2 data-i18n="composer.title">What do you want to do?</h2>
             </div>
             <span class="step-number">01</span>
           </div>
           <form id="job-form">
             <div class="form-grid">
               <div class="field">
-                <label for="project-select">Proje</label>
+                <label for="project-select" data-i18n="project.label">Project</label>
                 <select id="project-select" required>
-                  <option value="">Bağlanınca projeler yüklenecek</option>
+                  <option value="" data-i18n="project.loading">Projects load once you connect</option>
                 </select>
                 <p id="project-scope" class="field-hint"></p>
               </div>
               <div class="field">
-                <label for="engine-select">Agent motoru</label>
+                <label for="engine-select" data-i18n="engine.label">Agent engine</label>
                 <select id="engine-select" required>
-                  <option value="">Yükleniyor…</option>
+                  <option value="" data-i18n="engine.loading">Loading…</option>
                 </select>
-                <p id="engine-hint" class="field-hint">Alt-agent ekibini Orkestra aşamaya göre seçer.</p>
+                <p id="engine-hint" class="field-hint">Orkestra picks the sub-agent team for each phase.</p>
               </div>
             </div>
             <div class="field">
               <div class="label-row">
-                <label for="request-input">İstek</label>
-                <span id="request-count" class="field-hint">0 / 10.000</span>
+                <label for="request-input" data-i18n="request.label">Request</label>
+                <span id="request-count" class="field-hint">0 / 10,000</span>
               </div>
               <textarea id="request-input" minlength="3" maxlength="10000" rows="5" required
-                placeholder="Örn. Sipariş listesine CSV dışa aktarma ekle; mevcut testleri ve API sözleşmesini koru."></textarea>
+                placeholder="E.g. Add CSV export to the orders list; keep the existing tests and the API contract."
+                data-i18n-attr="placeholder:request.placeholder"></textarea>
             </div>
             <label class="consent-row">
               <input id="consent-check" type="checkbox" required>
-              <span>Agent’ın seçtiğim projede, işletim sistemi kullanıcı izinlerimle çalıştığını ve değişiklikleri kendim incelemem gerektiğini anlıyorum.</span>
+              <span data-i18n="consent.text">I understand that the agent runs in the project I selected with my operating system user permissions, and that I must review the changes myself.</span>
             </label>
             <div class="submit-row">
               <p id="job-error" class="error-message" role="alert" hidden></p>
-              <button id="start-button" class="button button-primary button-start" type="submit" disabled>Akışı başlat <span aria-hidden="true">→</span></button>
+              <button id="start-button" class="button button-primary button-start" type="submit" disabled><span data-i18n="start.button">Start the flow</span> <span aria-hidden="true">→</span></button>
             </div>
           </form>
         </section>
 
         <aside class="panel guide-panel">
-          <p class="eyebrow">NASIL İŞLER</p>
-          <h2>Sen kontrolü elinde tutarsın.</h2>
+          <p class="eyebrow" data-i18n="guide.eyebrow">HOW IT WORKS</p>
+          <h2 data-i18n="guide.title">You stay in control.</h2>
           <ol class="guide-list">
-            <li><span>1</span><div><b>İstek ve proje</b><p>Kapsamı net bir dille yaz; doğru klasörü seç.</p></div></li>
-            <li><span>2</span><div><b>Plan ve onay</b><p>Normal akışta planı sen onaylamadan uygulama başlamaz.</p></div></li>
-            <li><span>3</span><div><b>İlerlemeyi izle</b><p>Sorulara buradan yanıt ver; canlı durum bu sayfada güncellenir.</p></div></li>
+            <li><span>1</span><div><b data-i18n="guide.1.title">Request and project</b><p data-i18n="guide.1.body">Describe the scope clearly; pick the right folder.</p></div></li>
+            <li><span>2</span><div><b data-i18n="guide.2.title">Plan and approval</b><p data-i18n="guide.2.body">In the normal flow nothing is implemented until you approve the plan.</p></div></li>
+            <li><span>3</span><div><b data-i18n="guide.3.title">Follow progress</b><p data-i18n="guide.3.body">Answer questions here; the live status updates on this page.</p></div></li>
           </ol>
           <div class="local-notice">
             <span class="notice-icon" aria-hidden="true">i</span>
-            <p>Bu arayüz yalnız bu bilgisayarda dinler. Orkestra veriyi kendi sunucusuna göndermez; seçtiğin Claude Code veya Cursor aracı, istek ve kodu kendi sağlayıcısına aktarabilir.</p>
+            <p data-i18n="guide.notice">This interface listens on this computer only. Orkestra does not send data to its own server; the Claude Code, Cursor or Copilot tool you pick may send the request and code to its own provider.</p>
           </div>
         </aside>
       </div>
@@ -112,63 +117,63 @@
       <section class="flow-section" aria-labelledby="flow-heading">
         <div class="flow-section-heading">
           <div class="flow-heading-copy">
-            <p class="eyebrow">CANLI ORKESTRASYON</p>
-            <h2 id="flow-heading">Akışın haritası</h2>
-            <p>Her adım, ajan ve hareket gerçek çalışma kaydından gelir; geçmiş etkinlikleri aktif çalışma gibi göstermeyiz.</p>
+            <p class="eyebrow" data-i18n="flow.eyebrow">LIVE ORCHESTRATION</p>
+            <h2 id="flow-heading" data-i18n="flow.heading">Flow map</h2>
+            <p data-i18n="flow.copy">Every step, agent and action comes from the real run record; past activity is never shown as an active run.</p>
           </div>
           <div class="flow-summary" aria-live="off">
             <span class="flow-summary-mark" aria-hidden="true"></span>
-            <span id="flow-summary">Akış bekleniyor</span>
+            <span id="flow-summary">Waiting for the flow</span>
           </div>
         </div>
         <div id="flows-list" class="flows-list">
           <div class="empty-state flow-empty">
             <span class="empty-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
-            <b>Orkestra hazır</b>
-            <span>Bir çalışma başladığında fazları, ajanları ve son hareketleri burada canlı izleyeceksin.</span>
+            <b data-i18n="flow.empty_title">Orkestra is ready</b>
+            <span data-i18n="flow.empty_body">When a run starts, you will follow its phases, agents and latest actions here, live.</span>
           </div>
         </div>
         <div class="flow-footer">
-          <span id="flows-updated" class="field-hint" role="status">Akış verisi henüz alınmadı</span>
-          <span class="flow-live-legend"><i aria-hidden="true"></i> açık çalışma · yaklaşık 6 sn’de yenilenir</span>
+          <span id="flows-updated" class="field-hint" role="status">No flow data yet</span>
+          <span class="flow-live-legend"><i aria-hidden="true"></i> <span data-i18n="flow.legend">open run · refreshes about every 6 s</span></span>
         </div>
       </section>
 
       <section class="jobs-section">
         <div class="jobs-heading">
           <div>
-            <p class="eyebrow">CANLI TAKİP</p>
-            <h2>Çalışmalar</h2>
+            <p class="eyebrow" data-i18n="jobs.eyebrow">LIVE TRACKING</p>
+            <h2 data-i18n="jobs.heading">Runs</h2>
           </div>
           <div class="jobs-tools">
-            <span id="jobs-updated" class="field-hint">Henüz güncellenmedi</span>
-            <button id="refresh-button" class="button button-quiet" type="button">Görünümü yenile</button>
+            <span id="jobs-updated" class="field-hint">Not updated yet</span>
+            <button id="refresh-button" class="button button-quiet" type="button" data-i18n="jobs.refresh">Refresh view</button>
           </div>
         </div>
         <div id="jobs-list" class="jobs-list" aria-live="polite">
-          <div class="empty-state">Bridge’e bağlanınca son çalışmalar burada görünür.</div>
+          <div class="empty-state" data-i18n="jobs.empty_connect">Recent runs appear here once you connect to the bridge.</div>
         </div>
       </section>
     </section>
 
     <section class="legal-panel">
       <div class="legal-copy">
-        <p class="eyebrow">KULLANIM, LİSANS VE KAYNAK</p>
-        <h2>Şeffaf ve yerel.</h2>
-        <p>Orkestra açık kaynak MIT lisanslıdır. Üçüncü taraf referans dosyalarının lisansları ve upstream kaynakları ayrı listelenir. Orkestra bağımsızdır; Anthropic, Cursor veya listelenen projeler tarafından desteklenmez.</p>
-        <p>Yazılım “olduğu gibi” sunulur; çıktı veya hukuki uygunluk garantisi vermez ve hukuki tavsiye değildir. Guard’lar sandbox değildir: agent yerel kullanıcı yetkileriyle çalışır. Üretilen değişiklikleri ve sağlayıcının kullanım/veri koşullarını incelemek senin sorumluluğundadır.</p>
+        <p class="eyebrow" data-i18n="legal.eyebrow">USE, LICENSE AND SOURCES</p>
+        <h2 data-i18n="legal.title">Transparent and local.</h2>
+        <p data-i18n="legal.p1">Orkestra is open source under the MIT license. The licenses and upstream sources of third-party reference files are listed separately. Orkestra is independent; it is not endorsed by Anthropic, Cursor or the listed projects.</p>
+        <p data-i18n="legal.p2">The software is provided “as is”; it makes no guarantee about output or legal fitness and is not legal advice. Guards are not a sandbox: the agent runs with your local user permissions. Reviewing the generated changes and the provider's usage and data terms is your responsibility.</p>
       </div>
-      <nav class="legal-links" aria-label="Lisans ve kaynak belgeleri">
-        <a href="/legal/license" target="_blank" rel="noopener">MIT lisansı <span>↗</span></a>
-        <a href="/legal/third-party-notices" target="_blank" rel="noopener">Üçüncü taraf kaynakları <span>↗</span></a>
-        <a href="/legal/security" target="_blank" rel="noopener">Güvenlik açıklaması <span>↗</span></a>
+      <nav class="legal-links" aria-label="License and source documents" data-i18n-attr="aria-label:legal.nav_aria">
+        <a href="/legal/license" target="_blank" rel="noopener"><span data-i18n="legal.license">MIT license</span> <span>↗</span></a>
+        <a href="/legal/third-party-notices" target="_blank" rel="noopener"><span data-i18n="legal.third_party">Third-party sources</span> <span>↗</span></a>
+        <a href="/legal/security" target="_blank" rel="noopener"><span data-i18n="legal.security">Security statement</span> <span>↗</span></a>
       </nav>
     </section>
   </main>
 
   <footer class="footer">
-    <span>Orkestra · yalnızca 127.0.0.1</span>
-    <span>MIT · telemetry yok · harici UI bağımlılığı yok</span>
+    <span data-i18n="footer.local">Orkestra · 127.0.0.1 only</span>
+    <span data-i18n="footer.tags">MIT · no telemetry · no external UI dependencies</span>
   </footer>
 </body>
 </html>

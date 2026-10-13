@@ -1,10 +1,16 @@
 import json
+import os
+import shlex
+import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import helpers
 from orkestra_core import gates as G
 from orkestra_core import planparse as PP
+from orkestra_core import util as U
 from orkestra_core.cli import hoist_globals
 
 
@@ -172,6 +178,173 @@ class TestGateDetect(helpers.Sandbox):
         self.assertEqual(G.normalize_pkg("zod@3.23"), "zod")
         self.assertEqual(G.normalize_pkg("@tanstack/react-query@5.1"), "@tanstack/react-query")
         self.assertEqual(G.normalize_pkg("requests==2.31"), "requests")
+
+
+class TestFileLock(unittest.TestCase):
+    """FR-001 / SC-001: POSIX fcntl, Windows msvcrt, else no-op."""
+
+    def _path(self, td: str) -> Path:
+        return Path(td) / "state.json"
+
+    def test_e1_msvcrt_locking_when_fcntl_absent(self):
+        msvcrt = mock.Mock()
+        msvcrt.LK_LOCK = 1
+        msvcrt.LK_UNLCK = 0
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(U, "fcntl", None), \
+                 mock.patch.object(U, "msvcrt", msvcrt, create=True):
+                with U.file_lock(self._path(td)):
+                    pass
+        calls = msvcrt.locking.call_args_list
+        self.assertGreaterEqual(len(calls), 2, "msvcrt.locking must lock then unlock (no-op forbidden)")
+        self.assertEqual(calls[0].args[1:], (msvcrt.LK_LOCK, 1))
+        self.assertEqual(calls[-1].args[1:], (msvcrt.LK_UNLCK, 1))
+
+    def test_e2_fcntl_flock_when_present(self):
+        fake_fcntl = mock.Mock()
+        fake_fcntl.LOCK_EX = 2
+        fake_fcntl.LOCK_UN = 8
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(U, "fcntl", fake_fcntl), \
+                 mock.patch.object(U, "msvcrt", mock.Mock(), create=True):
+                with U.file_lock(self._path(td)):
+                    pass
+        modes = [c.args[1] for c in fake_fcntl.flock.call_args_list]
+        self.assertEqual(modes, [fake_fcntl.LOCK_EX, fake_fcntl.LOCK_UN])
+
+    def test_e3_noop_when_both_absent(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.object(U, "fcntl", None), \
+                 mock.patch.object(U, "msvcrt", None, create=True):
+                with U.file_lock(self._path(td)):
+                    pass  # must not raise
+
+    def test_docstring_does_not_exclude_windows(self):
+        src = Path(U.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("Windows is not a target", src)
+
+
+class TestWinSubprocessRunner(unittest.TestCase):
+    """A list runs as argv without a shell; a string runs through the platform shell on every OS (on Windows cmd.exe,
+    so `npm test`, `cd x && y` and quoted arguments behave as in a terminal)."""
+
+    def test_run_cmd_list_never_shell(self):
+        with mock.patch.object(G.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b"", stderr=b"")) as run:
+            G._run_cmd(["python", "-m", "unittest"], cwd=".", env={}, timeout=5)
+        self.assertEqual(run.call_args.kwargs.get("shell"), False)
+        self.assertEqual(run.call_args.args[0], ["python", "-m", "unittest"])
+
+    def test_run_cmd_string_on_nt_goes_through_the_shell(self):
+        # Intentional change: this used to pin shell=False + shlex.split(posix=False) on Windows, which could not run
+        # npm.cmd / yarn.cmd / mvn.cmd, `&&` chains or quoted arguments (a failing quoted command even passed).
+        with mock.patch.object(G, "_IS_WINDOWS", True), \
+             mock.patch.object(G.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b"", stderr=b"")) as run:
+            G._run_cmd('cd sub && python -m unittest -k "a and b"', cwd=".", env={}, timeout=5)
+        self.assertEqual(run.call_args.kwargs.get("shell"), True)
+        self.assertEqual(run.call_args.args[0], 'cd sub && python -m unittest -k "a and b"')
+
+    def test_run_cmd_string_on_posix_keeps_shell(self):
+        with mock.patch.object(G, "_IS_WINDOWS", False), \
+             mock.patch.object(G.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b"", stderr=b"")) as run:
+            G._run_cmd("python -m unittest", cwd=".", env={}, timeout=5)
+        self.assertEqual(run.call_args.kwargs.get("shell"), True)
+
+    def test_a_list_keeps_every_argument_and_reports_the_real_exit_code(self):
+        cp = G._run_cmd([sys.executable, "-c", "import sys; sys.exit(3)"], cwd=os.getcwd(), env=dict(os.environ), timeout=60)
+        self.assertEqual(cp.returncode, 3)
+
+    def test_windows_resolves_the_program_through_path_like_a_shell(self):
+        """CreateProcess ignores PATHEXT: `npm` has to become `...\\npm.CMD` before it is started."""
+        with mock.patch.object(G, "_IS_WINDOWS", True), \
+             mock.patch.object(G.shutil, "which", return_value="C:\\node\\npm.CMD") as which, \
+             mock.patch.object(G.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+            G._run_cmd(["npm", "test", "--", "-k", "a b"], cwd=".", env={"PATH": "C:\\node"}, timeout=5)
+        which.assert_called_once_with("npm", path="C:\\node")
+        self.assertEqual(run.call_args.args[0], ["C:\\node\\npm.CMD", "test", "--", "-k", "a b"])
+        self.assertIs(run.call_args.kwargs["shell"], False)
+
+    def test_an_unresolvable_program_stays_as_typed_and_posix_never_resolves(self):
+        with mock.patch.object(G, "_IS_WINDOWS", True), mock.patch.object(G.shutil, "which", return_value=None):
+            self.assertEqual(G._resolve_argv(["nope", "x"], {}), ["nope", "x"])
+        with mock.patch.object(G, "_IS_WINDOWS", False), mock.patch.object(G.shutil, "which") as which:
+            self.assertEqual(G._resolve_argv(["npm", 5], {}), ["npm", "5"])
+        which.assert_not_called()
+
+    def test_a_string_goes_through_the_shell_on_either_os(self):
+        for windows in (True, False):
+            with self.subTest(windows=windows), mock.patch.object(G, "_IS_WINDOWS", windows), \
+                 mock.patch.object(G.subprocess, "run", return_value=mock.Mock(returncode=0)) as run:
+                G._run_cmd("cd sub && npm test", cwd=".", env={}, timeout=5)
+            self.assertIs(run.call_args.kwargs["shell"], True)
+            self.assertEqual(run.call_args.args[0], "cd sub && npm test")
+
+
+class TestGateThatCannotStart(unittest.TestCase):
+    """A program that is missing or not executable is a failed gate (127 / 126, as a shell reports it), not a crash
+    that ends `orkestra gate baseline` with 'could not read or write a file'."""
+
+    def test_a_missing_program_is_a_failed_gate_not_a_crash(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = G.run_gate(Path(td), {"name": "unit", "cmd": ["orkestra-no-such-program-xyz", "--flag"]},
+                             Path(td) / "logs", "t")
+            self.assertEqual((res["exit"], res["ok"], res["timed_out"]), (127, False, False))
+            self.assertIn("could not start", res["tail"])
+            self.assertIn("could not start", Path(res["log"]).read_text(encoding="utf-8"))
+
+    def test_a_program_that_is_not_executable_is_126(self):
+        # run_gate streams through Popen in its own process group now (it used to pin subprocess.run)
+        with mock.patch.object(G.subprocess, "Popen", side_effect=PermissionError(13, "denied")), \
+             tempfile.TemporaryDirectory() as td:
+            res = G.run_gate(Path(td), {"name": "unit", "cmd": ["x"]}, Path(td) / "logs", "t")
+        self.assertEqual(res["exit"], 126)
+
+    def test_a_shell_string_for_a_missing_program_stays_127(self):
+        with tempfile.TemporaryDirectory() as td:
+            res = G.run_gate(Path(td), {"name": "unit", "cmd": "orkestra-no-such-program-xyz"}, Path(td) / "logs", "t")
+        self.assertEqual((res["exit"], res["ok"]), (127, False))
+
+    def test_runs_helper_mirrors_gates(self):
+        from orkestra_core import runs as R
+        self.assertTrue(hasattr(R, "_run_shell_or_list"))
+        # The helper now runs through G._stream_cmd (own process group, kill-tree on timeout); the list-versus-shell
+        # decision is still visible in the first argument that runner receives.
+        ok = (0, b"", "")
+        with mock.patch.object(G, "_IS_WINDOWS", True), mock.patch.object(G, "_stream_cmd", return_value=ok) as run:
+            R._run_shell_or_list("python -c pass", cwd=".", timeout=5, env={})
+        self.assertEqual(run.call_args.args[0], "python -c pass")                  # a lone string: through the shell
+        # Several arguments run as a list on Windows. `shlex.join` quotes with ' which cmd.exe does not understand: the
+        # old path split that record back with posix=False and ran `python -c "'import sys; sys.exit(3)'"`, a string
+        # statement that exits 0, so a failing command was recorded as a pass.
+        argv = [sys.executable, "-c", "import sys; sys.exit(3)"]
+        with mock.patch.object(G, "_IS_WINDOWS", True), mock.patch.object(G.shutil, "which", return_value=None), \
+             mock.patch.object(G.subprocess, "Popen", wraps=G.subprocess.Popen) as popen:
+            cp = R._run_shell_or_list(shlex.join(argv), cwd=os.getcwd(), timeout=60, env=dict(os.environ), argv=argv)
+        self.assertEqual(cp.returncode, 3)
+        self.assertEqual(popen.call_args.args[0], argv)
+        self.assertIs(popen.call_args.kwargs["shell"], False)
+        # a lone command string (`npm test && echo ok`) and every POSIX run keep going through the shell
+        with mock.patch.object(G, "_IS_WINDOWS", True), mock.patch.object(G, "_stream_cmd", return_value=ok) as run:
+            R._run_shell_or_list("npm test && echo ok", cwd=".", timeout=5, env={}, argv=["npm test && echo ok"])
+        self.assertEqual(run.call_args.args[0], "npm test && echo ok")
+        with mock.patch.object(G, "_IS_WINDOWS", False), mock.patch.object(G, "_stream_cmd", return_value=ok) as run:
+            R._run_shell_or_list(shlex.join(argv), cwd=".", timeout=5, env={}, argv=argv)
+        self.assertEqual(run.call_args.args[0], shlex.join(argv))
+
+
+class TestConfigMergeIsTypeSafe(unittest.TestCase):
+    def test_wrong_typed_settings_fall_back_to_the_defaults(self):
+        from orkestra_core import paths
+        merged = paths._deep_merge(paths.DEFAULT_GLOBAL_CONFIG, {
+            "engine": "cursor", "guards": {"git": "yes", "secrets": False}, "workspace_root": 5, "lang": ["tr"],
+            "watchdog": {"dead_wait_seconds": "soon", "loop_repeats": 4.5}, "extra": {"anything": 1}})
+        self.assertEqual(merged["engine"], paths.DEFAULT_GLOBAL_CONFIG["engine"])           # object expected
+        self.assertIs(merged["guards"]["git"], True)                                         # flag expected
+        self.assertIs(merged["guards"]["secrets"], False)                                    # a valid override still applies
+        self.assertEqual(merged["workspace_root"], "~/Projects")
+        self.assertEqual(merged["lang"], "auto")
+        self.assertEqual(merged["watchdog"]["dead_wait_seconds"], 90)
+        self.assertEqual(merged["watchdog"]["loop_repeats"], 4.5)                            # numbers interchange
+        self.assertEqual(merged["extra"], {"anything": 1})                                   # unknown keys pass through
 
 
 if __name__ == "__main__":

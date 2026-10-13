@@ -12,9 +12,9 @@ disable-model-invocation: true
 - AskUserQuestion does not exist. Wherever the text says to ask with it: write the question(s) in the chat, run
   `orkestra await "<one-line summary>"`, then end your turn (`orkestra playbook headless` has the wording — the user
   reads your message right here in the chat). The user's next message is the answer; a hook marks the run active
-  again. Plan approval is any clear approve intent the hook recognizes ("onay", "onaylıyorum",
-  "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "onay". Never approve yourself; after
-  their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
+  again. Plan approval is any clear approve intent the hook recognizes ("approve", "I approve", "go ahead", "lgtm",
+  "onay", "onaylıyorum", "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "approve". Never
+  approve yourself; after their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
   never skipped ("don't ask questions" in the request does not waive it) and never recorded by you in any way.
 - There is no SendMessage: to send findings back to a subagent, launch the same subagent type again with the
   findings and the path of its previous report.
@@ -26,10 +26,11 @@ disable-model-invocation: true
 The user explicitly asked to roll back an orkestra run. Hint: (what the user wrote with this command)
 
 1. `orkestra context` (with `-p <project>`) and identify the run (active run, or the run id given; finished runs need `--run <id>`).
-2. Dry run: `orkestra rollback -p <project> [--run <id>]`. Show the two groups in Turkish: files orkestra changed, and
+2. Dry run: `orkestra rollback -p <project> [--run <id>]`. Show the two groups in the user's language (English by default, Turkish when they write Turkish): files orkestra changed, and
    "other differences" (possibly the user's own edits made meanwhile — these are kept unless `--all`).
 3. Ask in the chat which one they want and END YOUR TURN. Applying needs the user's own message: they send
-   `/orkestra-rollback uygula` (only orkestra's changes) or `/orkestra-rollback uygula --all`; anything else = no.
+   `/orkestra-rollback apply` or `/orkestra-rollback uygula` (only orkestra's changes), or the same with
+   `--all` (also the other differences); anything else = no.
 4. Apply accordingly: `orkestra rollback -p <project> [--run <id>] --yes [--all]`. Current contents are saved first
    (the CLI prints where), so the rollback itself can be undone.
 5. If the run was still open: `orkestra abort "rolled back by user" -p <project>`.

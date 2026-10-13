@@ -7,12 +7,17 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+from . import i18n
+from .lazy import LazyModule
 from .util import now_iso, read_json, tail_lines, write_json_atomic, write_text_atomic
+
+# Imported on first use: the hooks load this module for normalize_pkg only (each import costs 3 to 4 ms).
+shutil = LazyModule("shutil")
+subprocess = LazyModule("subprocess")
 
 DEFAULT_TIMEOUT = 900
 
@@ -168,7 +173,171 @@ def _detect_dir(d: Path, cwd: str, add: Any) -> None:
 
 # ---------------------------------------------------------------- running
 
-def run_gate(project: Path, gate: Dict[str, Any], log_dir: Path, label: str) -> Dict[str, Any]:
+
+_IS_WINDOWS = os.name == "nt"           # a module constant so tests can exercise the Windows branches (not os.name: pathlib)
+
+
+def _resolve_argv(argv, env: Optional[dict]) -> List[str]:
+    """Windows only: CreateProcess does not apply PATHEXT, so `npm` never finds `npm.cmd` (nor yarn, mvn, gradlew).
+    Resolve the program through PATH the way a shell does; elsewhere the list is used as given."""
+    out = [str(a) for a in argv]
+    if _IS_WINDOWS and out:
+        exe = shutil.which(out[0], path=(env or {}).get("PATH") or None)
+        if exe:
+            out[0] = exe
+    return out
+
+
+def _spawn_failure(exc: OSError) -> Tuple[int, str]:
+    """(exit code, output) for a command that could not even start, as a shell would report it (127 / 126)."""
+    return (126 if isinstance(exc, PermissionError) else 127), f"[orkestra] could not start the command: {exc}"
+
+
+def _run_cmd(cmd, *, cwd: str, env: dict, timeout: int):
+    """Run a gate command. A list runs as argv without a shell. A string runs through the platform shell (sh, or
+    cmd.exe on Windows) exactly as typed in a terminal: `cd sub && npm test`, quoting, `VAR=1 cmd` and the .cmd shims
+    of npm/yarn/mvn all behave the same way they do there."""
+    if isinstance(cmd, (list, tuple)):
+        return subprocess.run(_resolve_argv(cmd, env), shell=False, cwd=cwd, env=env, capture_output=True,
+                              timeout=timeout)
+    return subprocess.run(str(cmd), shell=True, cwd=cwd, env=env, capture_output=True, timeout=timeout)
+
+
+# Streaming runner: every gate gets its own process group, its output reaches the log file as it arrives, and a
+# timeout / idle stall / interrupt kills the WHOLE group (SIGTERM, then SIGKILL after KILL_GRACE s).
+KILL_GRACE = 3.0
+_OUTPUT_KEEP = 2_000_000                # bytes of output kept in memory for the tail; the log file holds everything
+_DRAIN_WAIT = 2.0                       # s a leader's exit waits for its output pipe before leftovers are killed
+
+
+def _kill_tree(proc: "subprocess.Popen", grace: float = KILL_GRACE) -> None:
+    """Terminate the command and every descendant it started (never raises)."""
+    if _IS_WINDOWS:
+        try:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    else:
+        import signal
+        pgid = proc.pid                     # start_new_session=True: the leader's pid is the group id
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+        except OSError:
+            pass
+        deadline = time.monotonic() + grace
+        while time.monotonic() < deadline:
+            proc.poll()                     # reap the leader so only live members keep the group alive
+            try:
+                os.killpg(pgid, 0)
+            except OSError:
+                break                       # nobody left in the group
+            time.sleep(0.05)
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _stream_cmd(cmd, *, cwd: str, env: dict, timeout: int, idle_timeout: int, log_file: Any,
+                abort: Any = None) -> Tuple[int, bytes, str]:
+    """Run `cmd` (list = argv, string = platform shell) and stream merged output into `log_file` (a binary file
+    object) as it arrives. Returns (exit code, kept output, reason) where reason is '' | timeout | idle | aborted.
+    Raises OSError when the program cannot start; kills the whole process group on any BaseException."""
+    import threading
+    kw: Dict[str, Any] = {"cwd": cwd, "env": env, "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+                          "stderr": subprocess.STDOUT}
+    if _IS_WINDOWS:
+        kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kw["start_new_session"] = True      # its own process group: the kill reaches every descendant
+    if isinstance(cmd, (list, tuple)):
+        proc = subprocess.Popen(_resolve_argv(cmd, env), shell=False, **kw)
+    else:
+        proc = subprocess.Popen(str(cmd), shell=True, **kw)
+    kept = bytearray()
+    last = [time.monotonic()]
+
+    def pump() -> None:
+        try:
+            while True:
+                chunk = proc.stdout.read1(65536)
+                if not chunk:
+                    return
+                last[0] = time.monotonic()
+                log_file.write(chunk)
+                log_file.flush()
+                kept.extend(chunk)
+                if len(kept) > _OUTPUT_KEEP:
+                    del kept[:len(kept) - _OUTPUT_KEEP]
+        except (OSError, ValueError):
+            return
+
+    reader = threading.Thread(target=pump, daemon=True)
+    reader.start()
+    started = time.monotonic()
+    reason = ""
+    try:
+        while True:
+            try:
+                proc.wait(timeout=0.25)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            now = time.monotonic()
+            if abort is not None and abort.is_set():
+                reason = "aborted"
+            elif timeout and now - started >= timeout:
+                reason = "timeout"
+            elif idle_timeout and now - last[0] >= idle_timeout:
+                reason = "idle"
+            if reason:
+                _kill_tree(proc)
+                break
+        reader.join(_DRAIN_WAIT)
+        if reader.is_alive():               # a descendant outlived the leader and holds the pipe: kill the leftovers
+            _kill_tree(proc)
+            reader.join(_DRAIN_WAIT)
+    except BaseException:
+        _kill_tree(proc)
+        reader.join(_DRAIN_WAIT)
+        try:
+            log_file.write(b"\n[orkestra] INTERRUPTED\n")
+            log_file.flush()
+        except (OSError, ValueError):
+            pass
+        raise
+    finally:
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+    code = proc.returncode if proc.returncode is not None else 124
+    if reason in ("timeout", "idle"):
+        code = 124
+    return code, bytes(kept), reason
+
+
+def _run_tree(cmd, *, cwd: str, env: dict, timeout: int) -> "subprocess.CompletedProcess":
+    """Evidence / TDD runner: like _run_cmd, but through _stream_cmd, so the command has its own process group, a
+    leader's exit waits at most _DRAIN_WAIT for a leaked background descendant, and a timeout kills the whole tree.
+    Output is merged (stdout holds both streams). Raises subprocess.TimeoutExpired like subprocess.run would."""
+    import io
+    sink = io.BytesIO()
+    code, kept, reason = _stream_cmd(cmd, cwd=cwd, env=env, timeout=timeout, idle_timeout=0, log_file=sink)
+    if reason == "timeout":
+        raise subprocess.TimeoutExpired(cmd, timeout, output=kept)
+    return subprocess.CompletedProcess(cmd, code, stdout=kept, stderr=b"")
+
+
+def run_gate(project: Path, gate: Dict[str, Any], log_dir: Path, label: str, abort: Any = None) -> Dict[str, Any]:
     log_dir.mkdir(parents=True, exist_ok=True)
     cwd = (Path(project) / gate.get("cwd", ".")).resolve(strict=False)
     env = dict(os.environ)
@@ -178,36 +347,141 @@ def run_gate(project: Path, gate: Dict[str, Any], log_dir: Path, label: str) -> 
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     started = time.time()
     timed_out = False
-    try:
-        cp = subprocess.run(gate["cmd"], shell=True, cwd=str(cwd), env=env, capture_output=True,
-                            timeout=int(gate.get("timeout", DEFAULT_TIMEOUT)))
-        code = cp.returncode
-        output = (cp.stdout or b"").decode("utf-8", "replace") + (cp.stderr or b"").decode("utf-8", "replace")
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        code = 124
-        output = ((exc.stdout or b"").decode("utf-8", "replace") if isinstance(exc.stdout, bytes) else str(exc.stdout or "")) + "\n[orkestra] TIMEOUT"
-    duration = round(time.time() - started, 1)
+    idle = False
+    timeout = int(gate.get("timeout", DEFAULT_TIMEOUT))
+    idle_timeout = int(gate.get("idle_timeout") or 0)       # 0 = off; e2e gates: 300 is a sensible value (see onboard)
     log_path = log_dir / f"{label}-{gate['name']}.log"
-    write_text_atomic(log_path, f"$ {gate['cmd']}\n(cwd={cwd})\n\n{output}\n[exit {code}]\n")
-    return {
+    output = ""
+    with open(log_path, "wb") as lf:
+        lf.write(f"$ {gate['cmd']}\n(cwd={cwd})\n\n".encode("utf-8", "replace"))
+        lf.flush()
+        try:
+            code, raw, reason = _stream_cmd(gate["cmd"], cwd=str(cwd), env=env, timeout=timeout,
+                                            idle_timeout=idle_timeout, log_file=lf, abort=abort)
+            output = raw.decode("utf-8", "replace")
+            if reason == "timeout":
+                timed_out = True
+                output += "\n[orkestra] TIMEOUT"
+            elif reason == "idle":
+                timed_out = idle = True
+                output += f"\n[orkestra] TIMEOUT-IDLE (no output for {idle_timeout}s)"
+            elif reason == "aborted":
+                output += "\n[orkestra] ABORTED"
+            if reason:
+                lf.write(("\n" + output.rsplit("\n", 1)[-1]).encode("utf-8", "replace"))
+        except OSError as exc:              # the program is missing or not executable: a failed gate, not a crash
+            code, output = _spawn_failure(exc)
+            lf.write(output.encode("utf-8", "replace"))
+        lf.write(f"\n[exit {code}]\n".encode("utf-8"))
+    duration = round(time.time() - started, 1)
+    res = {
         "name": gate["name"], "cmd": gate["cmd"], "kind": gate.get("kind", "other"),
         "exit": code, "ok": code == 0, "timed_out": timed_out, "duration_s": duration,
         "log": str(log_path), "tail": tail_lines(output, 30, 3000) if code != 0 else "",
         "at": now_iso(),
     }
+    if idle:
+        res["idle_timeout"] = True
+    return res
+
+
+_CONCURRENT_KINDS = ("typecheck", "lint", "test")
+_SERIAL_ORDER = {"build": 0, "e2e": 2}              # after the concurrent wave: build, anything else, then e2e
+
+
+def effective_parallel(requested: Any) -> int:
+    """Worker count for the concurrent wave: min(requested, cpu_count / 2), at least 1."""
+    try:
+        n = int(requested)
+    except (TypeError, ValueError):
+        return 1
+    return max(1, min(n, (os.cpu_count() or 2) // 2))
+
+
+def _concurrent(g: Dict[str, Any]) -> bool:
+    if g.get("exclusive") or g.get("parallel") is False:
+        return False
+    return bool(g.get("parallel")) or g.get("kind") in _CONCURRENT_KINDS
 
 
 def run_all(project: Path, gates: List[Dict[str, Any]], log_dir: Path, label: str,
-            only: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    results = []
+            only: Optional[List[str]] = None, *, parallel: Any = 1, on_result: Any = None,
+            reuse: Optional[Dict[str, Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Run the selected gates. `reuse` maps a gate name to a ready result (carried, skipped, resumed): not executed.
+    `on_result(results_so_far)` is called after every finished gate (config order) so progress is persisted at once.
+    parallel > 1 runs typecheck/lint/test gates concurrently first, then the rest serially (build, other, e2e);
+    with parallel 1 the order is exactly the config order. The returned list always follows the config order."""
+    selected = []
     for g in gates:
         if only and g["name"] not in only:
             continue
         if g.get("enabled") is False and not only:
             continue
-        results.append(run_gate(project, g, log_dir, label))
-    return results
+        selected.append(g)
+    done: Dict[int, Dict[str, Any]] = {}
+
+    def emit(i: int, res: Dict[str, Any]) -> None:
+        done[i] = res
+        if on_result is not None:
+            on_result([done[k] for k in sorted(done)])
+
+    todo = []
+    for i, g in enumerate(selected):
+        if reuse and g["name"] in reuse:
+            emit(i, reuse[g["name"]])
+        else:
+            todo.append(i)
+    workers = effective_parallel(parallel)
+    wave = [i for i in todo if _concurrent(selected[i])] if workers > 1 else []
+    if len(wave) < 2:
+        wave = []
+    rest = [i for i in todo if i not in wave]
+    if wave:
+        rest.sort(key=lambda i: _SERIAL_ORDER.get(selected[i].get("kind"), 1))
+    import threading
+    abort = threading.Event()
+    try:
+        if wave:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=min(workers, len(wave))) as pool:
+                futs = {pool.submit(run_gate, project, selected[i], log_dir, label, abort): i for i in wave}
+                try:
+                    for fut in as_completed(futs):
+                        emit(futs[fut], fut.result())
+                except BaseException:
+                    abort.set()             # the running gates kill their own process groups; queued ones never start
+                    for f in futs:
+                        f.cancel()
+                    raise
+        for i in rest:
+            emit(i, run_gate(project, selected[i], log_dir, label, abort))
+    except BaseException:
+        abort.set()
+        raise
+    return [done[i] for i in range(len(selected))]
+
+
+def glob_match(pattern: str, rel: str) -> bool:
+    """Project-relative glob: `*` and `?` stay inside a path segment, `**` crosses segments."""
+    while pattern.startswith("./"):
+        pattern = pattern[2:]
+    rx, i = "", 0
+    while i < len(pattern):
+        c = pattern[i]
+        if pattern.startswith("**/", i):
+            rx += "(?:.*/)?"
+            i += 3
+            continue
+        if pattern.startswith("**", i):
+            rx += ".*"
+            i += 2
+            continue
+        rx += "[^/]*" if c == "*" else ("[^/]" if c == "?" else re.escape(c))
+        i += 1
+    rel = rel.replace("\\", "/")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return re.fullmatch(rx, rel) is not None
 
 
 def compare(baseline: List[Dict[str, Any]], current: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -236,13 +510,21 @@ def compare(baseline: List[Dict[str, Any]], current: List[Dict[str, Any]]) -> Di
 def format_results(results: List[Dict[str, Any]], comparison: Optional[Dict[str, Any]] = None,
                    baseline: Optional[List[Dict[str, Any]]] = None) -> str:
     bmap = {r["name"]: r for r in (baseline or [])}
-    lines = ["| gate | baseline | now | süre | komut |", "|---|---|---|---|---|"]
+    lines = [i18n.t("runs.gate_table_header"), "|---|---|---|---|---|"]
     for r in results:
         b = bmap.get(r["name"])
         bcell = ("PASS" if b["ok"] else "FAIL") if b else "—"
-        lines.append(f"| {r['name']} | {bcell} | {'PASS' if r['ok'] else ('TIMEOUT' if r['timed_out'] else 'FAIL')} "
+        now_cell = "SKIPPED" if r.get("skipped") else (
+            ("PASS (carried)" if r.get("carried_from") else "PASS") if r["ok"] else ("TIMEOUT" if r["timed_out"] else "FAIL"))
+        lines.append(f"| {r['name']} | {bcell} | {now_cell} "
                      f"| {r['duration_s']}s | `{r['cmd']}` |")
     out = "\n".join(lines)
+    skipped = [r["name"] for r in results if r.get("skipped")]
+    if skipped:
+        out += "\n\n" + i18n.t("runs.gates_unprotected", names=", ".join(skipped))
+    carried = [r["name"] for r in results if r.get("carried_from")]
+    if carried:
+        out += "\n\n" + i18n.t("runs.gates_carried", names=", ".join(carried))
     if comparison is not None:
         out += "\n\n" + ("NO REGRESSIONS" if comparison["ok"] else "REGRESSION DETECTED")
         for key in ("regressions", "new_gate_failures", "not_run", "pre_existing_failures", "fixed"):

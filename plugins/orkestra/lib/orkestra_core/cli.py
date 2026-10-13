@@ -5,20 +5,25 @@ Exit codes: 0 ok · 1 check failed (e.g. regression) · 2 usage/precondition err
 from __future__ import annotations
 
 import argparse
+import codecs
+import contextlib
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
 from . import engines as EN
 from . import evidence as E
 from . import gates as G
+from . import i18n
 from . import intent
 from . import memory as M
 from . import paths
@@ -28,6 +33,8 @@ from . import snapshot as S
 from . import tempo as T
 from .cliparse import build_parser, hoist_globals, split_remainder  # noqa: F401  (one parser: CLI + guards)
 from .cliparse import parse as parse_argv
+from .cliparse import requested_lang
+from .messages import protocol as PR
 from .state import (PHASES, OrkestraError, bind_marker, load_state, project_active_run, unbind_marker)
 from .util import read_json, read_text
 
@@ -38,15 +45,32 @@ TEMPLATES = PLUGIN_ROOT / "templates"
 NEXT_ACTION = {
     "intake": "Classify the request (size XS/S/M/L, project, risk) into request.md → `orkestra phase next`.",
     "discover": "Load memory, run scouts (parallel, read-only) → context.md; confirm gates; `orkestra gate baseline` → `orkestra phase next`.",
-    "clarify": "Ask only outcome-changing questions (AskUserQuestion; max 4 per round, ≤2 rounds) → spec.md with ## Netleştirmeler → `orkestra phase next`.",
     "plan": "orkestra:architect writes plan.md → orkestra:plan-critic → fix until VERDICT: PASS → `orkestra plan check` → `orkestra phase next`.",
-    "approve": "Show the plan summary and ask for approval (header 'Plan onayı', option 'Onayla — uygulamaya başla'). Hooks record the answer → `orkestra phase next`.",
     "implement": "For each task in dependency order: brief → orkestra:implementer (TDD) → orkestra:reviewer → `orkestra task done`. Then `orkestra phase next`.",
     "verify": "`orkestra gate verify` (no regressions) → orkestra:verifier writes verification.md (VERDICT: PASS) → `orkestra phase next`.",
     "review": "Parallel final review (reviewer + adversary) → triage every finding in reviews/triage.md → fix via implementer → re-verify → `orkestra phase next`.",
     "deliver": "Write report.md, update memory (feature-add, specs, decisions, learnings) → `orkestra phase next` (done).",
     "done": "Run complete.",
 }
+
+
+def phase_goal(phase: str, autopilot: bool = False) -> str:
+    """One-line goal of a phase (model-facing, English). The two phases that name a heading or an AskUserQuestion
+    prompt render it in the current language; every parser and recognizer accepts both. In autopilot there is no user
+    to ask or to approve: the text says what to do instead."""
+    if autopilot and phase == "clarify":
+        return ("Autopilot: infer conservative defaults from the request, codebase and project memory; record each material "
+                f"assumption in spec.md → ## {i18n.heading('clarifications')}; never ask → `orkestra phase next`. "
+                "With no safe default: `orkestra block \"<reason>\"`.")
+    if autopilot and phase == "approve":
+        return "Autopilot: no approval question. `orkestra phase next` records the hash-bound policy approval after the plan checks."
+    if phase == "clarify":
+        return ("Ask only outcome-changing questions (AskUserQuestion; max 4 per round, ≤2 rounds) → spec.md with "
+                f"## {i18n.heading('clarifications')} → `orkestra phase next`.")
+    if phase == "approve":
+        return (f"Show the plan summary and ask for approval ({PR.prompt_spec('approve', i18n.lang())}). "
+                "Hooks record the answer → `orkestra phase next`.")
+    return NEXT_ACTION.get(phase, "")
 
 
 _ASKER = EN.detect_env()       # the agent whose shell runs this command (None: an ordinary terminal)
@@ -64,19 +88,32 @@ def _out(text: str = "") -> None:
     sys.stdout.write(text + ("\n" if not text.endswith("\n") else ""))
 
 
-def _bind_here(project: Path, rid: str) -> None:
+def _bind_here(project: Path, rid: str) -> str:
     """Cursor tells the agent's shell which conversation it is: bind it now (Claude Code sessions are bound by the
-    PostToolUse hook from the marker line; in Cursor that hook is a second, equivalent path)."""
+    PostToolUse hook from the marker line; in Cursor that hook is a second, equivalent path). A conversation that still
+    drives another live run keeps it (the same rule as the hook's: state.try_bind); the returned text says so."""
     raw = EN.env_session_id()
     if not raw:
-        return
+        return ""
     from . import state as ST
     if ST.child_binding(raw):
-        return                                      # a subagent's shell: its parent drives the run
+        return ""                                   # a subagent's shell: its parent drives the run
     try:
-        ST.bind_session(EN.session_key("cursor", raw), project, rid, engine="cursor")
+        sid = EN.session_key("cursor", raw)
+        lease = float((paths.global_config().get("watchdog") or {}).get("lease_seconds") or 120)
+        res = ST.try_bind(sid, project, rid, engine="cursor", lease=lease)
     except Exception:
-        pass
+        return ""
+    if res.get("result") != "kept":
+        return ""
+    prev = res["prev"]
+    if not res.get("duplicate"):
+        ST.ledger(project, rid, i18n.t("dispatch.bind_kept", sid=EN.short_sid(sid), kept_run=prev["run_id"],
+                                       kept_project=prev["project"], age=res["age"]))
+    return (f"NOTE: this conversation is still bound to run {prev['run_id']} ({prev['project']}), active {res['age']} s "
+            f"ago, so {rid} ({project}) was NOT bound here: it has no driver from this chat, and its guards and the "
+            f"Stop nudges do not apply. To drive {rid} from here: `orkestra pause -p {prev['project']}`, then "
+            f"`orkestra resume -p {project}`. Otherwise tell the user.")
 
 
 def _unbind_here(project: Path, rid: str) -> None:
@@ -143,8 +180,7 @@ def _resolve_project(arg: Optional[str], required: bool = True) -> Optional[Path
         return Path(env).expanduser().resolve(strict=False)
     found = paths.find_project_root(Path.cwd())
     if found is None and required:
-        raise OrkestraError("not inside a project. cd into it or pass --project <name|path> "
-                            f"(workspace: {paths.workspace_root()})")
+        raise OrkestraError(i18n.t("cli.no_project", workspace=paths.workspace_root()))
     return found
 
 
@@ -181,7 +217,8 @@ def _next_task(st: Dict[str, Any]) -> Optional[str]:
 def _next_lines(project: Path, st: Dict[str, Any], deep: bool = True) -> List[str]:
     """The deterministic next step (≤ 3 lines). Never raises: a broken artifact must not hide the phase goal."""
     try:
-        return T.next_lines(T.next_action(project, st, deep=deep), T.flags(project, st))
+        from . import activity as A
+        return T.next_lines(T.next_action(project, st, deep=deep), T.flags(project, st, A.read_rows(project, st["run_id"])))
     except Exception as exc:  # pragma: no cover
         return [f"next: `orkestra playbook {st.get('phase')}` (next-step analysis failed: {exc})"]
 
@@ -191,6 +228,144 @@ def _tempo(project: Path, rid: str) -> str:
         return T.tempo_line(project, load_state(project, rid))
     except Exception:  # pragma: no cover
         return ""
+
+
+# ====================================================================== refusals about the machine and its files
+
+def _utf8_stdio() -> None:
+    """Print UTF-8 whatever the console says. Windows pipes default to cp125x and a few POSIX locales to ASCII; our
+    output has arrows, dots and the user's own text (any script, emoji), and a strict codec would end the command with a
+    traceback AFTER it changed state. A stream that cannot be reconfigured (an embedding caller's buffer) is left alone."""
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, ValueError, OSError):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
+def _io_detail(exc: OSError) -> str:
+    """`Permission denied: '/path'` from an OSError (its own text when it has no file name)."""
+    if exc.strerror and exc.filename:
+        return f"{exc.strerror}: {exc.filename}"
+    return str(exc)
+
+
+def _require_usable_home() -> None:
+    """`start` writes the run into the project AND registers it (with the session bindings) under ORKESTRA_HOME. When
+    that folder cannot be written, say so before anything is created in the project."""
+    home = paths.orkestra_home()
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        handle, probe = tempfile.mkstemp(prefix=".write-test-", dir=str(home))
+        os.close(handle)
+        os.unlink(probe)
+    except OSError as exc:
+        raise OrkestraError(i18n.t("cli.home_unusable", path=home, error=_home_reason(home, exc)))
+
+
+def _home_reason(home: Path, exc: OSError) -> str:
+    """Why ORKESTRA_HOME cannot be used, in a few words."""
+    return i18n.t("cli.home_is_file") if home.exists() and not home.is_dir() else (exc.strerror or str(exc))
+
+
+def _read_request_file(path: Path) -> str:
+    """The text of `--request-file`: UTF-8 (with or without a byte order mark), or UTF-16 with one (what `>` writes in
+    Windows PowerShell 5). Anything else is refused by name instead of crashing or storing garbage."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        raise OrkestraError(i18n.t("cli.request_file_missing", path=path))
+    except OSError as exc:                                  # a folder, no permission, ...
+        raise OrkestraError(i18n.t("cli.request_file_unreadable", path=path, error=exc.strerror or exc))
+    try:
+        text = raw.decode("utf-16" if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)) else "utf-8-sig")
+    except UnicodeDecodeError:
+        raise OrkestraError(i18n.t("cli.request_file_encoding", path=path))
+    if not text.strip():
+        raise OrkestraError(i18n.t("cli.request_file_empty", path=path))
+    return text
+
+
+def _json_kind(value: Any) -> str:
+    """object | array | string | number | boolean | null (the key of `cli.kind_*`)."""
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, (int, float)):
+        return "number"
+    return {dict: "object", list: "array", str: "string"}.get(type(value), "null")
+
+
+def _type_mismatches(default: Dict[str, Any], user: Dict[str, Any], prefix: str = "") -> List[Any]:
+    """[(key path, expected kind, found kind)] for user settings whose JSON type differs from the default's. A setting
+    left out or set to null is fine: every reader falls back to the default for it."""
+    found: List[Any] = []
+    for key, base in default.items():
+        value = user.get(key)
+        if value is None:
+            continue
+        want = _json_kind(base)
+        if _json_kind(value) != want:
+            found.append((prefix + key, want, _json_kind(value)))
+        elif isinstance(base, dict):
+            found += _type_mismatches(base, value, prefix + key + ".")
+    return found
+
+
+def _global_config_problem() -> str:
+    """'' when ~/.orkestra/config.json is absent, empty or usable; else what is wrong with it. `orkestra doctor` shows it."""
+    path = paths.orkestra_home() / "config.json"
+    try:
+        raw = path.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return ""
+    except OSError as exc:
+        return i18n.t("help.lang_unreadable", path=path, error=exc.strerror or exc)
+    if not raw.strip():
+        return ""
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (ValueError, RecursionError):                    # not JSON, not UTF-8, absurdly nested
+        return i18n.t("cli.config_not_json", path=path)
+    if not isinstance(data, dict):
+        return i18n.t("cli.config_not_object", path=path)
+    wrong = _type_mismatches(paths.DEFAULT_GLOBAL_CONFIG, data)
+    if not wrong:
+        return ""
+    details = "; ".join(i18n.t("cli.config_wrong_type", key=key, expected=i18n.t("cli.kind_" + want),
+                               found=i18n.t("cli.kind_" + got)) for key, want, got in wrong[:4])
+    return i18n.t("cli.config_bad_values", path=path, details=details)
+
+
+def _project_config_problem(project: Path) -> str:
+    """'' when the project's .orkestra/config.json is absent, empty or usable; else what is wrong with it. Gates drive the
+    no-regression rule, so a damaged file must stop `start` and `gate` instead of silently meaning "no gates"."""
+    path = paths.project_config_path(project)
+    try:
+        raw = path.read_bytes()
+    except (FileNotFoundError, NotADirectoryError):
+        return ""
+    except OSError as exc:
+        return i18n.t("help.lang_unreadable", path=path, error=exc.strerror or exc)
+    if not raw.strip():
+        return ""
+    try:
+        data = json.loads(raw.decode("utf-8-sig"))
+    except (ValueError, RecursionError):
+        problem = i18n.t("cli.project_config_json")
+    else:
+        gates = data.get("gates", []) if isinstance(data, dict) else []
+        if not isinstance(data, dict):
+            problem = i18n.t("cli.project_config_object")
+        elif not isinstance(gates, list) or not all(
+                isinstance(g, dict) and isinstance(g.get("name"), str) and isinstance(g.get("cmd"), str) for g in gates):
+            problem = i18n.t("cli.project_config_gates")
+        else:
+            return ""
+    return i18n.t("cli.project_config_bad", path=path, problem=problem)
+
+
+def _require_project_config(project: Path) -> None:
+    problem = _project_config_problem(project)
+    if problem:
+        raise OrkestraError(problem)
 
 
 # ====================================================================== commands
@@ -206,7 +381,8 @@ def cmd_context(a: argparse.Namespace) -> int:
             _out("projects: " + ", ".join(projs))
         _out("Resolve the target project from the user's request and pass `-p <name>` to every orkestra command.")
         return 0
-    cfg = paths.project_config(project)
+    config_problem = _project_config_problem(project)
+    cfg = {"gates": []} if config_problem else paths.project_config(project)
     dg = M.digest(project) if paths.memory_dir(project).is_dir() else {}
     gates_txt = ", ".join(g["name"] for g in cfg.get("gates") or []) or "none configured"
     if not paths.okdir(project).is_dir():
@@ -219,6 +395,8 @@ def cmd_context(a: argparse.Namespace) -> int:
     else:
         _out("memory: NOT INITIALIZED → run onboarding first (`orkestra init` + playbook onboard)")
     _out(f"gates: {gates_txt} · confirmed: {'yes' if cfg.get('gates_confirmed') else 'no'}")
+    if config_problem:
+        _out("WARNING: " + config_problem)
     rid = project_active_run(project)
     if rid:
         st = load_state(project, rid)
@@ -229,14 +407,16 @@ def cmd_context(a: argparse.Namespace) -> int:
             _out(f"awaiting user: {st['awaiting'].get('question', '')}")
         if st.get("blocked"):
             _out(f"blocked: {st['blocked'].get('reason', '')}")
-        _out(f"phase goal: {NEXT_ACTION.get(st['phase'], '')}")
+        _out(f"phase goal: {phase_goal(st['phase'], T.is_autopilot(st))}")
         for ln in _next_lines(project, st):
             _out(ln)
-        if _mode() == "headless" and st["phase"] in ("clarify", "approve"):
+        if T.is_autopilot(st):
+            pass                                    # autopilot: the phase goal above already says what to do instead of asking
+        elif _mode() == "headless" and st["phase"] in ("clarify", "approve"):
             _out("headless: no AskUserQuestion — follow `orkestra playbook headless` for questions/approval")
         elif _ASKER == "cursor" and st["phase"] in ("clarify", "approve"):
             _out("cursor: questions and the plan approval follow `orkestra playbook headless` (chat question → "
-                 "`orkestra await \"<summary>\"` → end your turn; approval = the user types \"onay\")")
+                 "`orkestra await \"<summary>\"` → end your turn; approval = the user types \"approve\" or \"onay\")")
         _out(f"playbook: `orkestra playbook {st['phase']}`")
         _out(f"artifacts: {paths.feature_dir(project, rid)}")
         _out("this session is not driving the run unless it ran `orkestra start` or `orkestra resume`")
@@ -266,7 +446,7 @@ def cmd_start(a: argparse.Namespace) -> int:
     assert project is not None
     request = a.request or ""
     if a.request_file:
-        request = read_text(Path(a.request_file))
+        request = _read_request_file(Path(a.request_file))
     if not request.strip():
         raise OrkestraError("--request or --request-file is required (the user's request, verbatim)")
     mode = "headless" if (a.headless or _mode() == "headless") else "interactive"
@@ -283,9 +463,11 @@ def cmd_start(a: argparse.Namespace) -> int:
     size = intent.infer_size(request) if size_arg == "auto" else size_arg
     if size not in intent.SIZES:
         raise OrkestraError(f"invalid size {size!r}")
+    _require_project_config(project)
+    _require_usable_home()
     st = R.start_run(project, a.title, request, size, mode, engine, approval_mode)
     rid = st["run_id"]
-    _bind_here(project, rid)
+    kept = _bind_here(project, rid)
     _out(f"run started: {rid} in {project}" + ("" if engine == "claude" else f" (engine: {engine})"))
     _out(f"size: {size}" + (" (inferred from request; override with --size XS|S|M|L)" if size_arg == "auto" else ""))
     _out(f"baseline: git={st['baseline']['git']} head={str(st['baseline'].get('head'))[:12]} "
@@ -298,7 +480,9 @@ def cmd_start(a: argparse.Namespace) -> int:
     if len(others) >= 2:
         _out(f"WARNING: {len(others)} other runs are open on this machine ({', '.join(others)}). They share CPU with this "
              f"one (tests, builds, simulators) and every run gets slower. Tell the user in one line; continue if they want.")
-    _out(f"next action: {NEXT_ACTION['intake']}")
+    _out(f"next action: {phase_goal('intake')}")
+    if kept:
+        _out(kept)
     _out(bind_marker(project, rid))
     return 0
 
@@ -307,15 +491,21 @@ def cmd_resume(a: argparse.Namespace) -> int:
     project = _resolve_project(a.project)
     assert project is not None
     _require_cursor_hooks()
+    from . import state as ST
+    rid0 = a.run or project_active_run(project) or ""
+    prev = str((read_json(ST.state_path(project, rid0)) or {}).get("status") or "") if rid0 else ""
+    actor = ST.take_actor(project, rid0) if rid0 else {}        # which chat asked (left by the PreToolUse hook)
     st = R.resume_run(project, a.run)
-    _bind_here(project, st["run_id"])
+    if prev == "paused" and st.get("status") == "active":       # the visible trace of the flip (who, from, to)
+        R.record_status_row(project, st["run_id"], prev, "active", actor or {"agent_type": "cli"})
+    kept = _bind_here(project, st["run_id"])
     _out(f"resumed {st['run_id']} · phase {st['phase']} · status {st['status']} · tasks {_progress(st)}")
     # A resume is the user saying "continue from here". Subagent records with no sign of life for a lease period
     # belong to a window that is gone: waiting for them would park the run in the very first answer.
     from . import activity as A
     from .state import ledger
     lease = float((paths.global_config().get("watchdog") or {}).get("lease_seconds") or 120)
-    _, lost = T.live_agents(project, st["run_id"], wd=dict(T.wd_cfg(), silent_seconds=lease))
+    _, lost = T.live_agents(project, st["run_id"], wd=dict(T.wd_cfg(), silent_seconds=lease, agent_silent_seconds=lease))
     # …but only when the window that launched them is silent too. Called from the SAME live window (its heartbeat
     # was refreshed by this very command), a quiet agent is just thinking: the normal silent_seconds rule applies.
     ages = A.session_ages(project, st["run_id"])
@@ -330,6 +520,8 @@ def cmd_resume(a: argparse.Namespace) -> int:
     for ln in _next_lines(project, st):
         _out(ln)
     _out(f"playbook: `orkestra playbook {st['phase']}`")
+    if kept:
+        _out(kept)
     _out(bind_marker(project, st["run_id"]))
     return 0
 
@@ -377,7 +569,7 @@ def cmd_phase(a: argparse.Namespace) -> int:
             _out(unbind_marker(project, rid))
             _out("Run complete. Remind the user: nothing was committed; the changes are in the working tree.")
         else:
-            _out(f"next action: {NEXT_ACTION.get(nxt, '')}")
+            _out(f"next action: {phase_goal(nxt, T.is_autopilot(load_state(project, rid)))}")
             _out(f"playbook: `orkestra playbook {nxt}`")
             if nxt == "approve":
                 note = _large_plan_note(read_text(paths.feature_dir(project, rid) / "plan.md"))
@@ -401,10 +593,19 @@ def cmd_status_change(a: argparse.Namespace) -> int:
     mapping = {"await": "awaiting_user", "block": "blocked", "unblock": "active", "pause": "paused", "abort": "aborted"}
     status = mapping[a.cmd]
     reason = " ".join(a.reason or []).strip()
+    flagged = (getattr(a, "reason_opt", None) or "").strip()        # `--reason TEXT`: same thing as the words
+    if reason and flagged:
+        raise OrkestraError(f"orkestra {a.cmd}: give the reason once, as words or with --reason, not both")
+    reason = flagged or reason
     if a.cmd in ("await", "block", "abort") and not reason:
-        raise OrkestraError(f"orkestra {a.cmd} needs a reason/question text")
-    R.set_status(project, rid, status, reason)
-    _out(f"{rid}: status → {status}" + (f" ({reason})" if reason else ""))
+        raise OrkestraError(f"orkestra {a.cmd} needs a reason/question text (words, or --reason TEXT)")
+    from . import state as ST
+    actor = ST.take_actor(project, rid)                 # the chat the PreToolUse hook saw ask for this ({} = a terminal)
+    changed = R.set_status(project, rid, status, reason, who=actor or {"agent_type": "cli"})
+    if changed:
+        _out(f"{rid}: status → {status}" + (f" ({reason})" if reason else ""))
+    else:
+        _out(i18n.t("cli.status_unchanged", run=rid, status=status))
     if status in ("aborted", "paused"):
         # Pause used to leave the session bound: Stop could still force-continue the run.
         _unbind_here(project, rid)
@@ -414,9 +615,38 @@ def cmd_status_change(a: argparse.Namespace) -> int:
     return 0
 
 
+GATE_OUT_CAP = 8 * 1024             # failing-gate tails printed to the model in one command (the logs hold the rest)
+
+
+def cap_gate_text(text: str, cap: int = GATE_OUT_CAP) -> str:
+    """Keep the gate table and as many failing tails as fit in `cap` characters; list the rest by log path."""
+    if len(text) <= cap:
+        return text
+    head, *tails = text.split("\n\n--- ")
+    out, left = head, []
+    for blk in tails:
+        block = "\n\n--- " + blk
+        log = re.search(r"full log: (\S+)", blk)
+        label = f"{blk.split(' ', 1)[0]}: {log.group(1) if log else '?'}"
+        room = cap - len(out)
+        if len(block) <= room:
+            out += block
+        elif room > 500 and not left:
+            first, _, body = blk.partition("\n")
+            keep = max(0, room - len(first) - 120)
+            out += "\n\n--- " + first + "\n…\n" + body[-keep:]
+            left.append(label + " (tail cut)")
+        else:
+            left.append(label)
+    if left:
+        out += f"\n\n(output capped at {cap // 1024} KB; open the full logs: " + "; ".join(left) + ")"
+    return out
+
+
 def cmd_gate(a: argparse.Namespace) -> int:
     project = _resolve_project(a.project)
     assert project is not None
+    _require_project_config(project)
     cfg = paths.project_config(project)
     if a.action == "detect":
         det = G.detect(project)
@@ -441,16 +671,17 @@ def cmd_gate(a: argparse.Namespace) -> int:
     rid = _run_id(project, a.run)
     if a.action == "baseline":
         results, text = R.gates_baseline(project, rid)
-        _out(text if results else "no gates configured → empty baseline recorded (RISK: no automated regression net)")
+        _out(cap_gate_text(text) if results else "no gates configured → empty baseline recorded (RISK: no automated regression net)")
         return 0
     if a.action == "run":
         gates = cfg.get("gates") or []
         results = G.run_all(project, gates, paths.run_dir(project, rid) / "evidence", "adhoc", only=a.names or None)
-        _out(G.format_results(results) if results else "no matching gates")
+        _out(cap_gate_text(G.format_results(results)) if results else "no matching gates")
         return 0 if all(r["ok"] for r in results) else 1
     if a.action == "verify":
-        comparison, text = R.gates_verify(project, rid)
-        _out(text)
+        comparison, text = R.gates_verify(project, rid, resume=bool(getattr(a, "resume", False)),
+                                            full=bool(getattr(a, "all", False)))
+        _out(cap_gate_text(text))
         return 0 if comparison["ok"] else 1
     if a.action == "last":
         rdir = paths.run_dir(project, rid)
@@ -460,7 +691,7 @@ def cmd_gate(a: argparse.Namespace) -> int:
             return 1
         base = (read_json(rdir / "gates-baseline.json") or {}).get("results") or []
         _out(f"last verify at {last.get('at')}")
-        _out(G.format_results(last.get("results") or [], last.get("comparison"), base))
+        _out(cap_gate_text(G.format_results(last.get("results") or [], last.get("comparison"), base)))
         newest = R._newest_change_mtime(project, rdir)
         if newest and newest > float(last.get("ts", 0)):
             _out("WARNING: files changed after this verify — it is stale; the orchestrator must re-run it")
@@ -553,8 +784,9 @@ def cmd_task(a: argparse.Namespace) -> int:
         R.task_reopen(project, rid, a.task, text or force or "another round", force)
     elif a.action == "add":
         if not text:
-            raise OrkestraError("orkestra task add FIX-R001 \"title\" [--no-tdd]")
-        R.task_add(project, rid, a.task, text, "n/a" if a.no_tdd else "required")
+            raise OrkestraError("orkestra task add FIX-R001 \"title\" [--no-tdd] [--files a.py,b.py]")
+        files = [x.strip() for x in (getattr(a, "files", "") or "").replace(";", ",").split(",") if x.strip()]
+        R.task_add(project, rid, a.task, text, "n/a" if a.no_tdd else "required", files)
     elif a.action == "note":
         R.task_note(project, rid, a.task, text)
     _out(f"{a.task}: {a.action} ok")
@@ -571,13 +803,38 @@ def cmd_next(a: argparse.Namespace) -> int:
     assert project is not None
     rid = _run_id(project, a.run)
     st = load_state(project, rid)
+    from . import activity as A
     n = T.next_action(project, st, deep=True)
-    fl = T.flags(project, st)
+    fl = T.flags(project, st, A.read_rows(project, rid))      # deny loops and repeated commands surface here too
     if a.json:
         _out(json.dumps(dict(n, flags=fl), indent=2, ensure_ascii=False, default=str))
         return 0
     for ln in T.next_lines(n, fl):
         _out(ln)
+    return 0
+
+
+def cmd_wait(a: argparse.Namespace) -> int:
+    """Headless: wait for the subagents INSIDE this process (the model is not asked anything while it waits), then print
+    the same verdict `orkestra next` would. An interactive session never blocks here: its hand-backs arrive as messages."""
+    from . import activity as A
+    project = _resolve_project(a.project)
+    assert project is not None
+    rid = _run_id(project, a.run)
+    st = load_state(project, rid)
+    if paths.is_headless(st):
+        res = T.wait_for(project, rid, a.max)
+    else:
+        res = {"reason": "interactive", "waited": 0.0}
+    st = load_state(project, rid)
+    n = T.next_action(project, st, deep=True)
+    fl = T.flags(project, st, A.read_rows(project, rid))
+    _out(T.next_lines(n, fl)[0])
+    why = {"idle": "no subagent is running", "reports": "a subagent report arrived", "handback": "a hand-back arrived",
+           "status": f"the run is {st.get('status')}", "artifact": "a review or report file changed",
+           "timeout": "cap reached; call `orkestra wait` again if the verdict still says running",
+           "interactive": "interactive session: not blocking, end your turn instead of waiting"}.get(res["reason"], res["reason"])
+    _out(f"wait: {why} (waited {T.dur(res['waited'])})")
     return 0
 
 
@@ -626,7 +883,8 @@ def cmd_tempo(a: argparse.Namespace) -> int:
     tm = T.timings(st)
     rows = A.read_all_rows(project, rid)
     dw = T.dead_wait_share(rows)
-    cls = T.classify(st, A.read_rows(project, rid), A.agents_pending(project, rid))
+    cls = T.classify(st, A.read_rows(project, rid), A.agents_pending(project, rid),
+                     reports_due=A.agents_reports_due(project, rid, max_age=3600.0))
     if a.json:
         _out(json.dumps({"run": rid, "timings": tm, "dead_wait": dw, "stall": cls, "flags": T.flags(project, st, rows[-200:])},
                         indent=2, ensure_ascii=False, default=str))
@@ -649,6 +907,8 @@ def cmd_tempo(a: argparse.Namespace) -> int:
 
 def cmd_watchdog(a: argparse.Namespace) -> int:
     from . import watchdog
+    if a.launchd and sys.platform != "darwin":
+        raise OrkestraError(i18n.t("cli.launchd_macos_only"))        # a LaunchAgent means nothing on Linux or Windows
     if a.launchd:
         plist = Path("~/Library/LaunchAgents/com.orkestra.watchdog.plist").expanduser()
         plist.parent.mkdir(parents=True, exist_ok=True)
@@ -660,22 +920,116 @@ def cmd_watchdog(a: argparse.Namespace) -> int:
 <plist version="1.0"><dict>
   <key>Label</key><string>com.orkestra.watchdog</string>
   <key>ProgramArguments</key><array><string>{sys.executable}</string><string>{PLUGIN_ROOT / 'bin' / 'orkestra'}</string><string>watchdog</string><string>--quiet</string></array>
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path_env}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path_env}</string><key>LANG</key><string>{i18n.job_locale()}</string></dict>
   <key>StartInterval</key><integer>60</integer><key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{logs}/watchdog.out</string>
   <key>StandardErrorPath</key><string>{logs}/watchdog.err</string>
 </dict></plist>
 """)
-        _out(f"wrote {plist}\nload it with:  launchctl load -w {plist}\n"
-             f"(not needed when the bridge runs: it scans every minute by itself)")
+        _out(i18n.t("cli.watchdog_launchd_wrote", plist=plist))
         return 0
+    if a.loop or a.daemon or a.status:
+        from . import activity as A
+        from . import fastwatch
+        if a.status:
+            st = fastwatch.status()
+            if a.json:
+                _out(json.dumps(st, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if not st["running"]:
+                _out(i18n.t("watchdog.fast_status_stopped", autostart="on" if st["autostart"] else "off"))
+                return 0
+            ago = A.human_duration(max(0, time.time() - float(st.get("ts") or time.time())))
+            _out(i18n.t("watchdog.fast_status_breaker") if st["breaker_open"] else
+                 i18n.t("watchdog.fast_status_running", pid=st["pid"], interval=st.get("interval") or "?",
+                        runs=st.get("open_runs") if st.get("open_runs") is not None else "?", ago=ago))
+            for key, info in sorted((st.get("runs") or {}).items()):
+                if info.get("flags"):
+                    _out(i18n.t("watchdog.fast_flag_line", run=key, flags=", ".join(info["flags"])))
+            return 0
+        if a.daemon:
+            if fastwatch.is_running():
+                _out(i18n.t("watchdog.fast_daemon_running", pid=fastwatch.holder_pid()))
+            elif os.environ.get("ORKESTRA_NO_DAEMON") == "1" or not fastwatch.status()["supported"]:
+                _out(i18n.t("watchdog.fast_daemon_disabled"))
+            else:
+                _out(i18n.t("watchdog.fast_daemon_started", pid=fastwatch.start_daemon()))
+            return 0
+        return fastwatch.run_forever(idle_exit=a.idle_exit or None)
     return watchdog.main(once=True, as_json=a.json, dry_run=a.dry_run, quiet=a.quiet)
+
+
+REVIEW_DIFF_LINES = 400         # the diff in a review packet (a bigger change is read from `orkestra diff` by file)
+REVIEW_TAIL_LINES = 40          # red / green evidence tail
+
+
+def _evidence_tail(rec: Dict[str, Any]) -> str:
+    """Last REVIEW_TAIL_LINES lines of the evidence log (falls back to the short tail kept in state)."""
+    text = read_text(Path(str(rec.get("log") or ""))) if rec.get("log") else ""
+    return "\n".join((text or str(rec.get("tail") or "")).splitlines()[-REVIEW_TAIL_LINES:])
+
+
+def review_packet(project: Path, rid: str, tid: str) -> str:
+    """Everything the task reviewer needs in one call: the task section with its acceptance, red/green tails, the
+    implementer's report, deviations and the diff of the task's own files (capped). Saves the ~18 exploratory calls."""
+    fdir = paths.feature_dir(project, rid)
+    st = load_state(project, rid)
+    t = (st.get("tasks") or {}).get(tid)
+    if not t:
+        raise OrkestraError(f"unknown task {tid}")
+    plan = read_text(fdir / "plan.md")
+    task = next((x for x in PP.parse_tasks(plan) if x.id == tid), None)
+    out = [f"# Review packet — {tid} · run {rid} · project {project.name} · round {T.reopen_count(t) + 1}",
+           f"artifacts: {fdir}  (write the review to reviews/{tid}.review.md; end with VERDICT: PASS | PASS_WITH_NOTES | FAIL)"]
+    out.append("## Task\n" + (PP.task_section(plan, tid) or f"### {tid} — {t.get('title')} (ad-hoc, no plan section)\n").strip())
+    acc = task.fields.get("acceptance") if task else ""
+    out.append("## Acceptance\n" + (acc or "(none recorded: judge against the task title and spec)"))
+    devs: List[str] = []
+    for kind in ("red", "green"):
+        rec = t.get(kind) or {}
+        if not rec:
+            out.append(f"## {kind.upper()} evidence\nnone recorded")
+            continue
+        out.append(f"## {kind.upper()} evidence (exit {rec.get('exit')}, {'ok' if rec.get('ok') else 'NOT ok'}) `{rec.get('cmd')}`\n"
+                   f"log: {rec.get('log')}\n" + _evidence_tail(rec))
+        devs += [f"{kind}: {d}" for d in rec.get("deviations") or []]
+        if rec.get("foreign_note"):
+            devs.append(f"{kind}: {rec['foreign_note']}")
+    rep_path = fdir / "tasks" / f"{tid}.report.md"
+    rep = read_text(rep_path)
+    out.append(f"## Implementer report ({rep_path})\n" + ("\n".join(rep.strip().splitlines()[:30]) if rep.strip() else "no report written"))
+    out.append("## Deviations\n" + ("\n".join(f"- {d}" for d in devs) if devs else "none recorded"))
+    prior = T.task_review(fdir, tid)
+    if prior:
+        out.append(f"## Earlier review\n{prior.get('path')} (verdict {prior.get('verdict')}): check that its blocker/major rows are fixed")
+    notes = [n for n in (t.get("notes") or [])[-5:]]
+    if notes:
+        out.append("## Task notes\n" + "\n".join(f"- {n}" for n in notes))
+    files = [f for f in (t.get("files") or []) if f]
+    body: List[str] = []
+    if S.is_git_repo(project) and files:
+        rc, diff = S._git(project, "--no-pager", "diff", "--", *files)
+        body = (diff or "").splitlines() if rc == 0 else []
+    for f in files:                              # new files are not in `git diff`: show their head
+        fp = project / f
+        if fp.is_file() and not any(ln.startswith("diff --git") and f in ln for ln in body):
+            head = read_text(fp).splitlines()
+            body += [f"new/untracked file: {f} ({len(head)} lines)"] + [f"+{ln}" for ln in head[:60]]
+    cut = len(body) > REVIEW_DIFF_LINES
+    out.append(f"## Diff of the task's files ({', '.join(files) or 'no files recorded'})\n"
+               + ("\n".join(body[:REVIEW_DIFF_LINES]) if body else "(no tracked diff)")
+               + (f"\n… {len(body) - REVIEW_DIFF_LINES} more diff lines: `orkestra diff -p {project.name}`" if cut else ""))
+    out.append("Start from this packet; open more only to verify a doubt (callers of changed functions, a log you need in full).")
+    return "\n\n".join(out)
 
 
 def cmd_brief(a: argparse.Namespace) -> int:
     project = _resolve_project(a.project)
     assert project is not None
     rid = _run_id(project, a.run)
+    if getattr(a, "review", False):
+        _out(review_packet(project, rid, a.task))
+        return 0
     fdir = paths.feature_dir(project, rid)
     plan = read_text(fdir / "plan.md")
     spec = read_text(fdir / "spec.md")
@@ -685,8 +1039,8 @@ def cmd_brief(a: argparse.Namespace) -> int:
     st = load_state(project, rid)
     ids = sorted(set(PP.ID_RE.findall(sec)))
     spec_lines = [ln for ln in spec.splitlines() if any(i in ln for i in ids)]
-    constraints = PP.section(plan, "Genel kısıtlar", "Global constraints") or ""
-    bounds = PP.section(spec, "Sınırlar", "Boundaries") or ""
+    constraints = PP.heading_body(plan, "global_constraints") or ""
+    bounds = PP.heading_body(spec, "boundaries") or ""
     gates = ", ".join(f"{g['name']}=`{g['cmd']}`" for g in paths.project_config(project).get("gates") or [])
     _out(f"# Task brief — {a.task} · run {rid} · project {project.name} ({project})")
     _out(f"artifacts: {fdir}  (context.md has the code map; read only what you need)")
@@ -777,8 +1131,12 @@ def cmd_diff(a: argparse.Namespace) -> int:
     created = [it["path"] for it in items if it["change"] == "created"]
     if S.is_git_repo(project) and mods:
         args = ["git", "-C", str(project), "--no-pager", "diff"] + (["--stat"] if a.stat else []) + ["--"] + mods
-        cp = subprocess.run(args, capture_output=True, text=True)
-        _out(cp.stdout or "(no tracked diff)")
+        try:        # bounded and without the index lock (S.git_env); git writes UTF-8, whatever the locale
+            cp = subprocess.run(args, capture_output=True, encoding="utf-8", errors="replace", timeout=S.GIT_TIMEOUT,
+                                env=S.git_env(), stdin=subprocess.DEVNULL)
+            _out(cp.stdout or "(no tracked diff)")
+        except (OSError, subprocess.SubprocessError):
+            _out("(no tracked diff)")
     for c in created:
         _out(f"new file: {c}")
     return 0
@@ -842,9 +1200,11 @@ def cmd_memory(a: argparse.Namespace) -> int:
 
 
 HEADLESS_WAIT = ("HEADLESS: wherever the text below tells you to stop after dispatching subagents, do NOT end your turn "
-                 "— this process exits with the turn and kills them. Wait inside the turn: `sleep 30; orkestra next` "
-                 "until it no longer reports running subagents (the wait guard is off here). The turn ends only after "
-                 "`orkestra await`, `orkestra block`, or when the run is done.")
+                 "— this process exits with the turn and kills them. Wait with ONE blocking call: `orkestra wait` (Bash "
+                 "timeout 600000; it waits inside the process, costs no tokens and prints the next step as soon as the "
+                 "subagents are done; never `sleep` + `orkestra next` polling). The turn ends only after `orkestra "
+                 "await` (manual runs) or `orkestra block`, or when the run is done.")
+HEADLESS_WAIT_AUTO = HEADLESS_WAIT.replace("`orkestra await` (manual runs) or `orkestra block`", "`orkestra block`")
 
 
 def _open_run_state(a: argparse.Namespace):
@@ -871,16 +1231,20 @@ def cmd_playbook(a: argparse.Namespace) -> int:
         lead.append(f"NOTE: run {st.get('run_id')} is in phase `{st['phase']}`, not `{name}`. This is the `{name}` playbook "
                     f"you asked for; the one to follow now is `orkestra playbook` (no argument).")
     if st and paths.is_headless(st) and st.get("phase") not in (None, "done"):
-        lead.append(HEADLESS_WAIT)
+        try:                    # said once per run: the next playbook call of this run does not repeat it
+            proj = _resolve_project(getattr(a, "project", None), required=False)
+            first = proj is None or T.once_per_run(proj, str(st.get("run_id")), "headless_wait")
+        except (OrkestraError, OSError):
+            first = True
+        if first:
+            lead.append(HEADLESS_WAIT_AUTO if T.is_autopilot(st) else HEADLESS_WAIT)
     if lead:
         _out("\n".join(lead) + "\n")
-    path = PLAYBOOKS / f"phase-{name}.md"
-    if not path.exists():
-        path = PLAYBOOKS / f"{name}.md"
+    path = _inside_dir(PLAYBOOKS, f"phase-{name}.md") or _inside_dir(PLAYBOOKS, f"{name}.md")
     if name == "run":           # the run skill itself: how an engine without the Claude Code plugin gets its start
         text = read_text(PLUGIN_ROOT / "skills" / "run" / "SKILL.md")
         text = text.split("\n---\n", 1)[1] if text.startswith("---\n") and "\n---\n" in text else text
-    elif not path.exists():
+    elif path is None:
         avail = sorted(p.stem for p in PLAYBOOKS.glob("*.md"))
         raise OrkestraError(f"no playbook '{name}'. available: run, {', '.join(avail)}")
     else:
@@ -903,7 +1267,7 @@ def cmd_run(a: argparse.Namespace) -> int:
     assert project is not None
     request = " ".join(a.request or []).strip()
     if len(request) < 3:
-        raise OrkestraError('usage: orkestra run [--engine claude|cursor] [-p <proje>] "<istek>"')
+        raise OrkestraError(i18n.t("cli.run_usage"))
     cfg = paths.global_config()
     try:
         engine = EN.normalize(a.engine, EN.default_engine(cfg))
@@ -943,23 +1307,26 @@ def cmd_run(a: argparse.Namespace) -> int:
 def cmd_cursor(a: argparse.Namespace) -> int:
     """Cursor side: build the generated skills/subagents, install them and the hooks into ~/.cursor, or check."""
     from . import cursorkit as CK
-    if _ASKER:
+    if _ASKER and a.action != "build":          # `build` only regenerates this checkout's committed tree (AGENTS.md rule 2)
         raise OrkestraError("`orkestra cursor …` changes the Cursor configuration: run it from your terminal.")
     try:
         if a.action == "build":
-            done = CK.build()
-            _out(f"cursor assets: {len(done)} file(s) written" + (": " + ", ".join(done) if done else " (already current)"))
+            dry = bool(getattr(a, "dry_run", False))
+            done = CK.build(dry=dry)
+            _out(i18n.t(("cli.cursor_assets_would" if dry else "cli.cursor_assets_written") if done else "cli.cursor_assets_current",
+                        count=len(done), files=", ".join(done)))
         elif a.action == "install":
             done = CK.install(copy=a.copy, dry=a.dry_run)
             for line in done:
-                _out(("would " if a.dry_run else "") + line)
-            _out("cursor: " + ("nothing to change" if not done else ("dry run — nothing written" if a.dry_run else
-                 "installed. New Cursor chats (IDE and `agent`) load it; open ones need a new chat.")))
+                _out(i18n.t("cli.kit_would", action=line) if a.dry_run else line)
+            _out(i18n.t("cli.cursor_nothing_to_change" if not done else
+                        ("cli.cursor_dry_run" if a.dry_run else "cli.cursor_installed")))
         elif a.action == "uninstall":
             done = CK.uninstall(dry=a.dry_run)
             for line in done:
-                _out(("would " if a.dry_run else "") + line)
-            _out("cursor: " + ("nothing installed" if not done else ("dry run" if a.dry_run else "removed")))
+                _out(i18n.t("cli.kit_would", action=line) if a.dry_run else line)
+            _out(i18n.t("cli.cursor_nothing_installed" if not done else
+                        ("cli.cursor_uninstall_dry" if a.dry_run else "cli.cursor_removed")))
         if a.action in ("status", "install"):
             ok = True
             for good, label, detail in CK.status(paths.global_config()):
@@ -982,14 +1349,15 @@ def cmd_copilot(a: argparse.Namespace) -> int:
         if a.action == "install":
             done = CK.install(dry=a.dry_run)
             for line in done:
-                _out(("would " if a.dry_run else "") + line)
-            _out("copilot: " + ("nothing to change" if not done else ("dry run — nothing written" if a.dry_run else
-                 "installed. Restart Copilot / VS Code chats so they load the hooks.")))
+                _out(i18n.t("cli.kit_would", action=line) if a.dry_run else line)
+            _out(i18n.t("cli.copilot_nothing_to_change" if not done else
+                        ("cli.copilot_dry_run" if a.dry_run else "cli.copilot_installed")))
         elif a.action == "uninstall":
             done = CK.uninstall(dry=a.dry_run)
             for line in done:
-                _out(("would " if a.dry_run else "") + line)
-            _out("copilot: " + ("nothing installed" if not done else ("dry run" if a.dry_run else "removed")))
+                _out(i18n.t("cli.kit_would", action=line) if a.dry_run else line)
+            _out(i18n.t("cli.copilot_nothing_installed" if not done else
+                        ("cli.copilot_uninstall_dry" if a.dry_run else "cli.copilot_removed")))
         if a.action in ("status", "install"):
             ok = True
             for good, label, detail in CK.status(paths.global_config()):
@@ -1005,13 +1373,15 @@ def cmd_copilot(a: argparse.Namespace) -> int:
 
 def _ask_yn(question: str, default: str = "y") -> bool:
     """Interactive yes/no for setup (same defaults shape as install.sh ask())."""
-    hint = "Y/n" if default == "y" else "y/N"
+    hint = i18n.t("cli.ask_yes_default" if default == "y" else "cli.ask_no_default")
     try:
         raw = input(f"{question} [{hint}] ").strip()
     except EOFError:
         raw = ""
-    ans = (raw or default).lower()
-    return ans[:1] in ("y", "e")
+    ans = (raw or default).strip().lower()
+    # the whole word, like install.sh and install.py: `exit` or `yeah` is not a yes, and neither is the Turkish `yok`
+    # or `yapma`; `e` / `evet` answer the Turkish prompt only
+    return ans in ("y", "yes") or (ans in ("e", "evet") and i18n.lang() == "tr")
 
 
 def _setup_detect() -> Dict[str, bool]:
@@ -1025,15 +1395,32 @@ def _setup_detect() -> Dict[str, bool]:
     }
 
 
-def _setup_install_claude() -> None:
-    """Claude Code marketplace + plugin (repo root next to plugins/)."""
+def _setup_install_claude() -> bool:
+    """Claude Code marketplace + plugin from this checkout (repo root next to plugins/). True only when every step
+    worked; a marketplace that is registered from another location is registered again for this checkout."""
     root = PLUGIN_ROOT.parent.parent
-    listed = subprocess.run(["claude", "plugin", "marketplace", "list"], capture_output=True, text=True, timeout=120)
-    if listed.returncode == 0 and "orkestra-local" in (listed.stdout or ""):
-        subprocess.run(["claude", "plugin", "marketplace", "update", "orkestra-local"], check=False, timeout=120)
-    else:
-        subprocess.run(["claude", "plugin", "marketplace", "add", str(root)], check=False, timeout=120)
-    subprocess.run(["claude", "plugin", "install", "orkestra@orkestra-local", "-s", "user"], check=False, timeout=120)
+
+    def step(*args: str) -> bool:
+        try:
+            return subprocess.run(["claude", *args], check=False, timeout=120).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    try:
+        listed = subprocess.run(["claude", "plugin", "marketplace", "list"], capture_output=True, encoding="utf-8",
+                                errors="replace", timeout=120)
+        text = (listed.stdout or "") if listed.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        text = ""
+    ok = True
+    registered = "orkestra-local" in text
+    if registered and not any(form in text for form in {str(root), os.path.realpath(str(root))}):
+        _out(i18n.t("cli.setup_marketplace_moved", name="orkestra-local", root=root))
+        ok = step("plugin", "marketplace", "remove", "orkestra-local")
+        registered = False
+    ok = (step("plugin", "marketplace", "update", "orkestra-local") if registered
+          else step("plugin", "marketplace", "add", str(root))) and ok
+    return step("plugin", "install", "orkestra@orkestra-local", "-s", "user") and ok
 
 
 def cmd_setup(a: argparse.Namespace) -> int:
@@ -1042,50 +1429,69 @@ def cmd_setup(a: argparse.Namespace) -> int:
     from . import copilotkit as Cop
     if _ASKER:
         raise OrkestraError("`orkestra setup` changes host configuration: run it from your terminal.")
-    # FR-003: PATH shim always (motorsuz / declined engines); agent refuse above skips this.
+    # FR-003: PATH shim always (no engine / declined engines); agent refuse above skips this.
     Cur.ensure_path_shim()
     detected = _setup_detect()
     if not any(detected.values()):
-        _out("setup: motorsuz — no Claude CLI, Cursor home, or Copilot home detected; nothing installed.")
+        _out(i18n.t("cli.setup_no_engine"))
         return 1
     yes = bool(getattr(a, "yes", False))
+
+    def state(key: str) -> str:
+        return i18n.t("cli.setup_state_" + key)
+
+    failed = False
     if detected["claude"]:
-        if yes or _ask_yn("Claude marketplace/plugin kurulsun mu?", "y"):
-            _setup_install_claude()
-            _out("setup: Claude marketplace/plugin done")
+        if yes or _ask_yn(i18n.t("cli.setup_ask_claude"), "y"):
+            if _setup_install_claude() is False:        # the claude commands printed why; "done" would be a lie
+                failed = True
+                _out(i18n.t("cli.setup_line", engine="Claude marketplace/plugin", state=state("failed")))
+                _out(i18n.t("cli.setup_claude_manual", root=PLUGIN_ROOT.parent.parent))
+            else:
+                _out(i18n.t("cli.setup_line", engine="Claude marketplace/plugin", state=state("done")))
         else:
-            _out("setup: Claude skipped")
+            _out(i18n.t("cli.setup_line", engine="Claude", state=state("skipped")))
     if detected["cursor"]:
-        if yes or _ask_yn("Cursor skill, alt-ajan ve hooks kurulsun mu?", "y"):
+        if yes or _ask_yn(i18n.t("cli.setup_ask_cursor"), "y"):
             try:
                 done = Cur.install()
             except EN.EngineError as exc:
                 raise OrkestraError(str(exc))
             for line in done:
                 _out(line)
-            _out("setup: Cursor " + ("already current" if not done else "installed"))
+            _out(i18n.t("cli.setup_line", engine="Cursor", state=state("current" if not done else "installed")))
         else:
-            _out("setup: Cursor skipped")
+            _out(i18n.t("cli.setup_line", engine="Cursor", state=state("skipped")))
     if detected["copilot"]:
-        if yes or _ask_yn("Copilot hooks kurulsun mu?", "y"):
+        if yes or _ask_yn(i18n.t("cli.setup_ask_copilot"), "y"):
             try:
                 done = Cop.install()
             except EN.EngineError as exc:
                 raise OrkestraError(str(exc))
             for line in done:
                 _out(line)
-            _out("setup: Copilot " + ("already current" if not done else "installed"))
+            _out(i18n.t("cli.setup_line", engine="Copilot", state=state("current" if not done else "installed")))
         else:
-            _out("setup: Copilot skipped")
-    return 0
+            _out(i18n.t("cli.setup_line", engine="Copilot", state=state("skipped")))
+    return 1 if failed else 0
+
+
+def _inside_dir(root: Path, name: str) -> Optional[Path]:
+    """`root/name` when it is an existing file that stays inside `root`, else None. A name is a lookup key, not a path:
+    `../../x`, an absolute path or a symlink pointing out must never reach a file the document folders do not hold."""
+    try:
+        path = (root / name).resolve()
+        base = root.resolve()
+    except (OSError, ValueError):
+        return None
+    return path if path.is_file() and (path == base or base in path.parents) else None
 
 
 def cmd_template(a: argparse.Namespace) -> int:
-    path = TEMPLATES / a.name
-    if not path.exists():
-        path = TEMPLATES / f"{a.name}.md"
-    if not path.exists():
-        avail = sorted(str(p.relative_to(TEMPLATES)) for p in TEMPLATES.rglob("*.md"))
+    root = i18n.template_dir(TEMPLATES)
+    path = _inside_dir(root, a.name) or _inside_dir(root, f"{a.name}.md")
+    if path is None:
+        avail = sorted(str(p.relative_to(root)) for p in root.rglob("*.md"))
         raise OrkestraError(f"no template '{a.name}'. available: {', '.join(avail)}")
     _out(read_text(path))
     return 0
@@ -1100,7 +1506,131 @@ def cmd_watch(a: argparse.Namespace) -> int:
 def cmd_dashboard(a: argparse.Namespace) -> int:
     from . import monitor
     project = _resolve_project(a.project) if a.project else None
-    return monitor.dashboard(project, a.port, a.open)
+    return monitor.dashboard(project, a.port, a.open, replace=getattr(a, "replace", False))
+
+
+# ====================================================================== language
+
+_LANG_FLAG: Optional[str] = None        # the value of `--lang` while main() runs it (it travels as ORKESTRA_LANG)
+
+
+def _lang_origin(source: str) -> str:
+    """Where the language comes from, for humans: `env (--lang)`, `env (ORKESTRA_LANG)`, `config (<file>)`, `locale`,
+    `default`."""
+    if source == "env":
+        return "env (--lang)" if _LANG_FLAG else "env (ORKESTRA_LANG)"
+    if source == "config":
+        return f"config ({paths.orkestra_home() / 'config.json'})"
+    return source
+
+
+def _backup_aside(path: Path, raw: bytes) -> Path:
+    """Keep the bytes of a config file we are about to replace; never overwrites an earlier backup."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(100):
+        dest = path.with_name(f"{path.name}.corrupt-{stamp}" + (f"-{n}" if n else ""))
+        try:
+            # 0600 like the config.json that replaces it: the file can hold notify tokens and webhook URLs
+            fd = os.open(str(dest), os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(raw)
+            return dest
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise OrkestraError(i18n.t("help.lang_unwritable", path=dest, error=exc))
+    raise OrkestraError(i18n.t("help.lang_unwritable", path=path, error="too many backups"))
+
+
+def _save_lang(value: str) -> Any:
+    """Persist `lang` in the global config.json: atomic, every other key kept, created when missing. A file that is
+    not a JSON object is copied aside first (never silently destroyed) and then replaced. Returns (path, backup)."""
+    from .util import write_json_atomic
+    path = paths.orkestra_home() / "config.json"
+    data: Dict[str, Any] = {}
+    backup: Optional[Path] = None
+    try:
+        raw: Optional[bytes] = path.read_bytes()
+    except FileNotFoundError:
+        raw = None
+    except OSError as exc:                              # a directory, no permission, ...
+        raise OrkestraError(i18n.t("help.lang_unreadable", path=path, error=exc))
+    if raw is not None and raw.strip():
+        try:
+            parsed: Any = json.loads(raw.decode("utf-8-sig"))     # a BOM (some Windows editors) is not corruption
+        except (ValueError, RecursionError):                     # not JSON, not UTF-8, absurdly nested
+            parsed = None
+        if isinstance(parsed, dict):
+            data = parsed
+        else:
+            backup = _backup_aside(path, raw)
+    data["lang"] = value
+    target = path.resolve() if path.is_symlink() else path      # a dotfiles-managed symlink must stay a symlink
+    try:
+        write_json_atomic(target, data)
+    except OSError as exc:
+        raise OrkestraError(i18n.t("help.lang_unwritable", path=path, error=exc))
+    return path, backup
+
+
+def _announce_saved_lang(value: str) -> None:
+    path, backup = _save_lang(value)
+    _out(i18n.t("help.lang_saved_auto" if value == "auto" else "help.lang_saved", lang=value, path=path))
+    if backup:
+        _out(i18n.t("help.lang_backup", path=backup))
+    code, source = i18n.lang_source()
+    if source == "env" and (value == "auto" or code != value):
+        _out(i18n.t("help.lang_override", origin="--lang" if _LANG_FLAG else "ORKESTRA_LANG", lang=code))
+
+
+def cmd_lang(a: argparse.Namespace) -> int:
+    """`orkestra lang [show|en|tr|auto]`: where the language of human-facing text comes from, or save a choice."""
+    value = getattr(a, "value", None) or "show"
+    if value == "show":
+        code, source = i18n.lang_source()
+        _out(f"language: {code}")
+        _out(f"source: {_lang_origin(source)}")
+        _out(i18n.t("help.lang_hint"))
+        return 0
+    _announce_saved_lang(value)
+    return 0
+
+
+def _tree_digest(root: Path) -> str:
+    """Digest of the code that runs the guards (hooks + library) under `root`; '' when there is none."""
+    import hashlib
+    h = hashlib.sha1()
+    found = False
+    for pattern in ("hooks/*.py", "hooks/*.json", "hooks/*.sh", "lib/orkestra_core/*.py", "lib/orkestra_core/messages/*.py"):
+        for f in sorted(root.glob(pattern)):
+            try:
+                data = f.read_bytes()
+            except OSError:
+                continue
+            found = True
+            h.update(f.relative_to(root).as_posix().encode("utf-8") + b"\0" + hashlib.sha1(data).digest())
+    return h.hexdigest() if found else ""
+
+
+def _claude_copies() -> List[Tuple[str, str, bool]]:
+    """(install path, version, same code as this checkout) of every other copy Claude Code registered for orkestra.
+    Claude Code runs hooks from its own cached copy, so a checkout edited after the install is NOT what the guards
+    run until the plugin is updated. Read-only; never touches ~/.claude."""
+    reg = read_json(Path(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude").expanduser() / "plugins"
+                    / "installed_plugins.json", default={}) or {}
+    mine = _tree_digest(PLUGIN_ROOT)
+    out: List[Tuple[str, str, bool]] = []
+    plugins = reg.get("plugins") if isinstance(reg, dict) else None
+    for name, entries in (plugins.items() if isinstance(plugins, dict) else []):
+        if not str(name).startswith("orkestra@"):
+            continue
+        for e in entries if isinstance(entries, list) else []:
+            raw = str(e.get("installPath") or "") if isinstance(e, dict) else ""
+            path = Path(raw).expanduser()
+            if not raw or not path.is_dir() or os.path.realpath(path) == os.path.realpath(PLUGIN_ROOT):
+                continue
+            out.append((str(path), str(e.get("version") or "?"), bool(mine) and _tree_digest(path) == mine))
+    return out
 
 
 def cmd_doctor(a: argparse.Namespace) -> int:
@@ -1116,47 +1646,81 @@ def cmd_doctor(a: argparse.Namespace) -> int:
 
     py = sys.version_info
     line(py >= (3, 9), "python >= 3.9", platform.python_version())
-    line(shutil.which("git") is not None, "git", shutil.which("git") or "not found")
-    soft(shutil.which("claude") is not None, "claude",
-         shutil.which("claude") or "not found (optional — Cursor/Copilot hooks also count)")
+    line(shutil.which("git") is not None, "git", shutil.which("git") or i18n.t("cli.doctor_not_found"))
+    soft(shutil.which("claude") is not None, "claude", shutil.which("claude") or i18n.t("cli.doctor_claude_missing"))
     for tool in ("node", "npx", "uv", "uvx", "gh", "jq"):
-        soft(shutil.which(tool) is not None, tool, shutil.which(tool) or "not found (optional)")
-    ws = paths.workspace_root()
-    line(ws.is_dir(), "workspace root", str(ws))
+        soft(shutil.which(tool) is not None, tool, shutil.which(tool) or i18n.t("cli.doctor_not_found_optional"))
+    config_problem = _global_config_problem()
+    if config_problem:                              # a wrong-typed setting must not stop the report that names it
+        ws = Path(os.environ.get("ORKESTRA_WORKSPACE") or paths.DEFAULT_GLOBAL_CONFIG["workspace_root"]).expanduser()
+        cfg = dict(paths.DEFAULT_GLOBAL_CONFIG)
+    else:
+        ws = paths.workspace_root()
+        cfg = paths.global_config()
+    soft(ws.is_dir(), "workspace root", str(ws) if ws.is_dir() else i18n.t("cli.doctor_workspace_missing", path=ws))
     home = paths.orkestra_home()
-    paths.ensure_global_config()
-    line(home.is_dir(), "orkestra home", str(home))
+    try:
+        paths.ensure_global_config()
+    except OSError as exc:                          # a file where the folder should be, no permission, a full disk
+        line(False, "orkestra home", i18n.t("cli.home_unusable", path=home, error=_home_reason(home, exc)))
+    else:
+        line(home.is_dir(), "orkestra home", str(home))
+    if config_problem:
+        line(False, "config.json", config_problem)
+    try:                                            # informational, never a failure: `orkestra lang` changes it
+        code, source = i18n.lang_source()
+        _out(f"[OK] language: {code} ({_lang_origin(source)})")
+    except Exception as exc:  # pragma: no cover
+        _out(f"[--] language: unknown ({type(exc).__name__})")
     line((PLUGIN_ROOT / "hooks" / "hooks.json").exists(), "plugin root", str(PLUGIN_ROOT))
+    # hooks/hooks.json starts hooks/run_hook.sh, which tries python3, then python, then `py -3`: only when none of them
+    # resolves do the Claude Code hooks fail open
+    py3 = shutil.which("python3")
+    fallback = None if py3 else (shutil.which("python") or shutil.which("py"))
+    soft(py3 is not None, "python3 on PATH (plugin hooks)",
+         py3 or (i18n.t("cli.doctor_python3_fallback", fallback=fallback) if fallback else
+                 i18n.t("cli.doctor_python3_none")))
+    for path, version, same in _claude_copies():
+        soft(same, "claude plugin copy",
+             i18n.t("cli.doctor_copy_same" if same else "cli.doctor_copy_differs", path=path, version=version))
     # hook self-test: a forbidden command must be denied, a harmless one allowed
     disp = PLUGIN_ROOT / "hooks" / "dispatch.py"
     try:
         ev = {"hook_event_name": "PreToolUse", "session_id": "doctor", "tool_name": "Bash",
               "tool_input": {"command": "git push --force origin main"}, "cwd": str(Path.cwd())}
         cp = subprocess.run([sys.executable, str(disp), "PreToolUse"], input=json.dumps(ev), capture_output=True,
-                            text=True, timeout=20)
+                            encoding="utf-8", errors="replace", timeout=20)
         line('"deny"' in cp.stdout, "hook self-test (deny force-push)", cp.stdout.strip()[:80] or cp.stderr.strip()[:80])
     except Exception as exc:  # pragma: no cover
         line(False, "hook self-test", str(exc))
     from . import cursorkit as CK
     claude_ready = shutil.which("claude") is not None
     cursor_ready = CK.hooks_active()
-    copilot_dir = EN.copilot_plugin_dir(paths.global_config())
+    copilot_dir = EN.copilot_plugin_dir(cfg)
     copilot_ready = EN.copilot_hooks_active(copilot_dir)
-    soft(cursor_ready, "cursor hooks", "active" if cursor_ready else "not installed")
-    soft(copilot_ready, "copilot hooks", "active" if copilot_ready else "not installed")
+    soft(cursor_ready, "cursor hooks", i18n.t("cli.doctor_active" if cursor_ready else "cli.doctor_not_installed"))
+    soft(copilot_ready, "copilot hooks", i18n.t("cli.doctor_active" if copilot_ready else "cli.doctor_not_installed"))
+    try:                                            # informational: the fast stall watcher (POSIX only)
+        from . import fastwatch
+        fw = fastwatch.status()
+        soft(fw["running"], i18n.t("watchdog.fast_doctor_name"),
+             i18n.t("watchdog.fast_doctor_on", pid=fw["pid"]) if fw["running"]
+             else i18n.t("watchdog.fast_doctor_off", autostart="on" if fw["autostart"] else "off"))
+    except Exception as exc:  # pragma: no cover
+        _out(f"[--] fast watcher: unknown ({type(exc).__name__})")
     engines_ready = sum((claude_ready, cursor_ready, copilot_ready))
     line(engines_ready >= 1, "engine ready",
-         f"{engines_ready} ready" if engines_ready else "none — install Claude, `orkestra cursor install`, or Copilot hooks")
+         i18n.t("cli.doctor_engines_ready", count=engines_ready) if engines_ready else i18n.t("cli.doctor_engines_none"))
     if claude_ready:
         try:
-            cp = subprocess.run(["claude", "mcp", "list"], capture_output=True, text=True, timeout=30,
-                                stdin=subprocess.DEVNULL)
+            cp = subprocess.run(["claude", "mcp", "list"], capture_output=True, encoding="utf-8", errors="replace",
+                                timeout=30, stdin=subprocess.DEVNULL)
             out = cp.stdout.lower()
             for name in ("context7", "playwright", "serena"):
-                soft(name in out, f"MCP {name}", "configured" if name in out else "not configured (optional)")
+                soft(name in out, f"MCP {name}", i18n.t("cli.doctor_configured" if name in out else "cli.doctor_not_configured"))
         except Exception:
-            soft(False, "claude mcp list", "could not run")
-    _out("doctor: " + ("all required checks passed" if ok else "some required checks FAILED"))
+            soft(False, "claude mcp list", i18n.t("cli.doctor_mcp_failed"))
+    _out(i18n.t("cli.doctor_all_passed" if ok else "cli.doctor_some_failed"))
     return 0 if ok else 1
 
 
@@ -1171,14 +1735,49 @@ HANDLERS = {
     "playbook": cmd_playbook, "template": cmd_template, "doctor": cmd_doctor,
     "watch": cmd_watch, "dashboard": cmd_dashboard,
     "evidence": cmd_evidence, "integrity": cmd_integrity, "report": cmd_report,
-    "next": cmd_next, "tempo": cmd_tempo, "watchdog": cmd_watchdog, "agents": cmd_agents,
-    "run": cmd_run, "cursor": cmd_cursor, "copilot": cmd_copilot, "setup": cmd_setup,
+    "next": cmd_next, "wait": cmd_wait, "tempo": cmd_tempo, "watchdog": cmd_watchdog, "agents": cmd_agents,
+    "run": cmd_run, "cursor": cmd_cursor, "copilot": cmd_copilot, "setup": cmd_setup, "lang": cmd_lang,
 }
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    if argv is None:
+        _utf8_stdio()                                   # run as the command itself: its streams are ours to configure
+    try:
+        rc = _main(argv)
+        sys.stdout.flush()                              # a reader that went away (`| head`) shows up here, not at exit
+        return rc
+    except BrokenPipeError:
+        # Not an error of ours. Point stdout at the null device so the flush at interpreter exit stays quiet too.
+        with contextlib.suppress(Exception):
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        return 1
+
+
+def _main(argv: Optional[List[str]] = None) -> int:
+    global _LANG_FLAG
+    raw = list(sys.argv[1:] if argv is None else argv)
+    flag = requested_lang(raw)
+    if not flag:
+        return _dispatch(raw)
+    # `--lang` travels as ORKESTRA_LANG, set BEFORE the parser is built: --help, the output of this command and every
+    # child process (hooks, engines) speak that language. An embedding caller gets its environment back.
+    saved = os.environ.get("ORKESTRA_LANG")
+    os.environ["ORKESTRA_LANG"] = flag
+    _LANG_FLAG = flag
+    try:
+        return _dispatch(raw)
+    finally:
+        _LANG_FLAG = None
+        if saved is None:
+            os.environ.pop("ORKESTRA_LANG", None)
+        else:
+            os.environ["ORKESTRA_LANG"] = saved
+
+
+def _dispatch(raw: List[str]) -> int:
     parser = build_parser()
-    a = parse_argv(parser, list(sys.argv[1:] if argv is None else argv))
+    a = parse_argv(parser, raw)
     if not a.cmd:
         parser.print_help()
         return 0
@@ -1186,9 +1785,22 @@ def main(argv: Optional[List[str]] = None) -> int:
         _out(f"orkestra {__version__}")
         return 0
     try:
-        return HANDLERS[a.cmd](a)
+        rc = HANDLERS[a.cmd](a)
+        if rc == 0 and a.cmd == "setup" and getattr(a, "lang", None):
+            _announce_saved_lang(a.lang)                # `setup --lang tr`: the install-time choice is kept
+        return rc
     except OrkestraError as exc:
         sys.stderr.write(f"orkestra: {exc}\n")
         return 2
+    except BrokenPipeError:
+        raise                                           # main() handles the vanished reader
+    except OSError as exc:                              # a folder that cannot be written, a full disk, a vanished file
+        sys.stderr.write("orkestra: " + i18n.t("cli.io_error", detail=_io_detail(exc)) + "\n")
+        return 2
     except KeyboardInterrupt:  # pragma: no cover
         return 130
+    except Exception as exc:                            # a bug, or a hand-edited file nobody expected: one line, not a traceback
+        if os.environ.get("ORKESTRA_DEBUG") == "1":
+            raise
+        sys.stderr.write("orkestra: " + i18n.t("cli.internal_error", error=f"{type(exc).__name__}: {exc}") + "\n")
+        return 2                                        # not 1: scripts read 1 as "the check failed" (gate, doctor)

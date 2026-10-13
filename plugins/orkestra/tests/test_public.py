@@ -94,7 +94,8 @@ class TestPlaybookKnowsThePhase(TempoBase):
         self.start()
         out = self.cli("playbook", "-p", "demo", env={"ORKESTRA_HEADLESS": "1"}).stdout
         self.assertTrue(out.startswith("HEADLESS: "), out[:80])
-        self.assertIn("sleep 30; orkestra next", out)
+        self.assertIn("`orkestra wait`", out)                    # one blocking call instead of `sleep 30; orkestra next` polling
+        self.assertNotIn("sleep 30;", out.replace("never `sleep` + `orkestra next` polling", ""))
         self.assertIn("do not end your turn", (helpers.PLUGIN / "skills/run/references/headless.md").read_text().lower())
 
 
@@ -182,7 +183,8 @@ class TestPublicRepository(unittest.TestCase):
         self.assertEqual(sibling_hits[:15], [])
 
     def test_documents_point_at_files_that_exist(self):
-        for doc in ("README.md", "README.tr.md", "ORKESTRA.md", "CONTRIBUTING.md", "SECURITY.md", "THIRD_PARTY_NOTICES.md"):
+        for doc in ("README.md", "README.tr.md", "ORKESTRA.md", "ORKESTRA.tr.md", "CONTRIBUTING.md", "SECURITY.md",
+                    "THIRD_PARTY_NOTICES.md"):
             text = (ROOT / doc).read_text(encoding="utf-8")
             for target in re.findall(r"\]\(((?!https?:|#|mailto:)[^)\s]+)\)", text):
                 self.assertTrue((ROOT / target.split("#")[0]).exists(), f"{doc} links to missing {target}")
@@ -198,8 +200,11 @@ class TestPublicRepository(unittest.TestCase):
         self.assertIn("https://github.com/soft-ai-solutions/orkestra.git", readme)
         self.assertTrue((ROOT / "CODE_OF_CONDUCT.md").is_file())
         self.assertTrue((ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").is_file())
-        self.assertTrue((ROOT / ".github" / "ISSUE_TEMPLATE" / "bug_report.md").is_file())
-        self.assertTrue((ROOT / ".github" / "ISSUE_TEMPLATE" / "feature_request.md").is_file())
+        # the issue forms (.yml) are the templates; the old free-text .md ones were removed because GitHub lists every
+        # valid template in the folder, so reporters could still pick the form-less version (no version, OS, doctor output)
+        for name in ("bug_report", "feature_request"):
+            self.assertTrue((ROOT / ".github" / "ISSUE_TEMPLATE" / f"{name}.yml").is_file(), name)
+            self.assertFalse((ROOT / ".github" / "ISSUE_TEMPLATE" / f"{name}.md").exists(), f"{name}.md duplicates the form")
         license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
         self.assertIn("Orkestra contributors", license_text)
         self.assertEqual(license_text, (helpers.PLUGIN / "LICENSE").read_text(encoding="utf-8"))
@@ -292,8 +297,9 @@ class TestPublicRepository(unittest.TestCase):
             "CURSOR_DEFAULT=y must gate on HAS_CURSOR=1 (detected Cursor)",
         )
         # A2: do not claim ready when the three-way readiness warn fired
-        self.assertIn('ok "Orkestra hazır."', install)
-        ready_ok_idx = install.index('ok "Orkestra hazır."')
+        ready_ok = 'ok "$(L \'Orkestra is ready.\' \'Orkestra hazır.\')"'      # English + Turkish pair (install.sh resolves the language)
+        self.assertIn(ready_ok, install)
+        ready_ok_idx = install.index(ready_ok)
         readiness_warn = (
             '[ "$HAS_CLAUDE" = 0 ] && [ "$CURSOR_READY" = 0 ] && [ "$COPILOT_READY" = 0 ]'
         )
@@ -465,6 +471,7 @@ class TestPublicRepository(unittest.TestCase):
         onboarding = (ROOT / "ONBOARDING.md").read_text(encoding="utf-8")
         security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
         orkestra_md = (ROOT / "ORKESTRA.md").read_text(encoding="utf-8")
+        orkestra_tr_md = (ROOT / "ORKESTRA.tr.md").read_text(encoding="utf-8")
         coc = (ROOT / "CODE_OF_CONDUCT.md").read_text(encoding="utf-8")
 
         # FR-006 / E9: PATH shim + install.sh --skip-tests in README and ONBOARDING
@@ -520,18 +527,19 @@ class TestPublicRepository(unittest.TestCase):
             "FR-007: README Limits must name Copilot in the asymmetry note",
         )
 
-        # FR-008: bridge/workbench wording matches code (Copilot is a bridge engine)
-        kaps = orkestra_md.split("## Kapsam", 1)[1].split("## ", 1)[0]
-        self.assertNotRegex(
-            kaps,
-            r"[Cc]opilot[^\n.]{0,80}(kapsam d[ıi][şs][ıi]|out of scope)",
-            "FR-008: ORKESTRA.md must not claim Copilot bridge/engine is out of scope",
-        )
-        self.assertRegex(
-            kaps,
-            r"[Bb]ridge.*[Cc]opilot|[Cc]opilot.*[Bb]ridge",
-            "FR-008: ORKESTRA.md Kapsam must acknowledge Copilot on the bridge",
-        )
+        # FR-008: bridge/workbench wording matches code (Copilot is a bridge engine); both language editions
+        for doc, heading in ((orkestra_md, "## Scope"), (orkestra_tr_md, "## Kapsam")):
+            kaps = doc.split(heading, 1)[1].split("## ", 1)[0]
+            self.assertNotRegex(
+                kaps,
+                r"[Cc]opilot[^\n.]{0,80}(kapsam d[ıi][şs][ıi]|out of scope)",
+                f"FR-008: ORKESTRA ({heading}) must not claim Copilot bridge/engine is out of scope",
+            )
+            self.assertRegex(
+                kaps,
+                r"[Bb]ridge.*[Cc]opilot|[Cc]opilot.*[Bb]ridge",
+                f"FR-008: ORKESTRA ({heading}) must acknowledge Copilot on the bridge",
+            )
         self.assertRegex(
             readme,
             r"workbench[^\n]{0,120}[Cc]opilot|[Cc]opilot[^\n]{0,80}workbench|"
@@ -567,6 +575,58 @@ class TestPublicRepository(unittest.TestCase):
             r"mailto:|@[\w.-]+\.(com|org|net|io)\b",
             "FR-009 / E10: CODE_OF_CONDUCT must not invent a public contact email",
         )
+
+    def test_install_windows_entrypoints(self):
+        """FR-003 / E6: install.py + install.ps1 exist; Windows skips LaunchAgent."""
+        self.assertTrue((ROOT / "install.py").is_file())
+        self.assertTrue((ROOT / "install.ps1").is_file())
+        py = (ROOT / "install.py").read_text(encoding="utf-8")
+        self.assertIn('os.name == "nt"', py)
+        self.assertRegex(py, r"LaunchAgent|launchd")
+        self.assertIn("skip", py.casefold())
+        sh = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertRegex(sh, r"[Ww]indows.*(install\.py|install\.ps1)")
+        self.assertIn("Darwin", sh)
+        self.assertIn("LaunchAgent", sh)
+
+    def test_posix_only_modules_declare_nt_skip(self):
+        """FR-007: listed POSIX fixture modules declare skipUnless(os.name != \"nt\")."""
+        modules = [
+            ROOT / "plugins" / "orkestra" / "tests" / "test_engines.py",
+            ROOT / "plugins" / "orkestra" / "tests" / "test_engines2.py",
+            ROOT / "plugins" / "orkestra" / "tests" / "test_flow.py",
+            ROOT / "plugins" / "orkestra" / "tests" / "test_hardening.py",
+            ROOT / "bridge" / "tests" / "test_bridge_engines.py",
+        ]
+        for path in modules:
+            src = path.read_text(encoding="utf-8")
+            self.assertIn("skipUnless", src, path.name)
+            self.assertRegex(src, r"os\.name\s*!=\s*[\"']nt[\"']", path.name)
+
+    def test_ci_includes_windows_latest(self):
+        """FR-007 / SC-003: unit matrix includes windows-latest for plugin+bridge."""
+        yml = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
+        self.assertIn("windows-latest", yml)
+        self.assertIn("ubuntu-latest", yml)
+        self.assertIn("macos-latest", yml)
+        self.assertIn("plugins/orkestra/tests", yml)
+        self.assertIn("bridge/tests", yml)
+
+    def test_windows_docs_honesty(self):
+        """FR-008 / SC-004: Windows supported with honest limits; not WSL-only; no pip/fail-open flip."""
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        readme_tr = (ROOT / "README.tr.md").read_text(encoding="utf-8")
+        onboarding = (ROOT / "ONBOARDING.md").read_text(encoding="utf-8")
+        self.assertNotIn("Windows is untested", readme)
+        for label, text in (("README.md", readme), ("README.tr.md", readme_tr), ("ONBOARDING.md", onboarding)):
+            self.assertRegex(text, r"[Ww]indows", f"{label} must mention Windows")
+            self.assertNotRegex(text, r"WSL[- ]only|only WSL", f"{label} must not claim WSL-only")
+            self.assertNotRegex(text, r"(?i)pip install\s+orkestra")
+            self.assertRegex(text, r"LaunchAgent|launchd", f"{label}: LaunchAgent N/A on Windows")
+            self.assertRegex(text, r"orkestra\.cmd|\.cmd", f"{label}: .cmd PATH shim")
+            self.assertRegex(text, r"Developer Mode|Dev Mode|symlink", f"{label}: optional Dev Mode/symlink note")
+            self.assertRegex(text, r"%USERPROFILE%|~/\.local/bin|ORKESTRA_SHIM_DIR", f"{label}: shim dir hint")
+        self.assertRegex(readme, r"(?i)(standard library|nothing to `pip install`)")
 
 if __name__ == "__main__":
     unittest.main()

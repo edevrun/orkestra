@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" SessionStart",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" SessionStart; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" SessionStart",
             "timeout": 15
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" UserPromptSubmit",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" UserPromptSubmit; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" UserPromptSubmit",
             "timeout": 15
           }
         ]
@@ -29,7 +29,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" PreToolUse",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" PreToolUse; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" PreToolUse",
             "timeout": 15
           }
         ]
@@ -41,7 +41,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" PostToolUse",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" PostToolUse; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" PostToolUse",
             "timeout": 15
           }
         ]
@@ -52,7 +52,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" Stop",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" Stop; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" Stop",
             "timeout": 15
           }
         ]
@@ -63,7 +63,52 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" SubagentStop",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" SubagentStop; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" SubagentStop",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" PostToolUseFailure; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" PostToolUseFailure",
+            "timeout": 15
+          }
+        ],
+        "matcher": "Bash|Agent|Task"
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" Notification; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" Notification",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" StopFailure; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" StopFailure",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if [ \"${OS:-}\" != \"Windows_NT\" ] && [ -z \"${MSYSTEM:-}\" ] && command -v python3 >/dev/null 2>&1; then exec python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" SessionEnd; fi; exec sh \"${CLAUDE_PLUGIN_ROOT}/hooks/run_hook.sh\" \"${CLAUDE_PLUGIN_ROOT}/hooks/dispatch.py\" SessionEnd",
             "timeout": 15
           }
         ]

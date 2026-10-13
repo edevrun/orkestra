@@ -1,6 +1,8 @@
 """Run lifecycle: start, phase transitions with hard preconditions, tasks, TDD evidence, approvals."""
 from __future__ import annotations
 
+import json
+import os
 import re
 import shlex
 import shutil
@@ -11,14 +13,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from . import evidence as E
 from . import gates as G
+from . import i18n
 from . import intent
 from . import paths
 from . import planparse as PP
 from . import snapshot as S
 from . import tempo as T
+from .messages import protocol as P
 from .state import (OPEN_STATUSES, PHASES, OrkestraError, StateTxn, active_runs, bind_marker, ledger, load_state,
                     new_state, next_run_id, project_active_run, save_state, set_active_run, unbind_marker)
-from .util import (now_iso, read_json, read_text, sha256_bytes, tail_lines, write_json_atomic,
+from .state import TERMINAL_STATUSES
+from .util import (file_lock, now_iso, read_json, read_text, sha256_bytes, tail_lines, write_json_atomic,
                    write_text_atomic)
 
 TEMPLATES = Path(__file__).resolve().parent.parent.parent / "templates"
@@ -37,6 +42,15 @@ BACK_EDGES = {
 
 # ---------------------------------------------------------------- project init / memory skeleton
 
+def _run_shell_or_list(cmd: str, *, cwd: str, timeout: int, env: dict, argv: Optional[List[str]] = None):
+    """Evidence/TDD runner. `cmd` is the POSIX-quoted record of the command (what the log and the red/green comparison
+    use); it runs through the shell. On Windows, several `argv` items run as a list instead: POSIX quotes mean nothing
+    to cmd.exe, and a list keeps every argument (spaces, quotes, `;`) exactly as the user typed it."""
+    if G._IS_WINDOWS and argv and len(argv) > 1:
+        return G._run_tree(list(argv), cwd=cwd, env=env, timeout=timeout)
+    return G._run_tree(cmd, cwd=cwd, env=env, timeout=timeout)
+
+
 def init_project(project: Path) -> List[str]:
     created: List[str] = []
     ok = paths.okdir(project)
@@ -51,7 +65,7 @@ def init_project(project: Path) -> List[str]:
     for name in ("PROJECT.md", "FEATURES.md", "DECISIONS.md", "LEARNINGS.md"):
         target = paths.memory_dir(project) / name
         if not target.exists():
-            tpl = read_text(TEMPLATES / "memory" / name) or f"# {name[:-3]}\n"
+            tpl = read_text(i18n.template_dir(TEMPLATES) / "memory" / name) or f"# {name[:-3]}\n"
             write_text_atomic(target, tpl.replace("{{project}}", project.name))
             created.append(str(target.relative_to(project)))
     cfgp = paths.project_config_path(project)
@@ -64,9 +78,33 @@ def init_project(project: Path) -> List[str]:
 
 # ---------------------------------------------------------------- start / resume
 
+def request_scaffold(title: str, run_id: str, size: str, mode: str, engine: str, approval_mode: str,
+                     request: str, code: Optional[str] = None) -> str:
+    """request.md as `start` writes it, in `code` (default: the current language). Headings and labels come from
+    messages/protocol; the readers accept both languages, so a run can be continued in the other one."""
+    lang = code or i18n.lang()
+
+    def label(key: str) -> str:
+        pair = P.REQUEST_FIELDS[key]
+        return pair[1] if lang == "tr" else pair[0]
+
+    return (f"# {i18n.heading('request', lang)}: {title}\n\n- {label('run')}: `{run_id}`\n- {label('size')}: {size}\n"
+            f"- {label('mode')}: {mode}\n- {label('engine')}: {engine}\n"
+            f"- {label('approval_mode')}: {approval_mode}\n- {label('date')}: {now_iso()}\n\n"
+            f"## {i18n.heading('raw_request', lang)}\n\n{request.strip()}\n")
+
+
 def start_run(project: Path, title: str, request: str, size: str, mode: str, engine: str = "claude",
               approval_mode: str = "autopilot") -> Dict[str, Any]:
+    """Open a run. One at a time per project: looking for an open run and creating the next one is a single step, so
+    two `orkestra start` at once cannot both pass the check (they used to leave two open runs, with clashing numbers)."""
     project = project.resolve(strict=False)
+    with file_lock(paths.okdir(project) / "start"):
+        return _start_run_locked(project, title, request, size, mode, engine, approval_mode)
+
+
+def _start_run_locked(project: Path, title: str, request: str, size: str, mode: str, engine: str,
+                      approval_mode: str) -> Dict[str, Any]:
     existing = project_active_run(project)
     if existing:
         st = load_state(project, existing)
@@ -85,10 +123,7 @@ def start_run(project: Path, title: str, request: str, size: str, mode: str, eng
                       "dirty_files": len(base.get("files") or {})}
     st["baseline"]["deps"] = G.dependency_sets(project)
     save_state(project, st)
-    req_md = (f"# İstek — {title}\n\n- run: `{run_id}`\n- boyut: {size}\n- mod: {mode}\n- motor: {engine}\n"
-              f"- onay modu: {approval_mode}\n- tarih: {now_iso()}\n\n"
-              f"## Ham istek\n\n{request.strip()}\n")
-    write_text_atomic(fdir / "request.md", req_md)
+    write_text_atomic(fdir / "request.md", request_scaffold(title, run_id, size, mode, engine, approval_mode, request))
     set_active_run(project, run_id)
     point_current(project, run_id)
     ledger(project, run_id, f"run started: {title!r} (size {size}, mode {mode}, engine {engine}); baseline git={base['git']} "
@@ -107,7 +142,8 @@ def record_engine_origin(project: Path, run_id: str, engine: str) -> bool:
         st["engine"] = engine
     request_path = paths.feature_dir(project, run_id) / "request.md"
     request = read_text(request_path)
-    updated = re.sub(r"(?m)^- motor: [^\n]*$", f"- motor: {engine}", request, count=1)
+    labels = "|".join(re.escape(x) for x in P.REQUEST_FIELDS["engine"])           # `engine` or `motor`: keep the run's own
+    updated = re.sub(rf"(?m)^(- (?:{labels}): )[^\n]*$", lambda m: m.group(1) + engine, request, count=1)
     if updated != request:
         write_text_atomic(request_path, updated)
     ledger(project, run_id, f"origin engine identified by host hook: {engine}")
@@ -235,14 +271,12 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
         need = intent.min_context_chars(st.get("size") or "M")
         if len(ctx.strip()) < need:
             problems.append(f"context.md missing or too thin (discovery output, >= {need} chars)")
-        if not (rdir / "gates-baseline.json").exists():
-            problems.append("baseline gates not recorded: run `orkestra gate baseline` (it records an empty "
-                            "baseline if the project has no gates, which is reported as a risk)")
     elif target == "plan":
         if not spec.strip():
             problems.append("spec.md missing")
-        elif not PP.has_section(spec, "Netleştirmeler", "Clarifications"):
-            problems.append("spec.md needs a `## Netleştirmeler` section (questions asked + answers, or why none were needed)")
+        elif not PP.has_heading(spec, "clarifications"):
+            problems.append(f"spec.md needs a `## {i18n.heading('clarifications')}` section (questions asked + answers, "
+                            f"or why none were needed)")
         if spec.strip() and not PP.spec_ids(spec):
             problems.append("spec.md defines no FR-###/SC-### ids")
     elif target == "approve":
@@ -269,6 +303,15 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
         elif appr.get("hash") != spec_plan_hash(project, rid):
             problems.append("spec/plan changed after approval — rerun plan-critic and record a current approval")
         problems += PP.check_plan(spec, plan, project)
+        # the baseline may run in the background during discover/clarify/plan (source cannot change before approval:
+        # the phase guard), but it must be complete before the first edit
+        if not (rdir / "gates-baseline.json").exists():
+            if (rdir / "gates-baseline.partial.json").exists():
+                problems.append("baseline gates still running or interrupted: wait for `orkestra gate baseline` to "
+                                "finish, or run it again")
+            else:
+                problems.append("baseline gates not recorded: run `orkestra gate baseline` (it records an empty "
+                                "baseline if the project has no gates, which is reported as a risk)")
     elif target == "verify":
         open_tasks = [tid for tid, t in st.get("tasks", {}).items() if t.get("status") not in ("done", "deferred")]
         if open_tasks:
@@ -279,13 +322,14 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
             if t.get("status") == "deferred" and not t.get("deferred_reason"):
                 problems.append(f"{tid}: deferred without a reason")
     elif target == "review":
+        changed = S.changed_files(project, rdir)            # ONE scan serves the newest-change check and the integrity check
         last = read_json(rdir / "gates-verify.json")
         if not isinstance(last, dict):
             problems.append("`orkestra gate verify` has not been run")
         elif not (last.get("comparison") or {}).get("ok"):
             problems.append("last `orkestra gate verify` shows regressions/failures — fix before review")
         else:
-            newest_change = _newest_change_mtime(project, rdir)
+            newest_change = _newest_change_mtime(project, rdir, changed)
             if newest_change and newest_change > float(last.get("ts", 0)):
                 problems.append("files changed after the last `orkestra gate verify` — run it again")
         ver = read_text(fdir / "verification.md")
@@ -294,7 +338,7 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
         problems += PP.check_trace(spec, ver)
         gate_names = [g["name"] for g in paths.project_config(project).get("gates") or []]
         problems += E.verification_problems(project, rid, spec, ver, gate_names)
-        problems += E.integrity_problems(project, rid)
+        problems += E.integrity_problems(project, rid, changed)
         problems += deps_problems(project, st)
     elif target == "deliver":
         open_tasks = [tid for tid, t in st.get("tasks", {}).items() if t.get("status") not in ("done", "deferred")]
@@ -313,6 +357,9 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
             problems.append("code changed during review fixes — run `orkestra gate verify` again")
         elif isinstance(last, dict) and not (last.get("comparison") or {}).get("ok"):
             problems.append("last gate verify is not green")
+        elif isinstance(last, dict) and any(r.get("carried_from") for r in last.get("results") or []):
+            problems.append("the last gate verify carried gates forward: run `orkestra gate verify --all` once so the "
+                            "final proof covers every gate")
     elif target == "done":
         rep = read_text(fdir / "report.md")
         if len(rep.strip()) < 300:
@@ -326,9 +373,9 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
     return problems
 
 
-def _newest_change_mtime(project: Path, rdir: Path) -> float:
+def _newest_change_mtime(project: Path, rdir: Path, changed: Optional[List[Dict[str, Any]]] = None) -> float:
     newest = 0.0
-    for item in S.changed_files(project, rdir):
+    for item in changed if changed is not None else S.changed_files(project, rdir):
         p = project / item["path"]
         try:
             newest = max(newest, p.stat().st_mtime)
@@ -348,7 +395,37 @@ def deps_problems(project: Path, st: Dict[str, Any]) -> List[str]:
 
 # ---------------------------------------------------------------- transitions
 
+# preconditions of these targets walk the tree and hash files: they run BEFORE the state lock is taken
+SCAN_TARGETS = ("review", "deliver", "done")
+# bookkeeping hooks write while a command works; none of it can change what a precondition says
+_VOLATILE_STATE = ("updated", "stop_blocks", "subagent_stop_blocks", "usage")
+
+
+def _state_token(st: Dict[str, Any]) -> str:
+    """Fingerprint of the state a precondition check was computed from."""
+    kept = {k: v for k, v in st.items() if k not in _VOLATILE_STATE}
+    return sha256_bytes(json.dumps(kept, sort_keys=True, default=str).encode("utf-8"))
+
+
+def _precheck(project: Path, run_id: str) -> Optional[Dict[str, Any]]:
+    """The slow part of phase_next (change scans, hashing, git, transcripts) computed from an unlocked read, so that
+    hooks and other agents never queue behind it. phase_next uses the result only if the state is unchanged once it
+    holds the lock (same fingerprint); otherwise it recomputes under the lock, as it always did."""
+    try:
+        st = load_state(project, run_id)
+        if st["phase"] == "done":
+            return None
+        target = PHASES[PHASES.index(st["phase"]) + 1]
+        if target not in SCAN_TARGETS:
+            return None
+        return {"target": target, "token": _state_token(st), "problems": preconditions(project, st, target),
+                "usage": usage_snapshot(project, st) if target == "done" else None}
+    except Exception:           # whatever is odd is decided (and reported) by the locked path
+        return None
+
+
 def phase_next(project: Path, run_id: str, note: str = "") -> Tuple[str, str]:
+    pre = _precheck(project, run_id)
     with StateTxn(project, run_id) as st:
         cur = st["phase"]
         if cur == "done":
@@ -373,7 +450,8 @@ def phase_next(project: Path, run_id: str, note: str = "") -> Tuple[str, str]:
                        "hash": current_hash}
                 write_json_atomic(rdir / "approval.json", rec)
                 ledger(project, run_id, "autopilot approved plan after checks and critic passed")
-        problems = preconditions(project, st, target)
+        fresh = pre is not None and pre["target"] == target and pre["token"] == _state_token(st)
+        problems = pre["problems"] if fresh else preconditions(project, st, target)
         if problems:
             raise OrkestraError(f"cannot move {cur} → {target}:\n  - " + "\n  - ".join(problems))
         if target == "approve":
@@ -385,7 +463,7 @@ def phase_next(project: Path, run_id: str, note: str = "") -> Tuple[str, str]:
             st["status"] = "active"
         if target == "done":
             st["status"] = "done"
-            snap = usage_snapshot(project, st)
+            snap = pre["usage"] if fresh else usage_snapshot(project, st)
             if snap:
                 st["usage"] = snap
         st["phase"] = target
@@ -464,29 +542,78 @@ def record_approval(project: Path, run_id: str, decision: str, source: str, deta
 
 # ---------------------------------------------------------------- status changes
 
-def set_status(project: Path, run_id: str, status: str, reason: str = "", source: str = "") -> None:
-    with StateTxn(project, run_id) as st:
-        if status == "awaiting_user" and st.get("approval_mode", "autopilot") != "manual":
-            raise OrkestraError("autopilot runs cannot wait for user input; decide conservatively or block on a real external dependency")
-        st["status"] = status
-        if status == "aborted":
-            snap = usage_snapshot(project, st)
-            if snap:
-                st["usage"] = snap
-        if status == "awaiting_user":
-            st["awaiting"] = {"question": reason, "at": now_iso()}
-            if source:                              # "hook": set by the AskUserQuestion hook, ends with that call
-                st["awaiting"]["source"] = source
-        elif status == "blocked":
-            st["blocked"] = {"reason": reason, "at": now_iso()}
-        elif status == "active":
-            st["blocked"] = None
-            st["awaiting"] = None
-    ledger(project, run_id, f"status → {status}" + (f": {reason}" if reason else ""))
+class _Unchanged(Exception):
+    """Raised inside the state transaction when a status call changes nothing: the file is not rewritten (its
+    mtime is a liveness signal), no ledger line is written."""
+
+
+def _status_unchanged(st: Dict[str, Any], status: str, reason: str, source: str) -> bool:
+    """Is `status` (with this reason) what the run already says? A repeated pause / unblock / abort is a no-op; a wait or
+    a block with a different question or reason still updates the record."""
+    if (st.get("status") or "") != status:
+        return False
+    if status == "awaiting_user":
+        aw = st.get("awaiting") or {}
+        return aw.get("question") == reason and (aw.get("source") or "") == (source or "")
+    if status == "blocked":
+        return (st.get("blocked") or {}).get("reason") == reason
+    return True
+
+
+def set_status(project: Path, run_id: str, status: str, reason: str = "", source: str = "",
+               who: Optional[Dict[str, Any]] = None) -> bool:
+    """Change a run's status. True = changed (or its reason updated), False = it already said that (nothing written:
+    no ledger line, no state rewrite). A closed run stays closed. `who` ({session_id, agent_type, agent_id}) names the
+    chat that asked: a visible `status` row (who, from, to) goes into the run's activity feed."""
+    prev = ""
+    try:
+        with StateTxn(project, run_id) as st:
+            prev = str(st.get("status") or "")
+            if prev in TERMINAL_STATUSES and status != prev:
+                raise OrkestraError(f"run '{run_id}' is {prev}: a closed run cannot be set to {status}")
+            if status == "awaiting_user" and st.get("approval_mode", "autopilot") != "manual":
+                raise OrkestraError("autopilot runs cannot wait for user input; decide conservatively or block on a real external dependency")
+            if _status_unchanged(st, status, reason, source):
+                raise _Unchanged()
+            _apply_status(project, st, status, reason, source)
+    except _Unchanged:
+        if status in ("aborted", "paused"):
+            set_active_run(project, None)
+            point_current(project, None)
+        return False
+    ledger(project, run_id, f"status {prev} → {status}" + (f": {reason}" if reason else ""))
     if status in ("aborted", "paused"):
         # Paused must leave the workspace index too: otherwise a foreign chat can re-lease the run.
         set_active_run(project, None)
         point_current(project, None)
+    if who is not None and prev != status:
+        record_status_row(project, run_id, prev, status, who)
+    return True
+
+
+def record_status_row(project: Path, run_id: str, prev: str, status: str, who: Dict[str, Any]) -> None:
+    """The visible trace of a status change in the run's activity feed: who asked, from, to (best effort)."""
+    from . import activity as A
+    from .engines import short_sid
+    by = short_sid(str(who.get("session_id") or "")) or "cli"
+    A.record(project, run_id, dict(who, tool_name=""), "status", i18n.t("runs.status_row", by=by, src=prev, dst=status))
+
+
+def _apply_status(project: Path, st: Dict[str, Any], status: str, reason: str, source: str) -> None:
+    st["status"] = status
+    if status == "aborted":
+        snap = usage_snapshot(project, st)
+        if snap:
+            st["usage"] = snap
+    if status == "awaiting_user":
+        st["awaiting"] = {"question": reason, "at": now_iso()}
+        if source:                                  # "hook": set by the AskUserQuestion hook, ends with that call
+            st["awaiting"]["source"] = source
+    elif status == "blocked":
+        st["blocked"] = {"reason": reason, "at": now_iso()}
+    elif status == "active":
+        st["blocked"] = None
+        st["awaiting"] = None
 
 
 # ---------------------------------------------------------------- tasks & TDD
@@ -508,6 +635,9 @@ def task_start(project: Path, run_id: str, tid: str, agent: str = "", force: str
         if t.get("status") in ("done", "deferred"):
             raise OrkestraError(f"{tid} is already {t['status']}. Another round starts with `orkestra task reopen {tid} "
                                 f"\"<why>\"` (after a review FAIL), not with task start.")
+        if t.get("status") == "blocked" and T.is_autopilot(st) and str((t.get("notes") or [""])[-1]).startswith(T.CAP_BLOCK):
+            raise OrkestraError(f"{tid} hit the review round limit and autopilot has no user to rule on it: "
+                                f"`orkestra task defer {tid} \"<why>\"` (the final review triages it) or `orkestra block \"<why>\"`.")
         if t.get("status") == "in_progress":
             return [f"{tid} is already in progress (started {t.get('started')}) — nothing changed; continue with "
                     f"`orkestra next`."]
@@ -537,12 +667,16 @@ def task_start(project: Path, run_id: str, tid: str, agent: str = "", force: str
 
 def task_done(project: Path, run_id: str, tid: str, note: str = "") -> bool:
     """False when the task was already done (idempotent: nothing is recorded twice)."""
-    if (_need_task(load_state(project, run_id), tid).get("status")) == "done":
+    seen = _need_task(load_state(project, run_id), tid)
+    if seen.get("status") == "done":
         return False
+    rdir = paths.run_dir(project, run_id)
+    # the change scan runs before the lock: it is file work, the lock only guards the task record
+    tests_changed = bool(E.test_files_state(project, rdir)) if seen.get("tdd") == "required" else None
     with StateTxn(project, run_id) as st:
         t = _need_task(st, tid)
         if t.get("tdd") == "required":
-            if not E.test_files_state(project, paths.run_dir(project, run_id)):
+            if not (tests_changed if tests_changed is not None else E.test_files_state(project, rdir)):
                 raise OrkestraError(f"{tid}: TDD task but no test file was added or changed in this run. Write the "
                                     f"test first (or mark the task `TDD: n/a (reason)` in the plan and re-approve).")
             if not (t.get("green") or {}).get("ok"):
@@ -597,42 +731,79 @@ def task_set(project: Path, run_id: str, tid: str, status: str, reason: str) -> 
     ledger(project, run_id, f"{tid} → {status}: {reason}")
 
 
+def _human_ruling_after(project: Path, run_id: str, since: float) -> bool:
+    """Is there a HUMAN row (a user prompt or an answered question) newer than `since`? The only thing that may lift
+    the review-round cap in manual mode: --force text is written by the model itself and proves nothing."""
+    from . import activity as A
+    return any(r.get("kind") in ("user", "answer") and float(r.get("ts") or 0) > since for r in A.read_rows(project, run_id))
+
+
 def task_reopen(project: Path, run_id: str, tid: str, reason: str, force: str = "") -> None:
     """Reopen for another round: evidence is reset so the next round starts with a fresh red test.
 
     Tempo rules (deterministic; `--force "<why>"` overrides and is written to the ledger):
       * a task whose latest review says PASS is not reopened for minors — they go to the final triage
-      * after MAX_REVIEW_ROUNDS - 1 reopen rounds the next one needs the user's ruling
+      * after MAX_REVIEW_ROUNDS - 1 reopen rounds the next one needs the user's ruling: in manual mode --force counts
+        only when a user / answer row is newer than the last reopen; in autopilot there is no user, --force cannot lift
+        the cap, and the task becomes blocked with the question recorded (defer or block are the only ways on)
+      * a reopen for missing red evidence is bookkeeping: not a review round, at most twice per task
     """
     fdir = paths.feature_dir(project, run_id)
+    refuse = ""
+    red_missing = False
     with StateTxn(project, run_id) as st:
         t = _need_task(st, tid)
         rounds = T.reopen_count(t)
+        auto = T.is_autopilot(st)
         rv = T.task_review(fdir, tid)
+        red_missing = bool(force) and force.strip().lower().startswith("red evidence missing") \
+            and t.get("tdd") == "required" and bool((t.get("green") or {}).get("ok")) and not (t.get("red") or {}).get("ok") \
+            and sum(1 for n in (t.get("notes") or []) if str(n).startswith(T.RED_MISSING)) < 2
         if rv:
             t["review_seen"] = rv.get("mtime")      # this verdict is now applied; the next round needs a newer review
-        if not force:
-            if rv.get("verdict") in ("PASS", "PASS_WITH_NOTES"):
-                raise OrkestraError(
-                    f"{tid}: the latest review ({rv.get('name')}) says {rv['verdict']}. A PASS is not reopened for minors: "
-                    f"`orkestra task done {tid} \"review: PASS\"` and carry them with `orkestra task note {tid} \"minor: …\"` "
-                    f"(the final review triages them). If a fix truly cannot wait: --force \"<why>\".")
-            if rounds >= T.MAX_REVIEW_ROUNDS - 1:
-                raise OrkestraError(
-                    f"{tid}: already reopened {rounds}×. Round {rounds + 1} failed too → stop and put the trade-off to the "
-                    f"user (AskUserQuestion), then pass the ruling: `orkestra task reopen {tid} --force \"<user's ruling>\"` "
-                    f"or `orkestra task defer {tid} \"<why>\"`.")
-        for k in ("red", "green"):
-            if t.get(k):
-                t.setdefault("history", []).append({k: t[k]})
-            t[k] = None
-        t["status"] = "pending"
-        t.setdefault("notes", []).append(f"reopened: {reason}" + (f" [forced: {force}]" if force else ""))
+        if not force and rv.get("verdict") in ("PASS", "PASS_WITH_NOTES"):
+            raise OrkestraError(
+                f"{tid}: the latest review ({rv.get('name')}) says {rv['verdict']}. A PASS is not reopened for minors: "
+                f"`orkestra task done {tid} \"review: PASS\"` and carry them with `orkestra task note {tid} \"minor: …\"` "
+                f"(the final review triages them). If a fix truly cannot wait: --force \"<why>\".")
+        capped = not red_missing and rounds >= T.MAX_REVIEW_ROUNDS - 1
+        if capped and auto:
+            refuse = (f"{tid}: already reopened {rounds}×, round {rounds + 1} would exceed the limit "
+                      f"({T.MAX_REVIEW_ROUNDS}). Autopilot has no user to rule on it, so --force cannot lift it. The task is now "
+                      f"blocked with the question recorded. Next: `orkestra task defer {tid} \"<why>\"` (the final review "
+                      f"triages it) or `orkestra block \"<why>\"`.")
+            t["status"] = "blocked"
+            t.setdefault("notes", []).append(f"{T.CAP_BLOCK} ({rounds + 1} rounds failed review): no safe automatic ruling, "
+                                             f"defer or block")
+        elif capped and not force:
+            raise OrkestraError(
+                f"{tid}: already reopened {rounds}×. Round {rounds + 1} failed too → stop and put the trade-off to the "
+                f"user (AskUserQuestion), then pass the ruling: `orkestra task reopen {tid} --force \"<user's ruling>\"` "
+                f"or `orkestra task defer {tid} \"<why>\"`.")
+        elif capped and not _human_ruling_after(project, run_id, float(t.get("last_reopen_at") or 0)):
+            raise OrkestraError(
+                f"{tid}: --force needs the user's ruling, and no user answer was recorded after the last reopen. Put the "
+                f"trade-off to the user (AskUserQuestion), then pass their ruling with --force, or "
+                f"`orkestra task defer {tid} \"<why>\"`.")
+        if not refuse:
+            for k in ("red", "green"):
+                if t.get(k):
+                    t.setdefault("history", []).append({k: t[k]})
+                t[k] = None
+            t["status"] = "pending"
+            t["last_reopen_at"] = time.time()
+            t.setdefault("notes", []).append(
+                ((T.RED_MISSING if red_missing else "reopened") + f": {reason}") + (f" [forced: {force}]" if force else ""))
+    if refuse:
+        ledger(project, run_id, f"{tid} blocked: review round limit reached ({rounds + 1} rounds), autopilot has no user ruling")
+        raise OrkestraError(refuse)
     ledger(project, run_id, f"{tid} reopened (evidence reset): {reason}" + (f" · forced: {force}" if force else ""))
 
 
-def task_add(project: Path, run_id: str, tid: str, title: str, tdd: str = "required") -> None:
-    """Ad-hoc task (e.g. a review fix R-001) after approval; recorded in the ledger and the report."""
+def task_add(project: Path, run_id: str, tid: str, title: str, tdd: str = "required",
+             files: Optional[List[str]] = None) -> None:
+    """Ad-hoc task (e.g. a review fix R-001) after approval; recorded in the ledger and the report. `files` is the
+    scope the task touches: the overlap check of `task start` and the parallel-dispatch advice read it."""
     if not re.match(r"^[A-Z][A-Z0-9-]{1,20}$", tid):
         raise OrkestraError("task id must look like FIX-R001 or T009")
     with StateTxn(project, run_id) as st:
@@ -640,10 +811,10 @@ def task_add(project: Path, run_id: str, tid: str, title: str, tdd: str = "requi
             raise OrkestraError(f"tasks can be added only after approval (phase {st['phase']})")
         if tid in (st.get("tasks") or {}):
             raise OrkestraError(f"{tid} already exists")
-        st.setdefault("tasks", {})[tid] = {"title": title, "status": "pending", "tdd": tdd, "files": [], "depends": [],
+        st.setdefault("tasks", {})[tid] = {"title": title, "status": "pending", "tdd": tdd, "files": list(files or []), "depends": [],
                                            "red": None, "green": None, "adhoc": True,
                                            "notes": ["ad-hoc (added after approval)"]}
-    ledger(project, run_id, f"{tid} added after approval: {title} (tdd {tdd})")
+    ledger(project, run_id, f"{tid} added after approval: {title} (tdd {tdd})" + (f" · files {', '.join(files)}" if files else ""))
 
 
 def task_note(project: Path, run_id: str, tid: str, note: str) -> None:
@@ -713,12 +884,13 @@ def tdd_record(project: Path, run_id: str, tid: str, kind: str, cmd: List[str], 
     rdir.mkdir(parents=True, exist_ok=True)
     started = time.time()
     try:
-        cp = subprocess.run(shell_cmd, shell=True, cwd=str(project), capture_output=True, timeout=1800,
-                            env=_ci_env())
+        cp = _run_shell_or_list(shell_cmd, cwd=str(project), timeout=1800, env=_ci_env(), argv=cmd)
         code = cp.returncode
         out = (cp.stdout or b"").decode("utf-8", "replace") + (cp.stderr or b"").decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
         code, out = 124, "[orkestra] TIMEOUT"
+    except OSError as exc:                  # could not start: 127/126, which red refuses as "not a real failure"
+        code, out = G._spawn_failure(exc)
     log = rdir / f"{tid}-{kind}-{int(started)}.log"
     write_text_atomic(log, f"$ {shell_cmd}\n\n{out}\n[exit {code}]\n")
     # red must be a real test failure: not success, not timeout, not "command not found"/not executable
@@ -747,11 +919,13 @@ def run_evidence(project: Path, run_id: str, label: str, cmd: List[str]) -> Dict
     rdir = paths.run_dir(project, run_id) / "evidence"
     rdir.mkdir(parents=True, exist_ok=True)
     try:
-        cp = subprocess.run(shell_cmd, shell=True, cwd=str(project), capture_output=True, timeout=900, env=_ci_env())
+        cp = _run_shell_or_list(shell_cmd, cwd=str(project), timeout=900, env=_ci_env(), argv=cmd)
         code = cp.returncode
         out = (cp.stdout or b"").decode("utf-8", "replace") + (cp.stderr or b"").decode("utf-8", "replace")
     except subprocess.TimeoutExpired:
         code, out = 124, "[orkestra] TIMEOUT"
+    except OSError as exc:
+        code, out = G._spawn_failure(exc)
     log = rdir / f"{safe}-{int(time.time())}.log"
     write_text_atomic(log, f"$ {shell_cmd}\n\n{out}\n[exit {code}]\n")
     ledger(project, run_id, f"evidence {safe}: exit {code} ({shell_cmd}) → {log.name}")
@@ -770,27 +944,134 @@ def _ci_env() -> Dict[str, str]:
 
 # ---------------------------------------------------------------- gates (state wiring)
 
+def _gate_parallel(project: Path) -> Any:
+    cfg = paths.project_config(project)
+    return cfg["gates_parallel"] if "gates_parallel" in cfg else paths.global_config().get("gates_parallel", 1)
+
+
+def _file_sigs(project: Path, changed: List[Dict[str, Any]]) -> Dict[str, str]:
+    """{changed path: size:mtime_ns:change}: a cheap fingerprint of the working-tree state a verify judged."""
+    out: Dict[str, str] = {}
+    for item in changed:
+        try:
+            st = (project / item["path"]).stat()
+            out[item["path"]] = f"{st.st_size}:{st.st_mtime_ns}:{item.get('change')}"
+        except OSError:
+            out[item["path"]] = f"gone:{item.get('change')}"
+    return out
+
+
+def _stamp_of(files: Dict[str, str]) -> str:
+    import hashlib
+    return hashlib.sha256("\n".join(f"{k}\0{v}" for k, v in sorted(files.items())).encode("utf-8")).hexdigest()[:16]
+
+
+def _full_verify_forced(project: Path) -> bool:
+    import os
+    if os.environ.get("ORKESTRA_GATES_FULL", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    cfg = paths.project_config(project)
+    val = cfg["gates_rerun_failed_baseline"] if "gates_rerun_failed_baseline" in cfg else \
+        paths.global_config().get("gates_rerun_failed_baseline", False)
+    return val is True
+
+
+BASELINE_SKIP_SECONDS = 120         # a baseline failure at least this slow is not re-run by `gate verify`
+
+
 def gates_baseline(project: Path, run_id: str) -> Tuple[List[Dict[str, Any]], str]:
     cfg = paths.project_config(project)
     rdir = paths.run_dir(project, run_id)
-    results = G.run_all(project, cfg.get("gates") or [], rdir / "evidence", "baseline")
+    part = rdir / "gates-baseline.partial.json"     # progress; gates-baseline.json only ever holds a COMPLETE baseline
+
+    def keep(rs: List[Dict[str, Any]]) -> None:
+        G.save_results(part, rs, {"ts": time.time(), "partial": True})
+
+    results = G.run_all(project, cfg.get("gates") or [], rdir / "evidence", "baseline",
+                        parallel=_gate_parallel(project), on_result=keep)
     G.save_results(rdir / "gates-baseline.json", results, {"ts": time.time()})
+    try:
+        part.unlink()
+    except OSError:
+        pass
     ok = sum(1 for r in results if r["ok"])
     ledger(project, run_id, f"gate baseline: {ok}/{len(results)} passing")
     return results, G.format_results(results)
 
 
-def gates_verify(project: Path, run_id: str) -> Tuple[Dict[str, Any], str]:
+def gates_verify(project: Path, run_id: str, resume: bool = False, full: bool = False) -> Tuple[Dict[str, Any], str]:
     cfg = paths.project_config(project)
     rdir = paths.run_dir(project, run_id)
     base = (read_json(rdir / "gates-baseline.json") or {}).get("results") or []
+    bmap = {r["name"]: r for r in base}
     label = f"verify-{int(time.time())}"
-    results = G.run_all(project, cfg.get("gates") or [], rdir / "evidence", label)
+    full = full or _full_verify_forced(project)
+    gates = [g for g in (cfg.get("gates") or []) if g.get("enabled") is not False]
+    files = _file_sigs(project, S.changed_files(project, rdir))
+    stamp = _stamp_of(files)
+    part = rdir / "gates-verify.partial.json"
+    reuse: Dict[str, Dict[str, Any]] = {}
+    if resume and not full:                         # results of an interrupted verify, only for the same tree state
+        prev = read_json(part)
+        if isinstance(prev, dict) and prev.get("stamp") == stamp:
+            names = {g["name"] for g in gates}
+            for r in prev.get("results") or []:
+                if r.get("name") in names:
+                    reuse[r["name"]] = dict(r, resumed=True)
+    run_list: List[Dict[str, Any]] = []
+    last = read_json(rdir / "gates-verify.json")
+    lres = {r["name"]: r for r in (last.get("results") or [])} if isinstance(last, dict) else {}
+    lfiles = last.get("files") if isinstance(last, dict) else None
+    for g in cfg.get("gates") or []:
+        name = g.get("name")
+        b = bmap.get(name)
+        if g.get("enabled") is False or name in reuse or full:
+            run_list.append(g)
+            continue
+        if b is not None and not b.get("ok"):
+            dur = float(b.get("duration_s") or 0)
+            if b.get("timed_out") or dur >= BASELINE_SKIP_SECONDS:
+                # it failed at baseline: the regression rule can never blame the run for it, re-running only burns time
+                reuse[name] = {"name": name, "cmd": g.get("cmd"), "kind": g.get("kind", "other"), "exit": b.get("exit", 1),
+                               "ok": False, "timed_out": bool(b.get("timed_out")), "duration_s": 0,
+                               "log": b.get("log", ""), "tail": b.get("tail", ""), "at": now_iso(),
+                               "skipped": "failed at baseline", "baseline_duration_s": dur}
+                run_list.append(g)
+                continue
+            # failed fast at baseline: still run (it may be fixed), within a bounded budget
+            run_list.append(dict(g, timeout=min(int(g.get("timeout", G.DEFAULT_TIMEOUT)), max(60, int(dur * 1.5) + 1))))
+            continue
+        prev_r = lres.get(name)
+        pats = g.get("paths")
+        if pats and isinstance(pats, list) and isinstance(lfiles, dict) and prev_r and prev_r.get("ok") \
+                and not prev_r.get("skipped") and prev_r.get("cmd") == g.get("cmd"):
+            dirty = any(G.glob_match(str(pt), f) for f in set(files) | set(lfiles) if files.get(f) != lfiles.get(f)
+                        for pt in pats)
+            if not dirty:
+                reuse[name] = dict(prev_r, carried_from=prev_r.get("carried_from") or last.get("label") or last.get("at"),
+                                   at=now_iso())
+        run_list.append(g)
+
+    def keep(rs: List[Dict[str, Any]]) -> None:
+        G.save_results(part, rs, {"ts": time.time(), "stamp": stamp, "label": label, "partial": True})
+
+    results = G.run_all(project, run_list, rdir / "evidence", label, parallel=_gate_parallel(project),
+                        on_result=keep, reuse=reuse)
     comparison = G.compare(base, results)
     # stamp AFTER the gates ran: files the gates themselves write (junit.xml, caches) must not look like new edits
-    G.save_results(rdir / "gates-verify.json", results, {"comparison": comparison, "ts": time.time()})
+    G.save_results(rdir / "gates-verify.json", results, {"comparison": comparison, "ts": time.time(), "label": label,
+                                                         "stamp": stamp, "files": files})
+    try:
+        part.unlink()
+    except OSError:
+        pass
+    notes = ""
+    if any(r.get("skipped") for r in results):
+        notes += " · not re-run (failed at baseline): " + ", ".join(r["name"] for r in results if r.get("skipped"))
+    if any(r.get("carried_from") for r in results):
+        notes += " · carried: " + ", ".join(r["name"] for r in results if r.get("carried_from"))
     ledger(project, run_id, f"gate verify: {'NO REGRESSIONS' if comparison['ok'] else 'REGRESSION'} "
-                            f"{comparison}")
+                            f"{comparison}{notes}")
     return comparison, G.format_results(results, comparison, base)
 
 

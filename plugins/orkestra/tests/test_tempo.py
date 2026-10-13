@@ -335,6 +335,8 @@ class TestReopenRules(TempoBase):
         self.assertEqual(cp.returncode, 2)
         self.assertIn("AskUserQuestion", cp.stderr)
         self.assertIn("flags: T001: review round 3", self.cli("next", "-p", "demo").stdout)
+        # --force alone is no ruling any more: a human row (user prompt / answer) newer than the last reopen is required
+        A.record(self.proj, self.rid, {"session_id": self.sid}, "user", "bir tur daha dene")
         self.assertEqual(self.reopen("--force", "kullanıcı: bir tur daha").returncode, 0)
 
     def test_without_a_review_file_reopen_still_works(self):

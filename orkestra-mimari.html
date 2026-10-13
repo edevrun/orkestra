@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Orkestra — mimari ve akış</title>
+<link rel="alternate" hreflang="en" href="docs/architecture.html">
 <style>
 :root{--bg:#f5f6f8;--card:#fff;--fg:#1b2130;--mut:#667085;--line:#e2e5ea;--soft:#eef0f4;--acc:#4338ca;--acc-soft:#eef0ff;
 --ok:#15803d;--ok-soft:#e8f6ec;--warn:#b45309;--warn-soft:#fdf3e1;--bad:#b91c1c;--bad-soft:#fdecec;--unk:#475569;--unk-soft:#eef1f5}
@@ -73,17 +74,19 @@ svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetic
 .sa{fill:var(--acc);font-size:12px;font-weight:600}
 .ar{stroke:var(--mut);stroke-width:1.5;fill:none}
 .ard{stroke:var(--mut);stroke-width:1.3;fill:none;stroke-dasharray:4 4}
+.langsw{margin:0 0 10px;font-size:13px;color:var(--mut)}
 footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-size:13px}
 </style>
 </head>
 <body>
 <header>
+  <p class="langsw"><a href="docs/architecture.html" hreflang="en" lang="en">English</a> · Türkçe</p>
   <h1>Orkestra — mimari ve akış</h1>
-  <p class="lead">Orkestra, Claude Code için bir eklentidir: bir geliştirme isteğini keşif, soru, plan, senin onayın, test önce uygulama, doğrulama, inceleme ve teslim aşamalarından geçirir. Kuralları modelin iyi niyetine bırakmaz; bir komut satırı aracı ve hook'lar zorlar.</p>
-  <p class="meta">Sürüm 1.6.0 · Bu sayfa 5 Ekim 2026, 20:55'te (İstanbul) kodun ve run kayıtlarının o anki hâline göre güncellendi (ilk yazım: 4 Ekim) · Canlı görünüm için: <code>orkestra dashboard --open</code></p>
+  <p class="lead">Orkestra, Claude Code, Cursor ve GitHub Copilot için bir eklentidir: bir geliştirme isteğini keşif, soru, plan, senin onayın, test önce uygulama, doğrulama, inceleme ve teslim aşamalarından geçirir. Kuralları modelin iyi niyetine bırakmaz; bir komut satırı aracı ve hook'lar zorlar.</p>
+  <p class="meta">Sürüm 1.6.0 · Bu sayfa 12 Ekim 2026'da iki dil, Copilot, Windows ve kurulum konularında kodla yeniden eşitlendi (ilk yazım: 4 Ekim). Run istatistikleri, hook testi ve sorun tablosu 4-5 Ekim'e aittir ve öyle işaretlidir · Canlı görünüm için: <code>orkestra dashboard --open</code></p>
 </header>
 <nav><div>
-  <a href="#ozet">Özet</a><a href="#mimari">Mimari</a><a href="#motor">İki motor</a><a href="#akis">Akış</a><a href="#ekip">Ajan ekibi</a>
+  <a href="#ozet">Özet</a><a href="#mimari">Mimari</a><a href="#motor">Üç motor</a><a href="#akis">Akış</a><a href="#ekip">Ajan ekibi</a>
   <a href="#guard">Guard'lar</a><a href="#tempo">Tempo ve devam</a><a href="#kapsam">Kapsam: hangi istekler geçiyor?</a><a href="#kanit">Kanıt</a>
   <a href="#dosya">Dosyalar</a><a href="#izleme">İzleme</a><a href="#durum">Son run'lar</a><a href="#sorun">Sorunlar ve durumları</a>
 </div></nav>
@@ -93,8 +96,8 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
   <div class="grid g4">
     <div class="stat"><b>10</b><span>faz, sırası kodla sabit</span></div>
     <div class="stat"><b>8</b><span>uzman alt-ajan</span></div>
-    <div class="stat"><b>6</b><span>hook olayı, tek giriş noktası</span></div>
-    <div class="stat"><b>344 + 16</b><span>otomatik test (eklenti + bridge), hepsi yeşil</span></div>
+    <div class="stat"><b>10</b><span>hook olayı, tek giriş noktası</span></div>
+    <div class="stat"><b>3</b><span>motor: Claude Code, Cursor, Copilot</span></div>
   </div>
   <div class="grid g2" style="margin-top:14px">
     <div class="card">
@@ -106,6 +109,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
         <li>Her görev önce başarısız test, sonra geçen test kanıtıyla kapanır.</li>
         <li>Başta geçen her kontrol (test, lint, tip, build) sonda da geçmek zorundadır.</li>
         <li>Bağımsız inceleme ve saldırgan test sonrası rapor yazar, proje hafızasını günceller.</li>
+        <li>İki dilde çalışır: çıktılar, belge şablonları ve <code>--help</code> İngilizce ya da Türkçedir (<code>orkestra lang</code>).</li>
       </ul>
     </div>
     <div class="card">
@@ -116,7 +120,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
         <li><code>.env</code> ve anahtar dosyalarını okumaz, yazmaz.</li>
         <li>Run sırasında başka projeye yazmaz, onaysız paket kurmaz.</li>
         <li>%100 hatasızlık vaat etmez: amaç, hatayı kod tabanına girmeden bir kapının, bir hook'un ya da bir incelemenin yakalamasıdır.</li>
-        <li>Claude Code ve Cursor dışındaki araçları denetlemez; Cursor'da da yalnız orkestra run'ı süren sohbetleri — bkz. <a href="#motor">İki motor</a> ve <a href="#kapsam">Kapsam</a>.</li>
+        <li>Claude Code, Cursor ve Copilot dışındaki araçları denetlemez; Cursor'da da yalnız orkestra run'ı süren sohbetleri — bkz. <a href="#motor">Üç motor</a> ve <a href="#kapsam">Kapsam</a>.</li>
       </ul>
     </div>
   </div>
@@ -131,17 +135,17 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
 
     <text class="s" x="16" y="22">GİRİŞLER</text>
     <rect class="bx" x="16" y="34" width="220" height="64" rx="10"/>
-    <text class="t" x="28" y="60">Claude Code sohbeti</text><text class="s" x="28" y="80">/orkestra:run &lt;istek&gt;</text>
-    <rect class="bx" x="16" y="150" width="220" height="44" rx="10"/><text class="t" x="28" y="177">Telegram  /yap …</text>
+    <text class="t" x="28" y="60">Ajan sohbeti</text><text class="s" x="28" y="80">/orkestra:run · /orkestra-run</text>
+    <rect class="bx" x="16" y="150" width="220" height="44" rx="10"/><text class="t" x="28" y="177">Telegram  /run · /yap …</text>
     <rect class="bx" x="16" y="204" width="220" height="44" rx="10"/><text class="t" x="28" y="231">n8n webhook</text>
     <rect class="bx" x="16" y="258" width="220" height="44" rx="10"/><text class="t" x="28" y="285">OpenClaw</text>
 
     <rect class="bx-soft" x="268" y="166" width="150" height="120" rx="10"/>
     <text class="t" x="280" y="192">bridge</text><text class="s" x="280" y="212">127.0.0.1:47615</text>
-    <text class="s" x="280" y="238">başsız oturum açar:</text><text class="s" x="280" y="256">claude -p …</text>
+    <text class="s" x="280" y="238">başsız oturum açar:</text><text class="s" x="280" y="256">claude -p · agent -p</text><text class="s" x="280" y="274">copilot -p …</text>
 
     <rect class="bx-big" x="450" y="24" width="400" height="300" rx="14"/>
-    <text class="s" x="464" y="46">CLAUDE CODE OTURUMU (eklenti yüklü)</text>
+    <text class="s" x="464" y="46">OTURUM: CLAUDE CODE · CURSOR · COPILOT</text>
     <rect class="bx" x="470" y="58" width="360" height="56" rx="10"/>
     <text class="t" x="482" y="82">Orkestratör — run skill'i</text><text class="s" x="482" y="101">fazları sırayla yürütür, ajanları çağırır</text>
     <rect class="bx" x="470" y="124" width="360" height="62" rx="10"/>
@@ -149,7 +153,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
     <text class="s" x="482" y="166">scout · researcher · architect · plan-critic</text>
     <text class="s" x="482" y="181">implementer · reviewer · adversary · verifier</text>
     <rect class="bx-acc" x="470" y="198" width="360" height="112" rx="10"/>
-    <text class="t" x="482" y="221">Hook'lar — hooks/dispatch.py</text>
+    <text class="t" x="482" y="221">Hook'lar: hooks/dispatch.py</text>
     <text class="s" x="482" y="241">UserPromptSubmit: git izni, onay kaydı</text>
     <text class="s" x="482" y="258">PreToolUse: guard kararı (izin / ret) + yedek</text>
     <text class="s" x="482" y="275">PostToolUse: oturum bağı, cevaplar, dokunulan dosya</text>
@@ -189,7 +193,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
 
     <rect class="bx-soft" x="16" y="504" width="1088" height="60" rx="12"/>
     <text class="t" x="28" y="529">İzleme (salt-okunur)</text>
-    <text class="s" x="28" y="549">orkestra watch · dashboard http://127.0.0.1:47616 · Telegram /durum — kaynak: state.json, activity.jsonl, ledger.md ve oturum kayıtlarındaki token sayıları</text>
+    <text class="s" x="28" y="549">orkestra watch · dashboard http://127.0.0.1:47616 · Telegram /status (/durum) · kaynak: state.json, activity.jsonl, ledger.md ve oturum kayıtlarındaki token sayıları</text>
 
     <path class="ar" marker-end="url(#ah)" d="M236 66H450"/>
     <path class="ar" marker-end="url(#ah)" d="M236 172H268"/>
@@ -208,19 +212,19 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
     <text class="s" x="658" y="492">okur</text>
   </svg>
   </div>
-  <div class="note">Hook'lar hata durumunda <b>açık başarısız olur</b>: <code>dispatch.py</code> içinde bir hata oluşursa oturumu kilitlemez, hatayı <code>~/.orkestra/logs/hooks.log</code>'a yazar ve araç çağrısına izin verir. Bu, bir guard hatasının çalışmanı durdurmamasını sağlar; karşılığında o anda guard da çalışmamış olur.</div>
+  <div class="note">Hook'lar hata durumunda <b>açık başarısız olur</b> (Claude Code ve Cursor): <code>dispatch.py</code> içinde bir hata oluşursa oturumu kilitlemez, hatayı <code>~/.orkestra/logs/hooks.log</code>'a yazar ve araç çağrısına izin verir. Bu, bir guard hatasının çalışmanı durdurmamasını sağlar; karşılığında o anda guard da çalışmamış olur. <b>Copilot'ta <code>PreToolUse</code> kapalı başarısız olur</b>: hook çökerse ya da yük geçersizse araç çağrısı reddedilir. Cursor ve Copilot olayları <code>cursor_hook.py</code> ve <code>copilot_hook.py</code> ile aynı işleyicilere çevrilir.</div>
 </section>
 
 <section id="motor">
-  <h2>İki motor: Claude Code ve Cursor</h2>
-  <p class="sub">1.5.0'dan beri bir run'ı Claude Code (varsayılan) ya da Cursor sürer; hangisinin süreceğini isteği verirken seçersin. Durum makinesi, kapılar, kanıt ve guard'lar tektir: Cursor için ayrı bir kopya yok, yalnız Cursor'un olaylarını aynı işleyicilere çeviren bir çevirmen (<code>hooks/cursor_hook.py</code>) var.</p>
+  <h2>Üç motor: Claude Code, Cursor ve Copilot</h2>
+  <p class="sub">Bir run'ı Claude Code (varsayılan), Cursor (1.5.0'dan beri) ya da GitHub Copilot sürer; hangisinin süreceğini isteği verirken seçersin. Durum makinesi, kapılar, kanıt ve guard'lar tektir: motor başına ayrı bir kopya yok, yalnız Cursor ve Copilot olaylarını aynı işleyicilere çeviren birer çevirmen (<code>hooks/cursor_hook.py</code>, <code>hooks/copilot_hook.py</code>) var.</p>
   <div class="card scroll">
   <table>
-    <tr><th>Nereden</th><th>Claude (varsayılan)</th><th>Cursor</th></tr>
-    <tr><td>Sohbet</td><td><code>/orkestra:run &lt;istek&gt;</code></td><td><code>/orkestra-run &lt;istek&gt;</code> (IDE ya da <code>agent</code>)</td></tr>
-    <tr><td>Terminal</td><td><code>orkestra run -p &lt;proje&gt; "&lt;istek&gt;"</code></td><td><code>orkestra run --engine cursor -p &lt;proje&gt; "&lt;istek&gt;"</code></td></tr>
-    <tr><td>Telegram</td><td><code>/yap &lt;proje&gt; &lt;istek&gt;</code></td><td><code>/yap cursor &lt;proje&gt; &lt;istek&gt;</code></td></tr>
-    <tr><td>Bridge API</td><td><code>{"project", "request"}</code></td><td>ek alan: <code>"engine": "cursor"</code></td></tr>
+    <tr><th>Nereden</th><th>Claude (varsayılan)</th><th>Cursor</th><th>Copilot</th></tr>
+    <tr><td>Sohbet</td><td><code>/orkestra:run &lt;istek&gt;</code></td><td><code>/orkestra-run &lt;istek&gt;</code> (IDE ya da <code>agent</code>)</td><td><code>/orkestra:run &lt;istek&gt;</code> (VS Code ya da Copilot CLI)</td></tr>
+    <tr><td>Terminal</td><td><code>orkestra run -p &lt;proje&gt; "&lt;istek&gt;"</code></td><td><code>orkestra run --engine cursor -p &lt;proje&gt; "&lt;istek&gt;"</code></td><td><code>orkestra run --engine copilot -p &lt;proje&gt; "&lt;istek&gt;"</code></td></tr>
+    <tr><td>Telegram</td><td><code>/yap &lt;proje&gt; &lt;istek&gt;</code> (<code>/run</code>)</td><td><code>/yap cursor &lt;proje&gt; &lt;istek&gt;</code></td><td><code>/yap copilot: &lt;proje&gt; &lt;istek&gt;</code></td></tr>
+    <tr><td>Bridge API</td><td><code>{"project", "request"}</code></td><td>ek alan: <code>"engine": "cursor"</code></td><td>ek alan: <code>"engine": "copilot"</code></td></tr>
   </table>
   </div>
   <div class="grid g2" style="margin-top:14px">
@@ -240,6 +244,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
         <li><code>orkestra cursor install</code>: skill ve alt-ajanları <code>~/.cursor</code>'a bağlar, hook girdilerini <code>~/.cursor/hooks.json</code>'a senin girdilerine dokunmadan ekler (önce yedek), <code>orkestra</code> komutunu PATH'e koyar. <code>uninstall</code> geri alır.</li>
         <li>Orkestra run'ıyla ilgisi olmayan Cursor sohbetlerine dokunulmaz. Run sürmüş sohbet, run kapandıktan sonra da git / sır / mağaza kurallarına tabidir. Tüm Cursor sohbetleri için: <code>engine.cursor.global_guards</code>.</li>
         <li>Hook'lar kurulu değilse bridge ve watchdog Cursor turu başlatmaz; <code>orkestra start</code> da hook'ların görmediği bir sohbette çalışmaz.</li>
+        <li><b>Copilot:</b> <code>orkestra copilot install</code> hook girdilerini yazar; Orkestra ajan eklentisini ve <code>SessionStart</code>, <code>UserPromptSubmit</code>, <code>PreToolUse</code>, <code>PostToolUse</code> hook'larını host'ta (VS Code ya da Copilot CLI) kendin etkinleştirirsin. Hook'suz bir Copilot oturumu denetimli run başlatmamalıdır. Copilot CLI başlatmalarında varsayılan model <code>gpt-6-luna</code>, reasoning effort <code>max</code>'tır.</li>
         <li>Komut satırı aracıyla beş gerçek run'da denendi; IDE penceresi ayrıca denenmedi. Cursor run'larında token sayımı ve implementer için bitiş anındaki TDD uyarısı yok.</li>
         <li><b>Kendi kendini onaylama:</b> bir denemede model onayı beklemek yerine hook betiğini kendisi çalıştırıp planını onayladı. Kapatıldı (komut ve dosya içeriği denetimi + hook'un kendisini ajanın başlattığını tanıması + açık yasak metni), ama guard'lar bir kum havuzu değildir.</li>
       </ul>
@@ -312,7 +317,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
         <li><b>store</b> — <code>eas build</code> (yerel olmayan), <code>eas submit</code>, <code>eas update</code>, <code>expo publish</code> engelli.</li>
         <li><b>home</b> — <code>~/.orkestra</code> model tarafından değiştirilemez.</li>
         <li><b>rollback</b> — <code>orkestra rollback --yes</code> yalnız açık isteğinle.</li>
-        <li><b>complex</b> — tek komutta 200'den fazla farklı yönlendirme hedefi ya da 2000'den fazla komut varsa, ya da denetim 8 saniyede bitmezse komut reddedilir. Sebep: zaman aşımına uğrayan hook komutu denetimsiz bırakır.</li>
+        <li><b>complex</b> — tek komutta 200'den fazla farklı yönlendirme hedefi ya da 2000'den fazla komut varsa, ya da denetim hook'un süre sınırında (6 sn CPU, 9 sn duvar saati) bitmezse komut reddedilir. Sebep: zaman aşımına uğrayan hook komutu denetimsiz bırakır.</li>
       </ul>
     </div>
     <div class="card">
@@ -322,6 +327,7 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
         <li><b>isolation</b> — run'ın projesi dışına yazılamaz (geçici klasörler hariç).</li>
         <li><b>deps</b> — planda onaylanmamış paket kurulamaz.</li>
         <li><b>deploy</b> — deploy, publish, prod migration, ssh, uzak rsync çalışmaz.</li>
+        <li><b>destructive</b> — hedeflerini adlandıramadığı ya da ayrılmış bir geçici alt klasör dışındaki özyinelemeli silme (<code>rm -r</code>) çalışmaz.</li>
         <li><b>roles</b> — salt-okur ajanlar yalnız rapor yazar; implementer orkestratörün komutlarını kullanamaz.</li>
         <li><b>internals</b> — makine durumuna (<code>.orkestra/runs</code>) elle ya da betikle yazılamaz (kanıt ve aktivite kayıtlarını okumak serbest); onaydan sonra <code>spec.md</code> donar; model onay sorusunun hiçbir yerine cevap gömemez.</li>
         <li><b>wait</b> — ana oturum alt-ajan beklemek için <code>sleep</code> ya da yoklama döngüsü çalıştıramaz; run dosyalarını döngüyle yoklayamaz.</li>
@@ -361,33 +367,35 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
   <table>
     <tr><th>Sınıf</th><th>Durum</th><th>Nasıl anlaşılır</th><th>Ne olur</th></tr>
     <tr><td class="n">1</td><td>Seni bekliyor</td><td>Açık soru, onay, bloke, duraklatılmış ya da tur bitmiş</td><td>5 dakika sonra bir kez bildirim. Asla senin yerine devam edilmez.</td></tr>
-    <tr><td class="n">2</td><td>Ölü bekleme</td><td>Alt-ajan 90 sn önce bitti, ana oturum ilerlemedi</td><td>Bildirim; 30 dakikada bir yinelenir.</td></tr>
-    <tr><td class="n">3</td><td>Asılı komut</td><td>Bir komut 15 dakikadır (kapı/test: 30 dakika) bitmedi</td><td>Bildirim. Komut öldürülmez.</td></tr>
+    <tr><td class="n">2</td><td>Ölü bekleme</td><td>Duran bir alt-ajanın raporu 60 sn gecikti ve tüm run o zamandan beri sessiz</td><td>Bildirim; 30 dakika, 2 sa, 8 sa ve bir gün sonra yinelenir, sonra durur.</td></tr>
+    <tr><td class="n">3</td><td>Asılı komut</td><td>Bir komut 15 dakikadır (kapı/test: 30 dakika) açık ve başladığından beri hiçbir ajan satır yazmadı</td><td>Bildirim. Komut öldürülmez.</td></tr>
     <tr><td class="n">4</td><td>Sessiz oturum</td><td>10 dakikadır hiçbir kayıt yok</td><td>Bildirim. Başsız başlatılmış run aynı oturumda en çok 3 kez sürdürülür.</td></tr>
     <tr><td class="n">5</td><td>Döngü</td><td>Aynı guard reddi ya da aynı komut 3 kez; aynı görevde 3 inceleme turu</td><td>Diğer sınıfların yanında bayrak olarak gösterilir.</td></tr>
   </table>
   </div>
-  <div class="note">Bu sınıfları <code>orkestra watch</code> ve panel gösterir; <code>orkestra watchdog</code> oturumun dışından tarar ve macOS bildirimi gönderir (bridge açıksa Telegram'a da). Otomatik devam yalnız başsız başlatılmış run'lar içindir ve o oturumun bir Claude süreci ya da bridge işi yaşarken hiç çalışmaz. Etkileşimli pencereden yürüttüğün run kendiliğinden sürdürülmez; istersen <code>watchdog.auto_resume</code> değerini <code>all</code> yaparsın. Eşikler <code>~/.orkestra/config.json</code> → <code>watchdog</code> altındadır.</div>
+  <div class="note">Bu sınıfları <code>orkestra watch</code> ve panel gösterir; <code>orkestra watchdog</code> oturumun dışından tarar ve macOS bildirimi gönderir (bridge açıksa Telegram'a da). Otomatik devam yalnız başsız başlatılmış run'lar içindir ve o oturumun bir Claude süreci ya da bridge işi yaşarken hiç çalışmaz. Etkileşimli pencereden yürüttüğün run kendiliğinden sürdürülmez; istersen <code>watchdog.auto_resume</code> değerini <code>all</code> yaparsın. Eşikler <code>~/.orkestra/config.json</code> → <code>watchdog</code> altındadır. macOS ve Linux'ta hızlı bir izleyici (<code>orkestra watchdog --status</code>) aynı türden düz koşulları token harcamadan 5 saniyede bir uygular.</div>
 </section>
 
 <section id="kapsam">
   <h2>Kapsam: hangi AI isteklerin orkestra kontrolünden geçiyor?</h2>
-  <p class="sub"><b>Hepsi değil.</b> Orkestra Claude Code oturumlarında ve (1.5.0'dan beri, <code>orkestra cursor install</code> sonrası) Cursor'da çalışır. Tam akış ancak bir run başlatıldığında devreye girer; Cursor'da run sürmeyen sohbetlere hiç dokunulmaz. Diğer AI araçları orkestra'dan geçmez.</p>
+  <p class="sub"><b>Hepsi değil.</b> Orkestra Claude Code oturumlarında, (<code>orkestra cursor install</code> sonrası) Cursor'da ve (hook'lar etkinse) GitHub Copilot'ta çalışır. Tam akış ancak bir run başlatıldığında devreye girer; Cursor'da run sürmeyen sohbetlere hiç dokunulmaz. Diğer AI araçları orkestra'dan geçmez.</p>
   <div class="card scroll">
   <table>
     <tr><th>İsteği nereden yaptığın</th><th>Durum</th><th>Ne uygulanır</th><th>Dayanak</th></tr>
     <tr><td><b>Claude Code</b>, <code>/orkestra:run</code> ile</td><td><span class="chip c-ok">Tam</span></td><td>10 fazlı akış, plan onayı, TDD kanıtı, kapılar ve tüm guard'lar.</td><td>Hook testi (aşağıda) ve bugünkü 4 run'ın kayıtları.</td></tr>
-    <tr><td><b>Telegram <code>/yap</code>, n8n webhook, OpenClaw</b></td><td><span class="chip c-ok">Tam</span></td><td>Bridge başsız bir Claude Code oturumu açar; aynı hook'lar çalışır, onay yalnız "onay" cevabınla kaydedilir.</td><td>README ve sözleşme dosyası; bridge testleri 9/9 yeşil. Canlı denemedim.</td></tr>
+    <tr><td><b>Telegram <code>/yap</code> (<code>/run</code>), n8n webhook, OpenClaw</b></td><td><span class="chip c-ok">Tam</span></td><td>Bridge başsız bir Claude Code, Cursor ya da Copilot oturumu açar; aynı hook'lar çalışır, onay yalnız "onay" cevabınla kaydedilir.</td><td>README ve sözleşme dosyası (<code>integrations/openclaw/CONTRACT.tr.md</code>); bridge test takımı. Canlı denemedim.</td></tr>
     <tr><td><b>Claude Code</b>, run başlatmadan yazılan istek</td><td><span class="chip c-warn">Kısmi</span></td><td>Yalnız "her oturumda" guard'ları: git, sırlar, mağaza, <code>~/.orkestra</code>. Plan, onay, TDD, izolasyon, paket ve deploy denetimi <b>yok</b>; kod doğrudan değişebilir.</td><td>Hook testi: istek mesajına hook çıktı vermedi, kaynak dosya düzenlemesine izin verildi.</td></tr>
     <tr><td>Açık run varken <b>aynı projede ikinci bir Claude Code oturumu</b></td><td><span class="chip c-warn">Kısmi</span></td><td>Run guard'ları yalnız run'a bağlı oturumda çalışır. İkinci oturum açılışta "bu projede açık run var; bu oturum o run'ı sürmüyor, onun dosyalarına dokunma" notunu alır ama dosyaları değiştirebilir. Aynı run'a ikinci bir oturum bağlanırsa uyarı verilir.</td><td>Hook testi: bağlı olmayan oturumun düzenlemesine izin verildi.</td></tr>
     <tr><td><b>Cursor Agent</b>, <code>/orkestra-run</code>, <code>orkestra run --engine cursor</code> ya da <code>/yap cursor</code> ile</td><td><span class="chip c-ok">Tam</span></td><td>Aynı 10 fazlı akış ve aynı guard'lar; onay sohbette <code>onay</code> yazarak. 1.5.0, <code>orkestra cursor install</code> gerekir.</td><td>Gerçek Cursor CLI ile beş XS run (5 Ekim): onay öncesi yazım ve izinsiz commit reddi, alt-ajan rolleri, onay kaydı. IDE penceresi ayrıca denenmedi.</td></tr>
     <tr><td><b>Cursor Agent</b>, run başlatmadan yazılan istek</td><td><span class="chip c-bad">Yok</span></td><td>Orkestra bu sohbetlere dokunmaz (bilinçli varsayılan). Yalnız <code>AGENTS.md</code> ve <code>.cursor/rules/</code> metin kuralları geçerli. İstersen <code>engine.cursor.global_guards: true</code> ile git / sır / mağaza kuralları tüm Cursor sohbetlerine uygulanır.</td><td>Hook testi: bağlı olmayan sohbette orkestra modülü yüklenmeden izin verildi.</td></tr>
     <tr><td><b>Cursor ya da VS Code içindeki Claude Code eklentisi</b></td><td><span class="chip c-unk">Doğrulanmadı</span></td><td>Bu bir Claude Code oturumu olduğu için yukarıdaki Claude Code satırlarıyla aynı olması beklenir.</td><td>Claude Code ayarlarına (<code>~/.claude</code>) erişimim olmadığı için kanıtlayamadım.</td></tr>
-    <tr><td><b>Codex, Gemini CLI, Copilot, ChatGPT ve benzerleri</b></td><td><span class="chip c-bad">Yok</span></td><td>Orkestra ile bağlantıları yok.</td><td>Orkestra kodunda bu araçlar için entegrasyon yok (fibra ve shop'da <code>.gemini</code> klasörü var).</td></tr>
-    <tr><td><b>Claude.ai sohbeti ve Cowork</b> (bu sayfa böyle bir oturumda yazıldı)</td><td><span class="chip c-bad">Yok</span></td><td>Bulutta çalışır, eklenti yüklenmez. Bu oturum orkestra dosyalarını hiçbir guard'a takılmadan düzenleyebildi.</td><td>Doğrudan gözlem.</td></tr>
+    <tr><td><b>GitHub Copilot</b> (VS Code ya da Copilot CLI), <code>/orkestra:run</code>, <code>orkestra run --engine copilot</code> ya da <code>/yap copilot:</code> ile, hook'lar etkinken</td><td><span class="chip c-ok">Tam</span></td><td>Aynı 10 fazlı akış ve aynı guard'lar. <code>PreToolUse</code> kapalı başarısızdır (hook çökmesi aracı reddeder).</td><td>Kodda <code>hooks/copilot_hook.py</code> ve <code>orkestra copilot install</code>; hook testleri. Host'ta eklentiyi etkinleştirmek elle yapılır; IDE penceresi bakımcılar tarafından ayrıca denenmedi.</td></tr>
+    <tr><td><b>Hook'suz Copilot oturumu</b></td><td><span class="chip c-bad">Yok</span></td><td>Eklenti ve hook'lar etkin değilse Orkestra devreye girmez; böyle bir oturumdan denetimli run başlatılmamalıdır.</td><td><code>ONBOARDING.md</code> (Copilot host enable).</td></tr>
+    <tr><td><b>Codex, Gemini CLI, ChatGPT ve benzerleri</b></td><td><span class="chip c-bad">Yok</span></td><td>Orkestra ile bağlantıları yok.</td><td>Orkestra kodunda bu araçlar için entegrasyon yok.</td></tr>
+    <tr><td><b>Claude.ai sohbeti ve Cowork</b></td><td><span class="chip c-bad">Yok</span></td><td>Bulutta çalışır, eklenti yüklenmez. Böyle bir oturum orkestra dosyalarını hiçbir guard'a takılmadan düzenleyebildi.</td><td>Doğrudan gözlem (4 Ekim).</td></tr>
   </table>
   </div>
-  <div class="note warn"><b>Önemli fark:</b> README'ye göre "X ekle" gibi bir geliştirme isteği run skill'ini kendiliğinden tetikler. Bu bir zorlama değil, modelin skill açıklamasına bakarak verdiği karardır. Model skill'i çağırmazsa istek akışa girmeden uygulanır. Her isteğin akıştan geçmesini istiyorsan <code>/orkestra:run</code> ile başlat.</div>
+  <div class="note warn"><b>Önemli fark:</b> model, "X ekle" gibi bir geliştirme isteği için run skill'ini kendiliğinden seçebilir. Bu bir zorlama değil, modelin skill açıklamasına bakarak verdiği karardır; README de <code>/orkestra:run</code> olmadan yazılan isteğe yalnız her oturumdaki guard'ların uygulandığını açıkça söyler. Model skill'i çağırmazsa istek akışa girmeden uygulanır. Her isteğin akıştan geçmesini istiyorsan <code>/orkestra:run</code> ile başlat.</div>
 
   <details>
     <summary>Nasıl test ettim: 24 senaryoluk hook testi ve sonuçları (4 Ekim, sürüm 1.2.1)</summary>
@@ -461,21 +469,24 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
                  kontrol listeleri (security, stack-web,
                  stack-mobile, data, ui-flow)
     agents/      8 ajan tanımı
-    hooks/       hooks.json, dispatch.py
+    hooks/       hooks.json, run_hook.sh, dispatch.py,
+                 cursor_hook.py, copilot_hook.py
     lib/orkestra_core/   CLI ve ayrıştırıcısı, guard'lar,
                  kapılar, kanıt, durum, tempo ve sıradaki
-                 adım, watchdog, izleme, token kullanımı
-    templates/   spec, plan, rapor, hafıza şablonları
+                 adım, watchdog, izleme, token kullanımı,
+                 i18n.py + messages/ (EN/TR katalogları)
+    templates/   en/ ve tr/: spec, plan, rapor, hafıza şablonları
     vendor/      sabitlenmiş referanslar (otomatik yüklenmez)
     cursor/      Cursor skill ve alt-ajan dosyaları (ÜRETİLİR:
                  orkestra cursor build)
-    tests/       344 test (+ gerçek Cursor yükleri: fixtures/)
-  bridge/        Telegram / n8n / OpenClaw köprüsü, 16 test
-  integrations/  OpenClaw sözleşmesi, entegrasyon planı
-  docs/          bu sayfa
+    tests/       eklenti test takımı (+ gerçek Cursor yükleri: fixtures/)
+  bridge/        Telegram / n8n / OpenClaw köprüsü, yerel arayüz, testleri
+  integrations/  OpenClaw eklentisi ve sözleşmesi (CONTRACT.md, CONTRACT.tr.md)
+  docs/          bu sayfa (Türkçe) ve architecture.html (English)
   dist/          sürüm paketleri ve değişiklik öncesi yedekler
-  install.sh · README.md · ORKESTRA.md · CONTRIBUTING.md · THIRD_PARTY_NOTICES.md
-  CHANGELOG.md</pre>
+  install.sh · install.ps1 · install.py
+  README.md · README.tr.md · ONBOARDING.md · ORKESTRA.md · ORKESTRA.tr.md
+  CONTRIBUTING.md · SECURITY.md · THIRD_PARTY_NOTICES.md · CHANGELOG.md</pre>
     </div>
     <div class="card">
       <h3>Her projede</h3>
@@ -504,14 +515,14 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
   <div class="card scroll">
   <table>
     <tr><th>Nereden</th><th>Komut ya da adres</th><th>Ne gösterir</th></tr>
-    <tr><td>Tarayıcı</td><td><code>python3 $ORKESTRA_ROOT/plugins/orkestra/bin/orkestra dashboard --open</code><br>http://127.0.0.1:47616/</td><td>Tüm açık run'lar: faz, şu anki durum, görev ve kanıt ilerlemesi, kapılar, token kullanımı, son araç çağrıları. Yalnız bu Mac, salt-okunur.</td></tr>
+    <tr><td>Tarayıcı</td><td><code>python3 $ORKESTRA_ROOT/plugins/orkestra/bin/orkestra dashboard --open</code><br>http://127.0.0.1:47616/</td><td>Tüm açık run'lar: faz, şu anki durum, görev ve kanıt ilerlemesi, kapılar, token kullanımı, son araç çağrıları. Yalnız bu makine, salt-okunur.</td></tr>
     <tr><td>Terminal</td><td><code>… orkestra watch</code> (<code>--once</code>, <code>--all</code>, <code>-p proje</code>)</td><td>Aynı görünüm, 2 saniyede bir yenilenir.</td></tr>
     <tr><td>Sohbet içi</td><td><code>/orkestra:status</code></td><td>Faz, görevler, kanıt eksikleri, seni bekleyen bir şey var mı.</td></tr>
     <tr><td>Sıradaki adım</td><td><code>… orkestra next -p proje</code></td><td>Yapılacak tek iş, en çok 3 satır. Aynı durumda hep aynı cevap.</td></tr>
     <tr><td>Süre dökümü</td><td><code>… orkestra tempo -p proje [--run id]</code></td><td>Faz süreleri, görev başına süre, inceleme retleri, ölçülen ölü bekleme payı. Biten run'larda da çalışır.</td></tr>
     <tr><td>Dışarıdan tarama</td><td><code>… orkestra watchdog</code> (<code>--dry-run</code>, <code>--quiet</code>, <code>--launchd</code>)</td><td>Her açık run için duraklama sınıfı; yeni olayda bir kez bildirim. Bridge çalışıyorsa dakikada bir kendisi koşar.</td></tr>
     <tr><td>Alt-ajan kayıtları</td><td><code>… orkestra agents -p proje</code></td><td>Arka planda çalışan ve iz bırakmayan alt-ajanlar; <code>agents clear</code> gitmiş olanların kaydını siler.</td></tr>
-    <tr><td>Telegram</td><td><code>/durum</code></td><td>İşler ve açık run'ların canlı durumu.</td></tr>
+    <tr><td>Telegram</td><td><code>/status</code> (<code>/durum</code>)</td><td>İşler ve açık run'ların canlı durumu.</td></tr>
     <tr><td>Ham kayıt</td><td><code>&lt;proje&gt;/.orkestra/current/ledger.md</code><br><code>&lt;proje&gt;/.orkestra/runs/*/activity.jsonl</code></td><td>Faz geçişleri ve kanıt satırları; araç çağrıları, guard retleri, sorular.</td></tr>
   </table>
   </div>
@@ -560,13 +571,14 @@ footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-
       <li><b>Bekleme guard'ı bir dürtmedir, güvenlik sınırı değil.</b> <code>S=120; sleep $S</code> gibi dolaylı beklemeleri yakalamaz.</li>
       <li><b>Değişken ve genişletme dolaylaması.</b> Guard'lar komutu çalıştırmadan okur; <code>$X</code> içine saklanmış bir komutu göremez. Bu 1.3.0'da da böyleydi.</li>
       <li><b>Watchdog kendiliğinden çalışmaz.</b> Bridge açıksa o çalıştırır; değilse <code>orkestra watchdog --launchd</code> ile kurman gerekir.</li>
+      <li><b>Windows daha az denendi.</b> Native desteklenir, ama bakımcıların Windows makinesi yok; watchdog orada yalnız bildirir ve Windows yolları simülasyon ile CI ile kapsanır.</li>
     </ul>
   </div>
 </section>
 
 </main>
 <footer>
-  Kaynaklar: <code>README.md</code>, <code>hooks/dispatch.py</code>, <code>hooks/cursor_hook.py</code>, <code>lib/orkestra_core/</code> (guards, shellparse, cliparse, runs, state, paths, cli, tempo, watchdog, activity, monitor, engines, cursorkit, shellcwd), <code>skills/run/</code> playbook'ları, <code>agents/</code>, <code>CHANGELOG.md</code>, <code>CONTRIBUTING.md</code>; proje <code>.orkestra/</code> kayıtları ve <code>orkestra tempo</code> çıktıları; ~/Projects yapılandırma taraması; 24 senaryoluk hook testi (4 Ekim); gerçek Cursor CLI ile beş run ve kaydedilen hook yükleri (5 Ekim); 330 + 16 otomatik test.
+  Kaynaklar: <code>README.md</code>, <code>hooks/dispatch.py</code>, <code>hooks/cursor_hook.py</code>, <code>lib/orkestra_core/</code> (guards, shellparse, cliparse, runs, state, paths, cli, tempo, watchdog, activity, monitor, engines, cursorkit, shellcwd), <code>skills/run/</code> playbook'ları, <code>agents/</code>, <code>CHANGELOG.md</code>, <code>CONTRIBUTING.md</code>; proje <code>.orkestra/</code> kayıtları ve <code>orkestra tempo</code> çıktıları; ~/Projects yapılandırma taraması; 24 senaryoluk hook testi (4 Ekim); gerçek Cursor CLI ile beş run ve kaydedilen hook yükleri (5 Ekim).
   Bu dosya durağandır ve hiçbir akışı etkilemez; orkestra kodu değiştikçe güncellenmesi gerekir.
 </footer>
 </body>

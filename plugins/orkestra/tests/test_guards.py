@@ -34,6 +34,39 @@ def decide(ev, b=None, grants=()):
     return guards.pre_tool_decision(ev, CFG, b, grants)
 
 
+class TestNestingDepthGuard(unittest.TestCase):
+    """A command nested deeper than the parser follows (bash -c / eval / $(...)) was parsed into nothing and every Bash
+    guard allowed it. It is refused instead, at any depth past the limit, with or without a bound run."""
+
+    @staticmethod
+    def nest(inner, levels, how):
+        import shlex
+        cmd = inner
+        for _ in range(levels):
+            cmd = {"bash": lambda c: "bash -c " + shlex.quote(c), "eval": lambda c: "eval " + shlex.quote(c),
+                   "subst": lambda c: "echo $(" + c + ")"}[how](cmd)
+        return cmd
+
+    def test_dangerous_commands_are_refused_inside_and_past_the_nesting_limit(self):
+        from orkestra_core import shellparse
+        for inner in ("git push", "cat ~/.ssh/id_rsa"):
+            for how in ("bash", "eval", "subst"):
+                for levels in (shellparse.MAX_DEPTH, shellparse.MAX_DEPTH + 1, shellparse.MAX_DEPTH + 3):
+                    for b in (None, binding()):
+                        with self.subTest(inner=inner, how=how, levels=levels, bound=bool(b)):
+                            d = decide(bash(self.nest(inner, levels, how)), b)
+                            self.assertTrue(d.denied, f"allowed: {inner} nested {levels}x in {how}")
+
+    def test_the_refusal_past_the_limit_says_why(self):
+        from orkestra_core import shellparse
+        d = decide(bash(self.nest("git push", shellparse.MAX_DEPTH + 1, "bash")))
+        self.assertTrue(d.denied)
+        self.assertIn(str(shellparse.MAX_DEPTH), d.reason)
+
+    def test_ordinary_nesting_is_not_refused(self):
+        self.assertFalse(decide(bash("bash -c 'echo $(echo $(date))'")).denied)
+
+
 class TestGitGuard(unittest.TestCase):
     def assertDenied(self, cmd, grants=(), b=None):
         d = decide(bash(cmd), b, grants)

@@ -41,6 +41,14 @@ class TestCopilotHookAdapter(FlowBase):
         self.assertIn("[orkestra:", out.get("permissionDecisionReason", ""))
         self.assertNotIn("hookSpecificOutput", out)
 
+    def test_a_closed_deadline_answer_of_an_earlier_run_does_not_silence_this_one(self):
+        # in-process callers (this adapter) never pass through dispatch.main(), which is what re-opens the answer
+        copilot_hook.dispatch._ANSWER.update(closed=True, emitted=True)
+        self.addCleanup(copilot_hook.dispatch._ANSWER.update, closed=False, emitted=False)
+        self.start()
+        out = self.copilot("PreToolUse", tool_name="Edit", tool_input={"file_path": str(self.proj / "calc.py")})
+        self.assertEqual(out.get("permissionDecision"), "deny")
+
     def test_registered_hook_entrypoint_emits_copilot_json(self):
         self.start()
         payload = {"hook_event_name": "PreToolUse", "session_id": self.sid, "cwd": str(self.proj),

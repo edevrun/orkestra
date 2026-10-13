@@ -1,6 +1,8 @@
 // integrations/openclaw/plugin/index.js
 // OpenClaw plugin "orkestra-bridge" (openclaw-agent side of CONTRACT.md):
-//   /yap <proje> <istek> · /durum · /iptal  → bridge/orkestra_client.py, no LLM turn.
+//   /run <project> <request> · /runs · /cancel  → bridge/orkestra_client.py, no LLM turn. The Turkish names /yap
+//   <proje> <istek> · /durum · /iptal are the same three commands (OpenClaw reserves /status for itself).
+//   Text for a person is English or Turkish (lang.js + messages.js: ORKESTRA_LANG, config.json, OS locale).
 //   A Telegram *reply* to an orkestra message → that job only (`reply <job-id>`); a bare option
 //   letter becomes "b) <option text>". Every other message goes to the agent untouched.
 //   Notifier service: polls `status --chat-id` and announces each stopped job state exactly once.
@@ -21,11 +23,10 @@ import {
   parseJobRef,
   parseSentMessageIds,
 } from "./logic.js";
+import { t } from "./messages.js";
 
 const PROJECT_NAME = /^[A-Za-z0-9._-]{1,80}$/;
 const MAX_MESSAGE_MAP = 300;
-const USAGE =
-  "Kullanım: /yap [claude:|cursor:|copilot:] <proje> <istek>\nÖrnek: /yap copilot: shop sipariş listesine CSV dışa aktarma ekle";
 
 function readState(file) {
   try {
@@ -52,7 +53,7 @@ export default definePluginEntry({
   id: "orkestra-bridge",
   name: "Orkestra bridge",
   description:
-    "Telegram → orkestra: /yap, /durum, /iptal, reply-to-answer and job notifications.",
+    "Telegram → orkestra: /run (/yap), /runs (/durum), /cancel (/iptal), reply-to-answer and job notifications.",
   register(api) {
     const cfg = api.pluginConfig ?? {};
     const chatId = typeof cfg.chatId === "string" ? cfg.chatId.trim() : "";
@@ -91,28 +92,42 @@ export default definePluginEntry({
     // Telegram message id → job, filled by the notifier; fallback when the quote is unavailable.
     let messages = {};
 
-    api.registerCommand({
-      name: "yap",
-      description: "Orkestra işi başlat: /yap [engine:] <proje> <istek>",
+    // Every command exists under an English and a Turkish name (the Turkish names are the original ones). A name the
+    // host already reserves is skipped with a warning; it never stops the plugin.
+    const registerBoth = (names, definition) => {
+      for (const [index, name] of names.entries()) {
+        // the prompt guidance is registered once (on the first name); an alias would only repeat it
+        const { agentPromptGuidance, ...plain } = definition;
+        try {
+          api.registerCommand({ ...(index === 0 ? definition : plain), name });
+        } catch (error) {
+          api.logger.warn(`orkestra-bridge: /${name} not registered: ${short(String(error), 200)}`);
+        }
+      }
+    };
+
+    registerBoth(["yap", "run"], {
+      description: t("cmd.run_desc"),
       channels: ["telegram"],
       acceptsArgs: true,
       requireAuth: true,
       agentPromptGuidance: [
         {
           text:
-            "Orkestra: the owner starts runs with /yap [claude:|cursor:|copilot:] <project> <request>, checks them with /durum, stops " +
-            "them with /iptal and answers a run by replying (Telegram reply) to its notification; the gateway routes " +
-            "all of that without you. In this chat never start, resume, continue or take over an orkestra run (no " +
-            "/orkestra:* skills or commands, no orkestra_client.py start/reply, no `orkestra resume`): open runs " +
-            "belong to their own desktop or /yap sessions and a second driver breaks them. If the owner asks for " +
-            "orkestra here, tell them to send /yap <project> <request> or prefix an engine (for example /yap copilot: <project> <request>). Handle other development requests directly.",
+            "Orkestra: the owner starts runs with /run (or /yap) [claude:|cursor:|copilot:] <project> <request>, checks them with " +
+            "/runs (or /durum), stops them with /cancel (or /iptal) and answers a run by replying (Telegram reply) to its " +
+            "notification; the gateway routes all of that without you. In this chat never start, resume, continue or take " +
+            "over an orkestra run (no /orkestra:* skills or commands, no orkestra_client.py start/reply, no `orkestra " +
+            "resume`): open runs belong to their own desktop or /run sessions and a second driver breaks them. If the owner " +
+            "asks for orkestra here, tell them to send /run <project> <request> or prefix an engine (for example /run copilot: " +
+            "<project> <request>). Handle other development requests directly.",
           surfaces: ["cli_backend", "openclaw_main"],
         },
       ],
       handler: async (ctx) => {
         const m = /^\s*(\S+)\s+([\s\S]*\S)\s*$/.exec(ctx.args ?? "");
         if (!m) {
-          return { text: USAGE };
+          return { text: t("cmd.usage") };
         }
         let project = m[1];
         let request = m[2];
@@ -121,21 +136,19 @@ export default definePluginEntry({
         if (enginePrefix) {
           const target = /^\s*(\S+)\s+([\s\S]*\S)\s*$/.exec(request);
           if (!target) {
-            return { text: USAGE };
+            return { text: t("cmd.usage") };
           }
           engine = enginePrefix[1].toLowerCase();
           project = target[1];
           request = target[2];
         }
         if (!PROJECT_NAME.test(project)) {
-          return { text: USAGE };
+          return { text: t("cmd.usage") };
         }
         // Fail closed: without a reliable view of open runs, do not risk taking over one.
         const runs = await monitor.openRuns();
         if (!runs.ok) {
-          return {
-            text: `⚠️ Başlatmadım: açık run kontrolü yapılamadı (${runs.error}). Güvenlik için bekliyorum; biraz sonra tekrar dene.`,
-          };
+          return { text: t("cmd.check_failed", { error: runs.error }) };
         }
         const busy = findOpenRun(runs.runs, project);
         if (busy) {
@@ -143,23 +156,22 @@ export default definePluginEntry({
         }
         const res = await client.start(project, request, chatId, engine);
         if (!res.ok) {
-          return { text: `⚠️ Başlatılamadı: ${res.error}` };
+          return { text: t("cmd.start_failed", { error: res.error }) };
         }
         return {
           text:
-            `▶️ Başladım: [${res.body.project}] iş ${res.body.id}` +
-            (res.body.engine && res.body.engine !== "claude"
-              ? ` · ${res.body.engine}`
-              : "") +
-            "\nVarsayılan autopilot'ta tamamlayacağım; manual onay istediysen yalnız onay aşamasında bu mesaja Yanıtla.",
+            t("cmd.started", {
+              project: res.body.project,
+              id: res.body.id,
+              engine: res.body.engine && res.body.engine !== "claude" ? ` · ${res.body.engine}` : "",
+            }) +
+            `\n${t("cmd.started_note")}`,
         };
       },
     });
 
-    api.registerCommand({
-      name: "durum",
-      description:
-        "Orkestra durumu: tüm açık run'lar (masaüstü dahil) ve Telegram işleri",
+    registerBoth(["durum", "runs"], {
+      description: t("cmd.runs_desc"),
       channels: ["telegram"],
       requireAuth: true,
       handler: async () => {
@@ -178,17 +190,16 @@ export default definePluginEntry({
       },
     });
 
-    api.registerCommand({
-      name: "iptal",
-      description: "Son açık orkestra işini durdur",
+    registerBoth(["iptal", "cancel"], {
+      description: t("cmd.cancel_desc"),
       channels: ["telegram"],
       requireAuth: true,
       handler: async () => {
         const res = await client.cancel(chatId);
         return {
           text: res.ok
-            ? String(res.body.message ?? "İptal isteği gönderildi.")
-            : `⚠️ İptal edilemedi: ${res.error}`,
+            ? String(res.body.message ?? t("cmd.cancel_sent"))
+            : t("cmd.cancel_failed", { error: res.error }),
         };
       },
     });
@@ -215,17 +226,17 @@ export default definePluginEntry({
       }
       const text = expandOptionReply(event.content ?? event.body ?? "", quoted);
       if (!text) {
-        return { handled: true, text: "⚠️ Boş yanıt orkestra'ya iletilmedi." };
+        return { handled: true, text: t("route.empty") };
       }
       const res = await client.reply(ref.jobId, text);
       return res.ok
         ? {
             handled: true,
-            text: `↪️ [${ref.project}] iş ${ref.jobId} → ${short(text)}`,
+            text: t("route.forwarded", { project: ref.project, id: ref.jobId, text: short(text) }),
           }
         : {
             handled: true,
-            text: `⚠️ [${ref.project}] iş ${ref.jobId}'ye iletilemedi: ${res.error}`,
+            text: t("route.failed", { project: ref.project, id: ref.jobId, error: res.error }),
           };
     });
 

@@ -29,7 +29,7 @@ approved_dependencies: []
 ## Görevler
 
 ### T001 — <kısa başlık>
-- Dosyalar: `src/a.ts` (değişir), `src/a.test.ts` (yeni)   ← var olmayan her dosya `(yeni)` diye işaretlenir; CLI kontrol eder
+- Dosyalar: `src/a.ts` (değişir), `src/a.test.ts` (yeni)   ← var olmayan her dosya (yeni) diye işaretlenir; CLI kontrol eder
 - Bağımlı: —
 - Kabul: Given <durum> When <eylem> Then <sonuç> (FR-001)
 - Test: `<tek testi koşan dar komut>`

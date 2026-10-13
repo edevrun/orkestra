@@ -16,14 +16,20 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
-import subprocess
 import sys
-import tempfile
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
+
+from . import i18n
+from .lazy import LazyModule
+from .messages import protocol as _protocol
+
+# Imported on first use: hooks reach this module for short_sid and the session-key prefixes only (each import costs 3 to 6 ms).
+shutil = LazyModule("shutil")
+subprocess = LazyModule("subprocess")
+tempfile = LazyModule("tempfile")
+uuid = LazyModule("uuid")
 
 ENGINES = ("claude", "cursor", "copilot")
 DEFAULT_ENGINE = "claude"
@@ -163,6 +169,8 @@ def headless_command(engine: str, bin_path: str, session_id: str, prompt: str, n
         argv = [bin_path, "-p", "--session-id" if new else "--resume", session_id,
                 "--permission-mode", str(o.get("permission_mode") or "auto"),
                 "--output-format", "json", "--max-turns", str(o.get("max_turns") or 400)]
+        if o.get("max_budget_usd") and float(o["max_budget_usd"]) > 0:     # opt-in spend ceiling (headless.max_budget_usd)
+            argv += ["--max-budget-usd", str(o["max_budget_usd"])]
         return {"argv": argv + [str(x) for x in (o.get("extra_args") or [])], "stdin": prompt}
     if engine == "copilot":
         argv = [bin_path, "-p", "--output-format", "json", "--allow-all-tools"]
@@ -199,6 +207,8 @@ def interactive_command(engine: str, bin_path: str, prompt: str, opts: Optional[
             argv += ["--model", str(o["model"])]
         if o.get("reasoning_effort"):
             argv += ["--reasoning-effort", str(o["reasoning_effort"])]
+        if o.get("max_autopilot_continues"):       # the same cap the headless builder passes
+            argv += ["--max-autopilot-continues", str(o["max_autopilot_continues"])]
         plugin_dir = str(o.get("plugin_dir") or copilot_plugin_dir())
         if plugin_dir:
             argv += ["--plugin-dir", plugin_dir]
@@ -214,7 +224,7 @@ def run_prompt(engine: str, request: str) -> str:
         return f"/orkestra:run {request}"
     # no reliance on skill discovery: the CLI serves the same instructions the skill carries
     return ("Orkestra run. First run the shell command `orkestra playbook run` and follow what it prints exactly "
-            f"(it is the orkestra-run skill).\n\nİstek: {request}")
+            f"(it is the orkestra-run skill).\n\n{i18n.heading('request')}: {request}")
 
 
 def resume_prompt(engine: str, project_name: str = "") -> str:
@@ -237,9 +247,9 @@ CURSOR_NOTES = NOTES_MARK + """ The instructions below were written for Claude C
 - AskUserQuestion does not exist. Wherever the text says to ask with it: write the question(s) in the chat, run
   `orkestra await "<one-line summary>"`, then end your turn (`orkestra playbook headless` has the wording — the user
   reads your message right here in the chat). The user's next message is the answer; a hook marks the run active
-  again. Plan approval is any clear approve intent the hook recognizes ("onay", "onaylıyorum",
-  "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "onay". Never approve yourself; after
-  their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
+  again. Plan approval is any clear approve intent the hook recognizes ("approve", "I approve", "go ahead", "lgtm",
+  "onay", "onaylıyorum", "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "approve". Never
+  approve yourself; after their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
   never skipped ("don't ask questions" in the request does not waive it) and never recorded by you in any way.
 - There is no SendMessage: to send findings back to a subagent, launch the same subagent type again with the
   findings and the path of its previous report.
@@ -257,7 +267,8 @@ _AGENT_RE = re.compile(r"\borkestra:(" + "|".join(re.escape(a) for a in AGENT_NA
 _SKILL_RE = re.compile(r"/orkestra:(" + "|".join(SKILL_NAMES) + r")\b")
 
 ASK_FOOTNOTE = ("(Cursor: there is no AskUserQuestion tool — write the question in the chat, run "
-                "`orkestra await \"<one-line summary>\"` and end your turn; plan approval is the user typing \"onay\".)")
+                "`orkestra await \"<one-line summary>\"` and end your turn; plan approval is the user typing "
+                "\"approve\" or \"onay\".)")
 
 # (Editing a skill / playbook / agent text? tests/test_engines2.py::test_every_rewrite_still_matches_its_source_sentence
 # tells you when an entry below has to follow.)
@@ -288,10 +299,16 @@ CURSOR_REWRITES = (
     ("`/compact`", "`/summarize`"),
     ("There is no AskUserQuestion and no live user.",
      "There is no AskUserQuestion tool (in a Cursor chat the user reads your message right there)."),
-    ("3. Ask with AskUserQuestion (header `Geri alma`): `Uygula (yalnız orkestra değişiklikleri)` · `Diğer farklar dahil uygula (--all)` · `Vazgeç`.",
-     "3. Ask in the chat which one they want and END YOUR TURN. Applying needs the user's own message: they send\n"
-     "   `/orkestra-rollback uygula` (only orkestra's changes) or `/orkestra-rollback uygula --all`; anything else = no."),
 )
+
+# The rollback question is worded per language (messages/protocol.PROMPTS), so it is matched by shape, not by text:
+# a numbered item "Ask with AskUserQuestion … (header `<Rollback | Geri alma>`) …" on one line.
+_ROLLBACK_ASK_RE = re.compile(
+    r"^([ \t]*\d+\.[ \t]+)Ask with AskUserQuestion[^\n]*`(?:%s)`[^\n]*$"
+    % "|".join(re.escape(h) for h in _protocol.PROMPTS["rollback"]["header"]), re.M)       # type: ignore[attr-defined]
+_ROLLBACK_CURSOR = ("Ask in the chat which one they want and END YOUR TURN. Applying needs the user's own message: they send\n"
+                    "   `/orkestra-rollback apply` or `/orkestra-rollback uygula` (only orkestra's changes), or the same with\n"
+                    "   `--all` (also the other differences); anything else = no.")
 
 
 def _rename(text: str) -> str:
@@ -299,6 +316,7 @@ def _rename(text: str) -> str:
     for old, new in CURSOR_REWRITES:
         if old in out:
             out = out.replace(old, new)
+    out = _ROLLBACK_ASK_RE.sub(lambda m: m.group(1) + _ROLLBACK_CURSOR, out)
     return _SKILL_RE.sub(r"/orkestra-\1", _AGENT_RE.sub(r"orkestra-\1", out)).replace("orkestra:<name>", "orkestra-<name>")
 
 
@@ -345,9 +363,9 @@ def child_env(engine: str, env: Optional[Mapping[str, str]] = None) -> Dict[str,
     for k in AGENT_MARKERS:                 # a driver started from inside some agent's shell: the child is its own agent
         out.pop(k, None)
     if normalize(engine) in ("cursor", "copilot"):
-        parts = [p for p in str(out.get("PATH") or "").split(os.pathsep) if p]
-        if str(PLUGIN_BIN) not in parts:
-            out["PATH"] = os.pathsep.join([str(PLUGIN_BIN)] + parts)
+        # always first: another `orkestra` earlier on PATH (a stale shim) must not shadow this checkout's CLI
+        parts = [p for p in str(out.get("PATH") or "").split(os.pathsep) if p and p != str(PLUGIN_BIN)]
+        out["PATH"] = os.pathsep.join([str(PLUGIN_BIN)] + parts)
     return out
 
 
@@ -448,25 +466,42 @@ def driver_prompt(engine: str, session_id: str, prompt: str, cwd: str) -> Option
                "prompt": prompt, "workspace_roots": [str(cwd)], "generation_id": "", "_driver": True}
     out_path = Path(tempfile.mkdtemp(prefix="orkestra-drv-")) / "out.json"
     try:
-        script = (
-            "import os, sys, subprocess\n"
-            f"out = {str(out_path)!r}\n"
-            f"hook = {str(CURSOR_HOOK)!r}\n"
-            f"payload = {json.dumps(json.dumps(payload))}\n"
-            "if os.fork() == 0:\n"
-            "    os.setsid()\n"
-            "    if os.fork() == 0:\n"
-            "        cp = subprocess.run([sys.executable, hook, 'beforeSubmitPrompt'], input=payload,\n"
-            "                            capture_output=True, text=True, env=dict(os.environ), timeout=30)\n"
-            "        body = cp.stdout if cp.stdout.strip() else '{}'\n"
-            "        tmp = out + '.tmp'\n"
-            "        with open(tmp, 'w', encoding='utf-8') as fh:\n"
-            "            fh.write(body); fh.flush(); os.fsync(fh.fileno())\n"
-            "        os.replace(tmp, out)\n"
-            "        os._exit(0)\n"
-            "    os._exit(0)\n"
-            "os.wait()\n"
-        )
+        if os.name == "nt":
+            script = (
+                "import os, sys, subprocess\n"
+                f"out = {str(out_path)!r}\n"
+                f"hook = {str(CURSOR_HOOK)!r}\n"
+                f"payload = {json.dumps(json.dumps(payload))}\n"
+                "flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)\n"
+                "cp = subprocess.run([sys.executable, hook, 'beforeSubmitPrompt'], input=payload,\n"
+                "                    capture_output=True, text=True, env=dict(os.environ), timeout=30,\n"
+                "                    creationflags=flags)\n"
+                "body = cp.stdout if cp.stdout.strip() else '{}'\n"
+                "tmp = out + '.tmp'\n"
+                "with open(tmp, 'w', encoding='utf-8') as fh:\n"
+                "    fh.write(body); fh.flush(); os.fsync(fh.fileno())\n"
+                "os.replace(tmp, out)\n"
+            )
+        else:
+            script = (
+                "import os, sys, subprocess\n"
+                f"out = {str(out_path)!r}\n"
+                f"hook = {str(CURSOR_HOOK)!r}\n"
+                f"payload = {json.dumps(json.dumps(payload))}\n"
+                "if os.fork() == 0:\n"
+                "    os.setsid()\n"
+                "    if os.fork() == 0:\n"
+                "        cp = subprocess.run([sys.executable, hook, 'beforeSubmitPrompt'], input=payload,\n"
+                "                            capture_output=True, text=True, env=dict(os.environ), timeout=30)\n"
+                "        body = cp.stdout if cp.stdout.strip() else '{}'\n"
+                "        tmp = out + '.tmp'\n"
+                "        with open(tmp, 'w', encoding='utf-8') as fh:\n"
+                "            fh.write(body); fh.flush(); os.fsync(fh.fileno())\n"
+                "        os.replace(tmp, out)\n"
+                "        os._exit(0)\n"
+                "    os._exit(0)\n"
+                "os.wait()\n"
+            )
         subprocess.run([sys.executable, "-c", script], check=True, timeout=45)
         deadline = time.time() + 45
         raw = ""
@@ -488,6 +523,7 @@ def driver_prompt(engine: str, session_id: str, prompt: str, cwd: str) -> Option
             out_path.parent.rmdir()
         except OSError:
             pass
+
 
 
 def agent_type_from_cursor(subagent_type: str) -> str:

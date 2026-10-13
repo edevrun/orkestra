@@ -2,7 +2,8 @@ import unittest
 
 import helpers  # noqa: F401
 from orkestra_core.intent import (approval, git_grants, infer_size, manual_approval_requested,
-                                  min_context_chars, off_topic_vs_project, skips_adversary, skips_plan_critic)
+                                  min_context_chars, off_topic_vs_project, skips_adversary, skips_plan_critic,
+                                  approval_answer)
 
 GRANT_CASES = {
     "commitle ve pushla": ["commit", "push"],
@@ -154,15 +155,19 @@ class TestOffTopic(unittest.TestCase):
             os.environ.pop("ORKESTRA_WORKSPACE", None)
 
     def test_unnamed_request_without_continue_is_off_topic(self):
-        """Gap: 'make this dashboard friendlier' while bound must unbind (no project name)."""
+        """2026-10-12 (BLK-02): 'make this dashboard friendlier' while bound used to unbind (no project name, no
+        continue cue). An ordinary message now KEEPS the binding; only an explicit signal lets go of it
+        (test_binding_model.TestOffTopic has the table)."""
         import os
         root, bound, _other = self._ws()
         try:
-            self.assertTrue(off_topic_vs_project(
+            self.assertFalse(off_topic_vs_project(
                 "make this dashboard friendlier", bound, "003-demo-kayit",
                 title="Demo Kayıt"))
-            self.assertTrue(off_topic_vs_project(
+            self.assertFalse(off_topic_vs_project(
                 "bu paneli daha okunaklı yap", bound, "003-x"))
+            self.assertTrue(off_topic_vs_project(
+                "forget this run, make this dashboard friendlier", bound, "003-x"))
             self.assertFalse(off_topic_vs_project("continue from here", bound, "003-x"))
             self.assertFalse(off_topic_vs_project("/orkestra-resume sample-app", bound, "003-x"))
             self.assertFalse(off_topic_vs_project("onaylıyorum", bound, "003-x"))
@@ -203,6 +208,201 @@ class TestInferSize(unittest.TestCase):
         self.assertTrue(skips_adversary("S") and not skips_adversary("L"))
         self.assertEqual(min_context_chars("XS"), 80)
         self.assertEqual(min_context_chars("S"), 200)
+
+
+class TestEnglishApproval(unittest.TestCase):
+    """A typed English approval is recorded only when it is a plain yes. A yes with a change, a condition or a
+    promise attached is not an approval: the run would start implementing against a plan the user wants changed."""
+
+    def test_approval_with_a_change_request_is_not_an_approval(self):
+        for text in ("approve it but change the button color", "Approve the plan, but add error handling",
+                     "approve this, but use postgres instead", "approve it. also change the title",
+                     "I approve, but please change the color scheme", "approved but remove the CSV export",
+                     "I approve this plan, but add logging first", "go ahead but use blue instead",
+                     "approved, except the migration", "lgtm but drop the dark mode part",
+                     "approve the plan but change the auth approach", "approve the spec but remove the migration step",
+                     "approve the plan except for the migration", "approve the plan, skip T002",
+                     "approve it, then rename the module", "I approve, can you also add a test for it",
+                     "approve it and please drop T003"):
+            with self.subTest(text=text):
+                self.assertNotEqual(approval(text), "approve")
+
+    def test_approval_with_a_change_request_is_recorded_as_a_change_request_where_it_names_one(self):
+        for text in ("approve it but change the button color", "Approve the plan, but add error handling",
+                     "approve it. also change the title", "approved, except the migration",
+                     "go ahead but use blue instead", "lgtm but drop the dark mode part"):
+            with self.subTest(text=text):
+                self.assertEqual(approval(text), "reject")
+
+    def test_conditions_and_promises_are_not_approvals(self):
+        for text in ("approve this plan only if you drop T004", "approve the plan after you add tests",
+                     "approve it once the tests pass", "I'll approve the plan tomorrow",
+                     "I will approve the plan after lunch", "we'll approve it later", "approve it when the CI is green"):
+            with self.subTest(text=text):
+                self.assertNotEqual(approval(text), "approve")
+
+    def test_a_negation_that_is_not_about_approving_does_not_void_the_approval(self):
+        for text in ("Don't worry, I approve", "I can't see any issue, I approve", "Not a problem, I approve.",
+                     "I do not object. I approve.", "Cannot wait, I approve", "I won't change anything, I approve",
+                     "No problem at all, approved", "Nothing to add, I approve this plan",
+                     "don’t worry, I approve", "I approve this plan, go ahead", "Plan approved, thanks",
+                     "I approve. Implement it carefully without breaking anything and with thorough tests"):
+            with self.subTest(text=text):
+                self.assertEqual(approval(text), "approve")
+
+    def test_a_negation_of_approving_still_voids_it(self):
+        for text in ("I do not approve", "I don’t approve this", "I can't approve this yet", "never approve",
+                     "I won't approve it", "I'm not going to approve this", "not approved", "Do not approve it"):
+            with self.subTest(text=text):
+                self.assertNotEqual(approval(text), "approve")
+
+    def test_plain_english_yes_words_approve(self):
+        for text in ("proceed", "Continue", "start", "ok", "Okay.", "yes please", "looks good", "Looks good to me!",
+                     "accept", "do it", "ok, go ahead", "yes, proceed", "sounds good", "ship it", "go for it"):
+            with self.subTest(text=text):
+                self.assertEqual(approval(text), "approve")
+        for text in ("ok wait", "ok but not yet", "start later", "continue? not sure", "okay, remove T002",
+                     "proceed without the tests", "no", "wait"):
+            with self.subTest(text=text):
+                self.assertNotEqual(approval(text), "approve")
+
+    def test_approval_answer_with_typed_text_after_the_option_label(self):
+        for text in ("Approve and start implementing; also remove the CSV export",
+                     "Approve and start implementing, drop T002", "Approve and start implementing, add a rollback task",
+                     "Approve and start implementing, skip the migration", "Approve and start implementing except T003",
+                     "Approve and start implementing without the tests", "Approve and start implementing, remove T004",
+                     "Approve and start implementing, but drop T002", "Approve and start implementing later"):
+            with self.subTest(text=text):
+                self.assertEqual(approval_answer(text), "reject")
+        for text in ("Approve and start implementing", "approve and start implementing.",
+                     "Onayla — uygulamaya başla", "Approve and start implementing, thanks"):
+            with self.subTest(text=text):
+                self.assertEqual(approval_answer(text), "approve")
+
+    def test_manual_approval_request_phrasings(self):
+        for text in ("wait for my approval before implementing", "I want to review the plan first",
+                     "let me review the plan before you start", "ask me before you start coding",
+                     "require my approval", "use manual approval", "get my sign-off first",
+                     "ask me for approval", "I'd like to review the plan", "switch to manual approval mode",
+                     "Please wait for my go-ahead before you code"):
+            with self.subTest(text=text):
+                self.assertTrue(manual_approval_requested(text))
+        for text in ("don't wait for my approval", "no need for my approval", "go without my approval",
+                     "use autopilot, not manual approval", "I never want to review the plan",
+                     "if the plan is risky, let me review the plan", "review the plan yourself",
+                     "the review should cover the plan"):
+            with self.subTest(text=text):
+                self.assertFalse(manual_approval_requested(text))
+
+    def test_a_typographic_apostrophe_reads_like_the_ascii_one(self):
+        self.assertEqual(git_grants("don’t push it"), git_grants("don't push it"))
+        self.assertNotIn("push", git_grants("don’t push it"))
+        self.assertEqual(approval("I can’t approve this yet"), approval("I can't approve this yet"))
+
+
+class TestManualApprovalScope(unittest.TestCase):
+    """A negation only cancels a manual-approval request when it is about asking/approving in the same clause, and
+    ordinary feature wording ("releases need my approval") is not a request to keep the plan decision."""
+
+    def test_a_negation_elsewhere_in_the_message_does_not_drop_an_explicit_request(self):
+        for text in ("Refactor the parser without breaking the API. Ask me for approval before you implement.",
+                     "Refactor the parser without breaking the API. Let me approve the plan.",
+                     "Add caching without changing the public interface; I want to decide the approach.",
+                     "Refactor the parser without breaking the API, and ask me for approval before you start.",
+                     "Skip the cache, no need for a rewrite. Ask me for approval before coding.",
+                     "I want to approve the plan, not the manual one",
+                     "Make onboarding not the manual process it is today. Ask me for approval before coding.",
+                     "Don't touch the schema. Ask me for approval before coding.",
+                     "- never edit the lockfile\n- ask me for approval before you implement"):
+            with self.subTest(text=text):
+                self.assertTrue(manual_approval_requested(text))
+
+    def test_a_negation_that_governs_the_approval_still_cancels_it(self):
+        for text in ("Go without asking me for approval", "no need for my approval, just do it",
+                     "Work without my approval, ask me for approval only if the plan is risky",
+                     "use autopilot, not manual approval", "autopilot please, not the manual approval mode",
+                     "Don't ask me for approval. Let me know when it is done."):
+            with self.subTest(text=text):
+                self.assertFalse(manual_approval_requested(text))
+
+    def test_ordinary_feature_wording_is_not_a_manual_approval_request(self):
+        for text in ("Add a deploy page where releases need my approval before going live",
+                     "The workflow should require my approval before sending any email",
+                     "I want to see the design in dark mode, so make the dark theme",
+                     "I want to check the design system docs, then add a tooltip component",
+                     "I want to see the plan for the migration after the run",
+                     "If I want to review the plan I will tell you",
+                     "Add a setting to enable manual approval of refunds",
+                     "Let me see the design in dark mode first, then add the toggle"):
+            with self.subTest(text=text):
+                self.assertFalse(manual_approval_requested(text))
+
+    def test_the_imperative_forms_of_the_request_still_count(self):
+        for text in ("Build the importer, then wait for my approval before implementing",
+                     "Add the exporter. Require my approval first.",
+                     "You must get my sign-off before you code", "The plan needs my approval before you implement",
+                     "Please wait for my go-ahead before you code", "let me review the plan before you start",
+                     "I want to review the spec first", "Refactor the cache, I'd like to review the plan.",
+                     "enable manual approval for this run"):
+            with self.subTest(text=text):
+                self.assertTrue(manual_approval_requested(text))
+
+
+class TestApprovalPhraseScope(unittest.TestCase):
+    """`approve it` / `approve the plan` inside a longer message is not an approval of a waiting plan unless the message
+    is a plain imperative; a condition, a limit or a retraction anywhere in the message voids an approval, in English
+    and in Turkish."""
+
+    def test_a_message_that_merely_contains_approve_it_is_not_an_approval(self):
+        for text in ("Approve it? Not yet.", "Approve the plan? I am not sure yet", "approve the plan? what are the risks",
+                     "Only the tech lead can approve this", "please approve this pull request on GitHub",
+                     "Why approve it so quickly", "Can the CI approve the plan automatically",
+                     "I'll let the lead approve this", "approve this pull request"):
+            with self.subTest(text=text):
+                self.assertNotEqual(approval(text), "approve")
+
+    def test_a_plain_imperative_approval_still_approves(self):
+        for text in ("approve it", "Approve the plan.", "approve it and go", "Approve the plan, then implement it carefully",
+                     "approve this, thanks", "approve the spec and start"):
+            with self.subTest(text=text):
+                self.assertEqual(approval(text), "approve")
+
+    def test_english_conditions_limits_and_retractions_void_the_approval(self):
+        for text in ("I approve the plan, provided the migration is reversible",
+                     "I approve this plan, assuming the tests pass", "I approve, as long as tests are green",
+                     "I approve this, pending the security review", "I approve this subject to legal sign-off",
+                     "Conditionally approved", "Plan approved on the condition that nothing is deployed",
+                     "Approved for T001 only", "I approve the first two tasks", "I approve the plan without T003",
+                     "I approve. Actually, wait.", "I approve the plan, once you rename the module",
+                     "I approve, make T003 smaller", "I approve. Do not implement T003.",
+                     "approved, but hold off on the migration for now", "I approve, not yet though"):
+            with self.subTest(text=text):
+                self.assertNotEqual(approval(text), "approve")
+
+    def test_turkish_negations_conditions_and_questions_void_the_approval(self):
+        for text in ("Planı onaylamadım", "Bu plan onaylanmadı", "planı onaylamadan başlama",
+                     "planı onaylamak istemiyorum", "planı onaylayabilir miyim",
+                     "Planı onaylamam için önce testleri göster", "planı onaylayacağım ama yarın",
+                     "Bence plan iyi, onaylıyorum ama önce bir bakayım", "Onaylıyorum fakat başlama",
+                     "onaylıyorum, planı T003 hariç", "onaylıyorum, yalnızca T001 olsun",
+                     "planı onaylarım ancak testler geçerse"):
+            with self.subTest(text=text):
+                self.assertNotEqual(approval(text), "approve")
+
+    def test_a_plain_statement_that_the_plan_was_not_approved_is_a_rejection(self):
+        for text in ("Planı onaylamadım", "Bu plan onaylanmadı", "planı onaylamak istemiyorum"):
+            with self.subTest(text=text):
+                self.assertEqual(approval(text), "reject")
+
+    def test_fluff_around_a_plain_approval_still_approves(self):
+        for text in ("I approve. Implement it carefully and run all tests after each task.",
+                     "I approve the plan, start with T001", "I approve this plan, go ahead and ship it",
+                     "Looks good, I approve the plan. Thanks!", "I approve, and don't worry about the old tests",
+                     "bu planı da onaylıyorum yap en uzman şekilde en kapsamlı testlerle hiçbir sağlıklı yapıyı bozmadan yap",
+                     "planı onaylıyorum, testleri de çalıştır", "Onaylıyorum, devam et lütfen",
+                     "Planı onaylıyorum, T001 ile başla", "Planı onaylıyorum, T001'den başlayalım"):
+            with self.subTest(text=text):
+                self.assertEqual(approval(text), "approve")
 
 
 

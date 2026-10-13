@@ -14,6 +14,7 @@ import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+os.environ["ORKESTRA_NO_DAEMON"] = "1"      # no test starts the detached fast watcher (fastwatch.ensure_running)
 BRIDGE = HERE.parent / "orkestra_bridge.py"
 PLUGIN = HERE.parent.parent / "plugins" / "orkestra"
 sys.path.insert(0, str(PLUGIN / "lib"))
@@ -61,8 +62,10 @@ class BridgeEnginesTest(unittest.TestCase):
             "cursor_bin": str(HERE / "fake_agent.py"), "copilot_bin": str(cls.fake_copilot),
             "copilot_plugin_dir": str(cls.copilot_plugin), "allowed_projects": PROJECTS, "watchdog_interval": 0,
             "auto_resume_delays": [0, 0, 0], "telegram": {"bot_token": "", "allowed_chat_ids": ["42"]}}))
+        # Turkish assertions below predate the English default; English is covered in test_bridge_i18n.py.
         cls.env = dict(os.environ, ORKESTRA_HOME=str(cls.home), ORKESTRA_WORKSPACE=str(cls.ws),
-                       ORKESTRA_CURSOR_HOME=str(cls.chome), ORKESTRA_SHIM_DIR=str(cls.tmp / "no-shim"))
+                       ORKESTRA_CURSOR_HOME=str(cls.chome), ORKESTRA_SHIM_DIR=str(cls.tmp / "no-shim"),
+                       ORKESTRA_LANG="tr")
         for k in ("CLAUDECODE", "CURSOR_AGENT", "CURSOR_CONVERSATION_ID", "ORKESTRA_CURSOR_BIN", "ORKESTRA_CLAUDE_BIN",
                   "ORKESTRA_HEADLESS"):
             cls.env.pop(k, None)
@@ -80,7 +83,9 @@ class BridgeEnginesTest(unittest.TestCase):
     def install_hooks(cls):
         cp = subprocess.run([sys.executable, str(PLUGIN / "bin" / "orkestra"), "cursor", "install"], env=cls.env,
                             capture_output=True, text=True)
-        assert "hooks.json: orkestra entries" in cp.stdout or "nothing to change" in cp.stdout, cp.stdout + cp.stderr
+        # the wording follows the language (this suite runs in Turkish): the file is what counts
+        hooks = cls.chome / "hooks.json"
+        assert cp.returncode == 0 and hooks.exists() and "cursor_hook.py" in hooks.read_text(encoding="utf-8"), cp.stdout + cp.stderr
 
     @classmethod
     def tearDownClass(cls):
@@ -255,6 +260,7 @@ class BridgeEnginesTest(unittest.TestCase):
         self.assertEqual(args[args.index("--reasoning-effort") + 1], "high")
         self.assertEqual(args[args.index("--plugin-dir") + 1], str(self.copilot_plugin))
 
+    @unittest.skipUnless(os.name != "nt", "#!/bin/sh non-exec fixture (FR-007)")
     def test_6_a_turn_that_cannot_start_never_leaves_the_job_running(self):
         notx = self.tmp / "not-executable-agent"
         notx.write_text("#!/bin/sh\n")

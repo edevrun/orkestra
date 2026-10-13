@@ -29,7 +29,15 @@ def is_mobile(project: Path) -> bool:
 
 
 def playbooks_for(files: Iterable[str], project: Path) -> List[str]:
-    files = [str(f) for f in files if f and "/.orkestra/" not in f"/{f}"]
+    norm = []
+    for f in files:
+        if not f:
+            continue
+        n = str(f).replace("\\", "/")
+        if "/.orkestra/" in ("/" + n):
+            continue
+        norm.append(n)
+    files = norm
     hit = set()
     for f in files:
         if SECURITY_RE.search(f):

@@ -1,12 +1,17 @@
 // integrations/openclaw/plugin/logic.js
 // Pure helpers for the OpenClaw ↔ orkestra bridge plugin: Telegram reply routing, option-letter
 // expansion, notification text and change detection. No I/O here; see index.js / client.js.
+// Text for a person comes from messages.js in English or Turkish (every formatter takes an optional `lang`, default:
+// the language resolved by lang.js); everything that RECOGNISES text (job header, approval words) accepts both.
+import { resolveLang } from "./lang.js";
+import { t } from "./messages.js";
 
 const PROJECT = String.raw`[A-Za-z0-9._-]{1,80}`;
 const JOB_ID = String.raw`[a-f0-9]{12}`;
-// Matches the bridge notification header `[proj] <status> · <phase> · iş <id>` and the
-// start confirmation `Başladım: [proj] iş <id>`, wherever they sit in the quoted message.
-const JOB_REF = new RegExp(String.raw`\[(${PROJECT})\][^\n]*?\biş\s+(${JOB_ID})\b`);
+// Matches the bridge notification header `[proj] <status> · <phase> · job <id>` (Turkish: `iş <id>`) and the start
+// confirmation `Started: [proj] job <id>` (`Başladım: [proj] iş <id>`), wherever they sit in the quoted message.
+// The job word is protocol: a run started in one language is answered in the other, so both are always accepted.
+const JOB_REF = new RegExp(String.raw`\[(${PROJECT})\][^\n]*?\b(?:iş|job)\s+(${JOB_ID})\b`);
 
 /** Statuses that need no notification (the job is still working). */
 export const RUNNING_STATUSES = new Set(["running", "queued"]);
@@ -14,16 +19,16 @@ export const RUNNING_STATUSES = new Set(["running", "queued"]);
 export const OPEN_RUN_STATUSES = new Set(["active", "awaiting_user", "blocked", "paused"]);
 const OPEN_JOB_STATUSES = new Set(["running", "queued", "awaiting_user"]);
 
-const STATUS_LABELS = {
-  running: "▶️ Çalışıyor",
-  queued: "⏳ Sırada",
-  awaiting_user: "⏸ Yanıtını bekliyor",
-  done: "✅ Tamamlandı",
-  blocked: "⛔ Engellendi",
-  error: "❌ Hata",
-  cancelled: "🛑 İptal",
-  paused: "⏸ Duraklatıldı",
-};
+const STATUS_KEYS = ["running", "queued", "awaiting_user", "done", "blocked", "error", "cancelled", "paused"];
+
+/** The human label of a job status (an unknown status is shown as it is). */
+export function statusLabel(status, lang = resolveLang()) {
+  return STATUS_KEYS.includes(status) ? t(`label.${status}`, {}, lang) : status;
+}
+
+function tasksSuffix(done, total, lang) {
+  return total ? t("tasks.suffix", { done: done ?? 0, total }, lang) : "";
+}
 
 /**
  * Finds the orkestra job a Telegram reply points at, from the quoted bot message text.
@@ -42,15 +47,51 @@ function escapeRegExp(text) {
   return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// orkestra records a plan approval only for a whole-message approval word (intent.approval), so a
-// chosen "a) Onayla — uygulamaya başla" option is forwarded as the canonical "onayla". Options with
-// conditions or change requests stay verbatim (orkestra then treats them as a change request).
-const APPROVAL_OPTION = /^(onayla|onay|evet|başla|uygula|kabul|approve|yes)\b/u;
-const APPROVAL_HEDGE = /(\?|\bdeğil|\bama\b|\bfakat\b|\bancak\b|\bbut\b|\bnot\b|\bno\b|hayır|iptal|vazgeç|değiştir|revize|düzelt|ekle|çıkar|reject|cancel|change|sonra|bekle)/u;
+// orkestra records a plan approval only for a whole-message approval word (intent.approval), so a chosen
+// "a) Onayla — uygulamaya başla" / "a) Approve and start implementing" option is forwarded as the canonical word of
+// its language ("onayla" / "approve"; orkestra accepts both). Options with conditions or change requests stay
+// verbatim (orkestra then treats them as a change request). Matching works on a folded text (lower case, Turkish
+// letters and accents reduced to ASCII, like protocol.fold in Python), so "İPTAL", "iptal" and "Iptal" are one word
+// and an English "I approve" is not mangled by Turkish dotless-i lower-casing. Never shrink these vocabularies.
+const APPROVAL_TR = /^(onayla|onay|evet|basla|uygula|kabul)\b/;
+const APPROVAL_EN = /^(approve|approved|i approve|we approve|yes|go ahead|proceed|lgtm)\b/;
+const APPROVAL_HEDGE = /(\?|\bdegil|\bama\b|\bfakat\b|\bancak\b|\bbut\b|\bnot\b|\bno\b|hayir|iptal|vazgec|degistir|revize|duzelt|ekle|cikar|reject|cancel|change|sonra|bekle|\bunless\b|\bexcept\b|\bhowever\b|\bwait\b|\blater\b|\binstead\b|\badd\b|\bremove\b|\bedit\b|\bmodify\b|\brevise\b|\bfix\b)/;
+const TURKISH_ASCII = { "ı": "i", "İ": "i", "ş": "s", "Ş": "s", "ğ": "g", "Ğ": "g", "ü": "u", "Ü": "u", "ö": "o", "Ö": "o", "ç": "c", "Ç": "c" };
 
-function isApprovalOption(option) {
-  const text = option.toLocaleLowerCase("tr").trim();
-  return APPROVAL_OPTION.test(text) && !APPROVAL_HEDGE.test(text);
+/** Lower case with Turkish letters (and any other accent) reduced to their ASCII base; punctuation is kept. */
+export function fold(text) {
+  return String(text ?? "")
+    .replace(/[ıİşŞğĞüÜöÖçÇ]/g, (c) => TURKISH_ASCII[c])
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "");
+}
+
+// What may follow an approval phrase without changing what is approved ("Approve and start implementing, thanks"). Any
+// other word ("skip", "rename", "T002", "postgres") is a condition or a change: that option goes to orkestra verbatim,
+// where its own reading of the text decides, instead of being flattened into a bare approval. Folded, whole words.
+const APPROVAL_FILLER = new Set([
+  "approve", "approved", "i", "we", "yes", "go", "ahead", "proceed", "lgtm", "and", "then", "start", "implementing",
+  "implementation", "it", "the", "plan", "spec", "this", "that", "now", "please", "thanks", "thank", "you", "continue",
+  "sure", "ok", "okay", "recommended", "default",
+  "onayla", "onay", "onayliyorum", "evet", "basla", "baslayin", "baslayalim", "uygula", "kabul", "ve", "uygulamaya",
+  "uygulamayi", "simdi", "lutfen", "tesekkurler", "tesekkur", "plani", "bu", "devam", "et", "onerilen", "varsayilan",
+]);
+// Notes a label may carry: "(Recommended)", and the rollback wording that shares the legacy word "uygula".
+const APPROVAL_NOTE = /\s*\((?:recommended|default|onerilen|varsayilan|yalniz orkestra degisiklikleri)\)/g;
+
+/** The canonical approval word for an option text ("onayla" | "approve"), or null when it is not a plain approval. */
+function approvalWord(option) {
+  const text = fold(option).trim();
+  if (APPROVAL_HEDGE.test(text)) {
+    return null;
+  }
+  const word = APPROVAL_TR.test(text) ? "onayla" : APPROVAL_EN.test(text) ? "approve" : null;
+  if (!word) {
+    return null;
+  }
+  const rest = text.replace(APPROVAL_NOTE, " ").split(/[^a-z0-9]+/).filter(Boolean);
+  return rest.every((w) => APPROVAL_FILLER.has(w)) ? word : null;
 }
 
 /**
@@ -78,7 +119,7 @@ export function expandOptionReply(text, quoted) {
     const m = re.exec(quoted);
     if (m && m[1].trim() !== "") {
       const option = m[1].trim().slice(0, 300);
-      return isApprovalOption(option) ? "onayla" : `${letter}) ${option}`;
+      return approvalWord(option) ?? `${letter}) ${option}`;
     }
   }
   return reply;
@@ -89,11 +130,11 @@ export function expandOptionReply(text, quoted) {
  * @param {{ id: string, project: string, status: string, phase?: string | null, last_message?: string | null }} job
  * @returns {string}
  */
-export function formatNotification(job) {
-  const label = STATUS_LABELS[job.status] ?? job.status;
-  const header = `[${job.project}] ${label}` + (job.phase ? ` · ${job.phase}` : "") + ` · iş ${job.id}`;
+export function formatNotification(job, lang = resolveLang()) {
+  const header = `[${job.project}] ${statusLabel(job.status, lang)}` + (job.phase ? ` · ${job.phase}` : "") +
+    ` · ${t("job_ref", { id: job.id }, lang)}`;
   const body = (job.last_message ?? "").trim();
-  const hint = job.status === "awaiting_user" ? "\n\n↩️ Cevap için bu mesajı Yanıtla (seçenekliyse yalnız harfi yaz)." : "";
+  const hint = job.status === "awaiting_user" ? `\n\n${t("notify.reply_hint", {}, lang)}` : "";
   return header + (body ? `\n\n${body}` : "") + hint;
 }
 
@@ -108,14 +149,23 @@ export function findOpenRun(runs, project) {
     (r.project_name === project || String(r.project ?? "").split("/").pop() === project)) ?? null;
 }
 
-/** Why /yap did not start: the project already has an open run. */
-export function formatBusyProject(project, run) {
-  const where = run.mode === "headless" ? "Telegram /yap" : "masaüstü";
-  const tasks = run.tasks_total ? ` · görev ${run.tasks_done ?? 0}/${run.tasks_total}` : "";
+/** The phase / status of a run in the reader's language (`watch --json` carries a Turkish twin of each). */
+function phaseText(run, lang) {
+  return (lang === "tr" && run.phase_tr) || run.phase;
+}
+
+function statusText(run, lang) {
+  return (lang === "tr" && run.status_tr) || run.status;
+}
+
+/** Why /run (/yap) did not start: the project already has an open run. */
+export function formatBusyProject(project, run, lang = resolveLang()) {
+  const where = run.mode === "headless" ? t("where.telegram_run", {}, lang) : t("where.desktop", {}, lang);
+  const tasks = tasksSuffix(run.tasks_done, run.tasks_total, lang);
   return (
-    `⛔ Başlatmadım: [${project}] projesinde zaten açık bir orkestra run var — "${run.title}"\n` +
-    `${run.phase_tr || run.phase}${tasks} · ${where} · ${run.live?.text || run.status_tr || run.status}\n` +
-    "Aynı projede ikinci run, açık olanı devralıp bozabilir. Bitmesini bekle (/durum) ya da o run'ı kendi oturumundan kapat."
+    `${t("busy.header", { project, title: run.title }, lang)}\n` +
+    `${phaseText(run, lang)}${tasks} · ${where} · ${run.live?.text || statusText(run, lang)}\n` +
+    t("busy.footer", {}, lang)
   );
 }
 
@@ -125,40 +175,41 @@ export function formatBusyProject(project, run) {
  * @param {{ runs?: any[] | null, runsError?: string | null, bridgeJobs?: any[] | null, bridgeError?: string | null }} input
  * @returns {string}
  */
-export function formatStatus({ runs, runsError, bridgeJobs, bridgeError }) {
-  const lines = ["🎼 Orkestra durumu"];
+export function formatStatus({ runs, runsError, bridgeJobs, bridgeError }, lang = resolveLang()) {
+  const lines = [t("status.title", {}, lang)];
   const open = (runs ?? []).filter((r) => OPEN_RUN_STATUSES.has(r.status));
   const closed = (runs ?? []).filter((r) => !OPEN_RUN_STATUSES.has(r.status));
   if (runsError) {
-    lines.push(`⚠️ Run listesi alınamadı: ${runsError}`);
+    lines.push(t("status.runs_error", { error: runsError }, lang));
   } else if (open.length === 0) {
-    lines.push("Açık run yok.");
+    lines.push(t("status.no_open_runs", {}, lang));
   } else {
-    lines.push(`Açık run'lar (${open.length}):`);
+    lines.push(t("status.open_runs", { n: open.length }, lang));
     for (const r of open) {
-      const tasks = r.tasks_total ? ` · görev ${r.tasks_done ?? 0}/${r.tasks_total}` : "";
-      const where = r.mode === "headless" ? "Telegram işi" : "masaüstü";
-      lines.push(`• ${r.project_name} — ${r.title}`);
-      lines.push(`  ${r.phase_tr || r.phase}${tasks} · ${where} · ${r.live?.text || r.status_tr || r.status}`);
+      const tasks = tasksSuffix(r.tasks_done, r.tasks_total, lang);
+      const where = r.mode === "headless" ? t("where.telegram_job", {}, lang) : t("where.desktop", {}, lang);
+      lines.push(t("status.run_head", { project: r.project_name, title: r.title }, lang));
+      lines.push(`  ${phaseText(r, lang)}${tasks} · ${where} · ${r.live?.text || statusText(r, lang)}`);
     }
   }
   if (closed.length > 0) {
-    lines.push(`Son 12 saatte kapanan: ${closed.map((r) => `${r.project_name} (${r.status_tr || r.status})`).join(", ")}`);
+    const list = closed.map((r) => `${r.project_name} (${statusText(r, lang)})`).join(", ");
+    lines.push(t("status.closed", { list }, lang));
   }
   const jobs = (bridgeJobs ?? []).filter((j) => OPEN_JOB_STATUSES.has(j.status));
   if (bridgeError) {
-    lines.push(`⚠️ Telegram işleri alınamadı: ${bridgeError}`);
+    lines.push(t("status.jobs_error", { error: bridgeError }, lang));
   } else if (jobs.length === 0) {
-    lines.push("Telegram'dan başlatılmış açık iş yok.");
+    lines.push(t("status.no_jobs", {}, lang));
   } else {
-    lines.push(`Telegram'dan başlatılan açık işler (${jobs.length}):`);
+    lines.push(t("status.open_jobs", { n: jobs.length }, lang));
     for (const j of jobs) {
-      lines.push(`• ${j.id} · ${j.project} · ${STATUS_LABELS[j.status] ?? j.status}` + (j.phase ? ` · ${j.phase}` : ""));
+      lines.push(`• ${j.id} · ${j.project} · ${statusLabel(j.status, lang)}` + (j.phase ? ` · ${j.phase}` : ""));
     }
-    lines.push("↩️ Bu işlerin bildirim mesajını Yanıtla ile cevaplayabilirsin.");
+    lines.push(t("status.reply_hint", {}, lang));
   }
   if (open.some((r) => r.mode !== "headless")) {
-    lines.push("ℹ️ Masaüstünde başlatılan run'lar buradan izlenir; soruları o projenin Claude penceresinden cevaplanır.");
+    lines.push(t("status.desktop_note", {}, lang));
   }
   return lines.join("\n");
 }

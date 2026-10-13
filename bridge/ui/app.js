@@ -1,5 +1,8 @@
 "use strict";
 
+// All text a person reads comes from i18n.js (English + Turkish): this file has none of its own.
+const I18n = window.OrkestraI18n;
+const LANG_KEY = "orkestra.lang";
 const $ = (id) => document.getElementById(id);
 const state = {
   token: "",
@@ -10,75 +13,165 @@ const state = {
   enginesLoading: false,
   engineRequestId: 0,
   messages: new Map(),
+  lang: I18n.DEFAULT,
+  statusKey: "status.disconnected",
+  projects: null,
+  engines: null,
+  jobs: null,
+  runs: null,
 };
-const flowPhases = [
-  ["intake", "İstek"],
-  ["discover", "Keşif"],
-  ["clarify", "Netleştir"],
-  ["plan", "Plan"],
-  ["approve", "Onay"],
-  ["implement", "Uygula"],
-  ["verify", "Doğrula"],
-  ["review", "İncele"],
-  ["deliver", "Teslim"],
-  ["done", "Bitti"],
-];
-const flowStatusLabels = {
-  active: "Akış sürüyor",
-  awaiting_user: "Senden yanıt bekliyor",
-  blocked: "Dikkat gerekiyor",
-  paused: "Duraklatıldı",
-  done: "Tamamlandı",
-  error: "Hata",
-  aborted: "Durduruldu",
-};
-const agentProfiles = {
-  adversary: ["Karşıt inceleme", "Risk ve zayıf noktaları arar"],
-  architect: ["Mimar", "Çözüm ve uygulama planı"],
-  implementer: ["Uygulayıcı", "Onaylı görevleri uygular"],
-  main: ["Orkestra", "Ana akış yöneticisi"],
-  "plan-critic": ["Plan eleştirmeni", "Planı uygulamadan önce zorlar"],
-  researcher: ["Araştırmacı", "Kod ve teknik kaynak keşfi"],
-  reviewer: ["Kod inceleyici", "Değişiklikleri bağımsız inceler"],
-  scout: ["Keşif ajanı", "Proje yapısını ve ilgili kodu bulur"],
-  verifier: ["Doğrulayıcı", "Test ve kapı kanıtlarını kontrol eder"],
-  ana: ["Orkestra", "Ana akış yöneticisi"],
-};
-const activityLabels = {
-  agent_done: "Ajan raporu",
-  answer: "Ajan yanıtı",
-  bind: "Oturum bağlandı",
-  deny: "Guard engeli",
-  handback: "Kontrol devri",
-  idle: "Bekleme",
-  nudge: "Devam sinyali",
-  result: "Sonuç",
-  tool: "Araç kullanımı",
-  user: "Kullanıcı",
-  wait_agents: "Ajanlar bekleniyor",
-};
-const statusLabels = {
-  queued: "Sırada",
-  running: "Çalışıyor",
-  awaiting_user: "Yanıtın bekleniyor",
-  blocked: "Bloke",
-  paused: "Duraklatıldı",
-  stalled: "Devam gerekiyor",
-  done: "Tamamlandı",
-  error: "Hata",
-  cancelled: "İptal edildi",
-};
+const flowPhaseIds = ["intake", "discover", "clarify", "plan", "approve", "implement", "verify", "review", "deliver", "done"];
+const dynamic = new Map(); // element id -> () => text, run again when the language changes
 
-function setStatus(message, connected = false) {
+function t(key, params) {
+  return I18n.translate(state.lang, key, params);
+}
+
+function hasMessage(key) {
+  return Object.prototype.hasOwnProperty.call(I18n.MESSAGES[I18n.DEFAULT], key);
+}
+
+function locale() {
+  return I18n.LOCALES[state.lang] || I18n.LOCALES[I18n.DEFAULT];
+}
+
+function readStoredLang() {
+  try {
+    return window.localStorage.getItem(LANG_KEY);
+  } catch (error) {
+    return null; // storage blocked: the page still works, the choice just is not remembered
+  }
+}
+
+function storeLang(code) {
+  try {
+    window.localStorage.setItem(LANG_KEY, code);
+  } catch (error) {
+    // not remembered
+  }
+}
+
+/** Puts `factory()` into element `id` now and again whenever the language changes. */
+function bind(id, factory) {
+  dynamic.set(id, factory);
+  $(id).textContent = factory();
+}
+
+function renderRich(node, text) {
+  node.replaceChildren();
+  text.split("`").forEach((part, index) => {
+    if (!part) return;
+    if (index % 2) {
+      const code = document.createElement("code");
+      code.textContent = part;
+      node.append(code);
+    } else {
+      node.append(document.createTextNode(part));
+    }
+  });
+}
+
+function applyStatic() {
+  document.documentElement.lang = state.lang;
+  for (const node of document.querySelectorAll("[data-i18n]")) node.textContent = t(node.dataset.i18n);
+  for (const node of document.querySelectorAll("[data-i18n-rich]")) renderRich(node, t(node.dataset.i18nRich));
+  for (const node of document.querySelectorAll("[data-i18n-attr]")) {
+    for (const pair of node.dataset.i18nAttr.split(";")) {
+      const [attribute, key] = pair.split(":");
+      if (attribute && key) node.setAttribute(attribute.trim(), t(key.trim()));
+    }
+  }
+  const other = I18n.SUPPORTED.find((code) => code !== state.lang);
+  $("lang-button").textContent = I18n.LANGUAGE_NAMES[other];
+  $("lang-button").lang = other;
+}
+
+function relabelSelects() {
+  const projectFirst = $("project-select").options[0];
+  if (projectFirst && projectFirst.value === "") {
+    projectFirst.textContent = state.projects ? t("project.choose") : t("project.loading");
+  }
+  if (state.engines) {
+    for (const option of $("engine-select").options) {
+      const engine = (state.engines.engines || []).find((item) => item.id === option.value);
+      if (engine) option.textContent = engineOptionLabel(engine);
+    }
+  }
+}
+
+function applyLanguage() {
+  applyStatic();
+  for (const [id, factory] of dynamic) $(id).textContent = factory();
+  relabelSelects();
+  if (state.jobs) renderJobs(state.jobs);
+  if (state.runs) renderFlows(state.runs);
+  updatePhaseTimers();
+}
+
+function toggleLanguage() {
+  state.lang = I18n.SUPPORTED.find((code) => code !== state.lang);
+  storeLang(state.lang);
+  applyLanguage();
+  if (state.token) {              // the texts the bridge wrote are fetched again in the new language
+    refreshFlows();
+    loadEngines().catch(() => {});
+  }
+}
+
+/** ?lang= and the button's stored choice are final; otherwise the bridge's own language (GET /health) decides. */
+async function initLanguage() {
+  const browser = window.navigator.languages && window.navigator.languages.length
+    ? window.navigator.languages
+    : [window.navigator.language];
+  const search = window.location.search;
+  const stored = readStoredLang();
+  state.lang = I18n.pickLanguage({ search, stored, browser });
+  const explicit = Boolean(I18n.normalize(new URLSearchParams(search).get("lang")) || I18n.normalize(stored));
+  bind("connection-status", () => t(state.statusKey));
+  bind("flow-summary", () => t("flow.waiting"));
+  bind("flows-updated", () => t("flow.updated_none"));
+  bind("jobs-updated", () => t("jobs.updated_none"));
+  bind("engine-hint", () => t("engine.hint"));
+  bind("request-count", requestCountText);
+  applyLanguage();
+  if (explicit) return;
+  try {
+    const response = await fetch("/health", { cache: "no-store" });
+    const server = I18n.normalize((await response.json()).lang);
+    if (server && server !== state.lang) {
+      state.lang = server;
+      applyLanguage();
+    }
+  } catch (error) {
+    // no health answer: keep the browser language
+  }
+}
+
+function setStatus(key, connected = false) {
+  state.statusKey = key;
   const node = $("connection-status");
-  node.textContent = message;
+  node.textContent = t(key);
   node.classList.toggle("connected", connected);
+}
+
+function requestCountText() {
+  return `${$("request-input").value.length.toLocaleString(locale())} / ${(10000).toLocaleString(locale())}`;
+}
+
+function errorText(error) {
+  return String(error.message || "").includes("unauthorized") ? t("status.bad_token") : error.message;
+}
+
+/** The page's language travels with every call (?lang=): the bridge writes its own texts (live status, engine reasons,
+ * errors) in it, so a page switched to English no longer shows Turkish status lines from a Turkish bridge. */
+function withLang(path) {
+  return `${path}${path.includes("?") ? "&" : "?"}lang=${encodeURIComponent(state.lang)}`;
 }
 
 async function api(path, options = {}) {
   const headers = new Headers({ Authorization: `Bearer ${state.token}` });
   if (options.body !== undefined) headers.set("Content-Type", "application/json");
-  const response = await fetch(path, {
+  const response = await fetch(withLang(path), {
     method: options.method || "GET",
     headers,
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
@@ -91,32 +184,36 @@ async function api(path, options = {}) {
   } catch {
     payload = {};
   }
-  if (!response.ok) throw new Error(payload.error || `İstek başarısız (HTTP ${response.status})`);
+  if (!response.ok) throw new Error(payload.error || t("error.http", { status: response.status }));
   return payload;
 }
 
 function fillProjects(data) {
+  state.projects = data;
   const select = $("project-select");
-  select.replaceChildren(new Option("Proje seç…", ""));
+  select.replaceChildren(new Option(t("project.choose"), ""));
   for (const project of data.projects || []) {
     select.add(new Option(project.name, project.name));
   }
-  $("project-scope").textContent = data.restricted
-    ? `${(data.projects || []).length} izinli proje gösteriliyor.`
-    : `${(data.projects || []).length} workspace klasörü gösteriliyor; bridge allowlist’i boş.`;
-  if (!data.projects || data.projects.length === 0) {
-    $("project-scope").textContent = "Seçilebilir proje yok. Workspace veya allowed_projects ayarını kontrol et.";
-  }
+  const count = (data.projects || []).length;
+  bind("project-scope", () => {
+    if (count === 0) return t("project.none");
+    return t(data.restricted ? "project.scope_restricted" : "project.scope_open", { n: count });
+  });
   updateStartButton();
 }
 
+function engineOptionLabel(engine) {
+  return engine.available ? engine.label : t("engine.unavailable", { label: engine.label });
+}
+
 function fillEngines(data) {
+  state.engines = data;
   const select = $("engine-select");
   const available = (data.engines || []).filter((engine) => engine.available);
   select.replaceChildren();
   for (const engine of data.engines || []) {
-    const label = engine.available ? engine.label : `${engine.label} — kullanılamıyor`;
-    const option = new Option(label, engine.id);
+    const option = new Option(engineOptionLabel(engine), engine.id);
     option.disabled = !engine.available;
     if (engine.reason) option.title = engine.reason;
     select.add(option);
@@ -126,8 +223,10 @@ function fillEngines(data) {
   const selectedEngine = (data.engines || []).find((engine) => engine.id === select.value);
   $("engine-select").title = selectedEngine && selectedEngine.reason ? selectedEngine.reason : "";
   const unavailable = (data.engines || []).filter((engine) => !engine.available && engine.reason);
-  $("engine-hint").textContent = "Alt-agent ekibini Orkestra aşamaya göre seçer."
-    + (unavailable.length ? ` Kullanılamayan motor: ${unavailable.map((engine) => `${engine.label} — ${engine.reason}`).join("; ")}` : "");
+  bind("engine-hint", () => t("engine.hint")
+    + (unavailable.length
+      ? t("engine.unavailable_list", { list: unavailable.map((engine) => `${engine.label}: ${engine.reason}`).join("; ") })
+      : ""));
   updateStartButton();
 }
 
@@ -162,15 +261,15 @@ async function connect(event) {
     $("connect-panel").hidden = true;
     $("workbench").hidden = false;
     $("disconnect-button").hidden = false;
-    setStatus("Yerel bridge’e bağlı", true);
+    setStatus("status.connected", true);
     await Promise.all([refreshJobs(), refreshFlows()]);
     schedulePoll();
     scheduleFlowPoll();
   } catch (error) {
     state.token = "";
-    $("connect-error").textContent = error.message;
+    $("connect-error").textContent = errorText(error);
     $("connect-error").hidden = false;
-    setStatus("Bağlantı kurulamadı");
+    setStatus("status.failed");
   }
 }
 
@@ -187,6 +286,10 @@ function updateStartButton() {
 
 function statusClass(status) {
   return String(status || "").replace(/[^a-z0-9_-]/gi, "");
+}
+
+function engineLabel(id) {
+  return hasMessage(`engine.${id}`) ? t(`engine.${id}`) : t("engine.claude");
 }
 
 function makeJobCard(job) {
@@ -213,7 +316,6 @@ function makeJobCard(job) {
   const cancel = document.createElement("button");
   cancel.className = "button button-quiet";
   cancel.type = "button";
-  cancel.textContent = "İşi durdur";
   cancel.addEventListener("click", () => cancelJob(job.id, cancel));
   actions.append(cancel);
 
@@ -227,12 +329,9 @@ function makeJobCard(job) {
   replyInput.required = true;
   replyInput.maxLength = 10000;
   replyInput.rows = 2;
-  replyInput.setAttribute("aria-label", "Orkestra'nın sorusuna yanıt");
-  replyInput.placeholder = "Yanıtını yaz…";
   const replyButton = document.createElement("button");
   replyButton.className = "button button-primary";
   replyButton.type = "submit";
-  replyButton.textContent = "Yanıtla";
   reply.append(replyInput, replyButton);
   reply.addEventListener("submit", (event) => sendReply(event, job.id, replyInput, replyButton));
 
@@ -241,6 +340,15 @@ function makeJobCard(job) {
   error.hidden = true;
   card.append(main, actions, conversation, reply, error);
   return card;
+}
+
+/** The fixed labels of a job card, in the current language (run on every render, so a language switch reaches old cards). */
+function labelJobCard(card) {
+  card.querySelector(".job-actions button").textContent = t("job.stop");
+  const input = card.querySelector(".reply-form textarea");
+  input.setAttribute("aria-label", t("job.reply_aria"));
+  input.placeholder = t("job.reply_placeholder");
+  card.querySelector(".reply-form button").textContent = t("job.reply_button");
 }
 
 function renderConversation(card, job) {
@@ -255,7 +363,7 @@ function renderConversation(card, job) {
     const bubble = document.createElement("div");
     bubble.className = `chat-bubble ${item.role === "user" ? "user" : "agent"}`;
     const label = document.createElement("b");
-    label.textContent = item.role === "user" ? "Sen" : "Orkestra";
+    label.textContent = item.role === "user" ? t("job.you") : t("job.orkestra");
     const text = document.createElement("p");
     text.textContent = item.text;
     bubble.append(label, text);
@@ -268,14 +376,18 @@ function renderConversation(card, job) {
 }
 
 function updateJobCard(card, job) {
-  const status = statusLabels[job.status] || job.status || "Durum bilinmiyor";
-  card.querySelector(".job-project").textContent = job.project || "Proje";
+  labelJobCard(card);
+  const status = hasMessage(`jobstatus.${job.status}`) ? t(`jobstatus.${job.status}`) : job.status || t("status.unknown");
+  card.querySelector(".job-project").textContent = job.project || t("job.project");
   const badge = card.querySelector(".job-status");
   badge.textContent = status;
   badge.className = `job-status ${statusClass(job.status)}`;
-  const engine = job.engine === "cursor" ? "Cursor" : "Claude Code";
-  const run = job.run_id ? ` · run ${job.run_id}` : "";
-  card.querySelector(".job-meta").textContent = `${engine} · iş ${String(job.id || "").slice(0, 8)}${run}`;
+  const run = job.run_id ? t("job.meta_run", { run: job.run_id }) : "";
+  card.querySelector(".job-meta").textContent = t("job.meta", {
+    engine: engineLabel(job.engine),
+    id: String(job.id || "").slice(0, 8),
+    run,
+  });
   renderConversation(card, job);
   const canReply = ["awaiting_user", "blocked", "paused", "stalled"].includes(job.status);
   card.querySelector(".reply-form").hidden = !canReply;
@@ -291,7 +403,7 @@ function renderJobs(jobs) {
     list.replaceChildren();
     const empty = document.createElement("div");
     empty.className = "empty-state";
-    empty.textContent = "Henüz bridge işi yok. Yeni bir istek başlattığında burada görünür.";
+    empty.textContent = t("jobs.empty");
     list.append(empty);
     return;
   }
@@ -305,6 +417,7 @@ function renderJobs(jobs) {
   for (const [id, card] of existing) {
     if (!keep.has(id)) card.remove();
   }
+  for (const stale of list.querySelectorAll(":scope > .empty-state")) stale.remove();
 }
 
 function flowElement(tag, className, text) {
@@ -314,24 +427,28 @@ function flowElement(tag, className, text) {
   return element;
 }
 
+function flowPhaseLabel(id) {
+  return t(`phase.${id}`);
+}
+
 function flowPhaseIndex(run) {
   const index = Number(run.phase_index);
-  if (Number.isInteger(index) && index >= 0 && index < flowPhases.length) return index;
-  const found = flowPhases.findIndex(([id]) => id === run.phase);
+  if (Number.isInteger(index) && index >= 0 && index < flowPhaseIds.length) return index;
+  const found = flowPhaseIds.indexOf(run.phase);
   return Math.max(0, found);
 }
 
 function flowUpdatedText(run) {
   const date = run.updated ? new Date(run.updated) : null;
   return date && !Number.isNaN(date.valueOf())
-    ? `Son hareket ${date.toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit" })}`
-    : `Run ${String(run.run_id || "").slice(0, 10)}`;
+    ? t("flowcard.last_activity", { time: date.toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit" }) })
+    : t("flowcard.run", { id: String(run.run_id || "").slice(0, 10) });
 }
 
 function updatePhaseTimers() {
   for (const timer of document.querySelectorAll(".flow-current-duration")) {
     const duration = phaseDuration(timer.dataset.phaseSince);
-    timer.textContent = duration ? `${duration} bu fazda` : "mevcut adım";
+    timer.textContent = duration ? t("flowcard.in_phase", { duration }) : t("flowcard.current_step");
   }
 }
 
@@ -339,14 +456,15 @@ function phaseDuration(phaseSince) {
   const start = Number(phaseSince);
   if (!Number.isFinite(start) || start <= 0) return "";
   const elapsed = Math.max(0, Math.floor(Date.now() / 1000 - start));
-  if (elapsed < 60) return `${elapsed} sn`;
-  if (elapsed < 3600) return `${Math.floor(elapsed / 60)} dk`;
-  return `${Math.floor(elapsed / 3600)} sa ${Math.floor((elapsed % 3600) / 60)} dk`;
+  if (elapsed < 60) return t("duration.sec", { n: elapsed });
+  if (elapsed < 3600) return t("duration.min", { n: Math.floor(elapsed / 60) });
+  return t("duration.hour", { h: Math.floor(elapsed / 3600), m: Math.floor((elapsed % 3600) / 60) });
 }
 
 function agentProfile(name) {
   const key = String(name || "agent").toLowerCase().split(":").pop();
-  return agentProfiles[key] || [key.replace(/[-_]/g, " "), "Orkestra ajanı"];
+  if (hasMessage(`agent.${key}`)) return [t(`agent.${key}`), t(`agent.${key}.desc`)];
+  return [key.replace(/[-_]/g, " "), t("agent.other.desc")];
 }
 
 function flowGate(label, value) {
@@ -357,7 +475,7 @@ function flowGate(label, value) {
 
 function renderAgentNetwork(run) {
   const panel = flowElement("section", "flow-subpanel");
-  panel.setAttribute("aria-label", "Ajan ekibi ve görev durumu");
+  panel.setAttribute("aria-label", t("network.aria"));
   const agents = Array.isArray(run.agents)
     ? [...new Set(run.agents.filter((agent) => typeof agent === "string" && agent.trim()).map((agent) => agent.trim()))]
     : [];
@@ -365,8 +483,8 @@ function renderAgentNetwork(run) {
   const tasksTotal = Number(run.tasks_total) || 0;
   const tasksDone = Number(run.tasks_done) || 0;
   const heading = flowElement("div", "flow-subheading");
-  heading.append(flowElement("h3", "", "Ajan ağı"));
-  heading.append(flowElement("span", "", agents.length ? `${agents.length} açık ajan kaydı` : "güncel ekip"));
+  heading.append(flowElement("h3", "", t("network.heading")));
+  heading.append(flowElement("span", "", agents.length ? t("network.records", { n: agents.length }) : t("network.current_team")));
   panel.append(heading);
 
   const network = flowElement("div", "agent-network");
@@ -374,8 +492,8 @@ function renderAgentNetwork(run) {
   orchestrator.append(flowElement("span", "orchestrator-glyph", "O"));
   const orchestratorCopy = flowElement("div", "orchestrator-copy");
   orchestratorCopy.append(
-    flowElement("b", "", "Orkestra"),
-    flowElement("span", "", "Akış ve kalite kapıları"),
+    flowElement("b", "", t("network.orchestrator")),
+    flowElement("span", "", t("network.orchestrator_desc")),
   );
   orchestrator.append(orchestratorCopy);
   network.append(orchestrator, flowElement("div", "agent-connector"));
@@ -386,25 +504,23 @@ function renderAgentNetwork(run) {
       const [label, description] = agentProfile(name);
       const task = tasks.find((item) => String(item.agent || "").split(":").pop() === name.split(":").pop());
       const card = flowElement("div", "flow-agent-card");
-      const initials = label.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toLocaleUpperCase("tr-TR");
+      const initials = label.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toLocaleUpperCase(locale());
       card.append(flowElement("span", "agent-glyph", initials || "A"));
       const copy = flowElement("div", "agent-copy");
       copy.append(
         flowElement("b", "", label),
-        flowElement("span", "", task ? `${task.id || "Görev"} · ${task.title || description}` : description),
+        flowElement("span", "", task ? `${task.id || t("network.task")} · ${task.title || description}` : description),
       );
       card.append(copy);
       agentGrid.append(card);
     }
   } else {
-    const detail = run.status === "awaiting_user"
-      ? "Ajanlar, Orkestra'nın sana yönelttiği yanıtı bekliyor."
-      : "Bu kayıtta şu anda etkin alt-agent görünmüyor.";
+    const detail = run.status === "awaiting_user" ? t("network.waiting") : t("network.none");
     agentGrid.append(flowElement("div", "flow-agent-empty", detail));
   }
   network.append(agentGrid);
   if (agents.length) {
-    network.append(flowElement("p", "flow-agent-note", "Ajanlar Orkestra'nın görev ve güvenlik kapıları içinde çalışır."));
+    network.append(flowElement("p", "flow-agent-note", t("network.note")));
   }
   panel.append(network);
 
@@ -412,39 +528,43 @@ function renderAgentNetwork(run) {
     const taskList = flowElement("div", "flow-current-tasks");
     for (const task of tasks) {
       const row = flowElement("div", "flow-task");
-      row.append(flowElement("span", "flow-task-id", task.id || "Görev"));
+      row.append(flowElement("span", "flow-task-id", task.id || t("network.task")));
       const copy = flowElement("div", "flow-task-copy");
       copy.append(
-        flowElement("b", "", task.title || "Etkin görev"),
-        flowElement("span", "", task.agent ? `Atanan ajan: ${agentProfile(task.agent)[0]}` : "Görev atanmış"),
+        flowElement("b", "", task.title || t("network.active_task")),
+        flowElement("span", "", task.agent ? t("network.assigned", { agent: agentProfile(task.agent)[0] }) : t("network.task_assigned")),
       );
       row.append(copy);
       taskList.append(row);
     }
     panel.append(taskList);
   } else if (tasksTotal) {
-    panel.append(flowElement("p", "flow-agent-note", `Görev ilerlemesi: ${tasksDone}/${tasksTotal} tamamlandı.`));
+    panel.append(flowElement("p", "flow-agent-note", t("network.progress", { done: tasksDone, total: tasksTotal })));
   }
   return panel;
 }
 
+function activityLabel(kind) {
+  return hasMessage(`activity.${kind}`) ? t(`activity.${kind}`) : "";
+}
+
 function renderFlowActivity(run) {
   const panel = flowElement("section", "flow-subpanel");
-  panel.setAttribute("aria-label", "Son ajan ve araç hareketleri");
+  panel.setAttribute("aria-label", t("events.aria"));
   const heading = flowElement("div", "flow-subheading");
   heading.append(
-    flowElement("h3", "", "Son hareketler"),
-    flowElement("span", "", "gerçek hook kaydı"),
+    flowElement("h3", "", t("events.heading")),
+    flowElement("span", "", t("events.tag")),
   );
   panel.append(heading);
 
   const entries = Array.isArray(run.activity) ? run.activity.slice(-6).reverse() : [];
   if (!entries.length) {
-    panel.append(flowElement("div", "flow-agent-empty", "Bu run için görünür hareket kaydı henüz oluşmadı."));
+    panel.append(flowElement("div", "flow-agent-empty", t("events.empty")));
     return panel;
   }
   const list = flowElement("ol", "flow-event-list flow-activity");
-  list.setAttribute("aria-label", "Çalışmanın son ajan ve araç olayları");
+  list.setAttribute("aria-label", t("events.list_aria"));
   for (const entry of entries) {
     const kind = typeof entry.kind === "string" ? entry.kind : "";
     const row = flowElement("li", `flow-event${kind === "deny" ? " is-deny" : ""}${["user", "answer"].includes(kind) ? ` is-${kind}` : ""}`);
@@ -453,9 +573,9 @@ function renderFlowActivity(run) {
     const body = flowElement("div", "flow-event-body");
     const meta = flowElement("div", "flow-event-meta");
     const agent = flowElement("span", "flow-event-agent", agentProfile(entry.agent || "main")[0]);
-    meta.append(agent, flowElement("span", "flow-event-kind", activityLabels[kind] || kind || "Hareket"));
+    meta.append(agent, flowElement("span", "flow-event-kind", activityLabel(kind) || kind || t("activity.other")));
     if (entry.tool) meta.append(flowElement("span", "flow-event-tool", entry.tool));
-    const description = flowElement("p", "flow-event-description", entry.what || entry.tool || activityLabels[kind] || "Hareket kaydedildi.");
+    const description = flowElement("p", "flow-event-description", entry.what || entry.tool || activityLabel(kind) || t("activity.recorded"));
     description.title = description.textContent;
     body.append(meta, description);
     row.append(time, body);
@@ -473,36 +593,37 @@ function buildFlowCard(run) {
   const header = flowElement("div", "flow-card-header");
   const identity = flowElement("div", "flow-identity");
   const projectLine = flowElement("div", "flow-project-line");
-  projectLine.append(flowElement("span", "flow-project-name", run.project_name || "Proje"));
+  projectLine.append(flowElement("span", "flow-project-name", run.project_name || t("job.project")));
   projectLine.append(flowElement("span", "flow-run-id", `run ${String(run.run_id || "").slice(0, 10)}`));
-  projectLine.append(flowElement("span", "flow-engine-tag", run.engine === "cursor" ? "Cursor" : "Claude Code"));
-  identity.append(projectLine, flowElement("p", "flow-title", run.title || "Başlıksız çalışma"));
-  header.append(identity, flowElement("span", "flow-status-pill", flowStatusLabels[run.status] || run.status || "Durum bilinmiyor"));
+  projectLine.append(flowElement("span", "flow-engine-tag", engineLabel(run.engine)));
+  identity.append(projectLine, flowElement("p", "flow-title", run.title || t("flowcard.untitled")));
+  const statusText = hasMessage(`flowstatus.${run.status}`) ? t(`flowstatus.${run.status}`) : run.status || t("status.unknown");
+  header.append(identity, flowElement("span", "flow-status-pill", statusText));
   inner.append(header);
 
   const completed = run.status === "done" || run.phase === "done";
-  const phaseIndex = completed ? flowPhases.length - 1 : flowPhaseIndex(run);
-  const progress = completed ? 100 : Math.round((phaseIndex / (flowPhases.length - 1)) * 100);
-  const currentPhase = flowPhases[phaseIndex] || flowPhases[0];
+  const phaseIndex = completed ? flowPhaseIds.length - 1 : flowPhaseIndex(run);
+  const progress = completed ? 100 : Math.round((phaseIndex / (flowPhaseIds.length - 1)) * 100);
+  const currentPhase = flowPhaseLabel(flowPhaseIds[phaseIndex] || flowPhaseIds[0]);
   const progressRow = flowElement("div", "flow-progress-row");
   progressRow.append(
-    flowElement("span", "", `Şu an: ${currentPhase[1]}`),
-    flowElement("strong", "", `${completed ? flowPhases.length : phaseIndex + 1} / ${flowPhases.length} faz`),
+    flowElement("span", "", t("flowcard.now", { phase: currentPhase })),
+    flowElement("strong", "", t("flowcard.phase_count", { i: completed ? flowPhaseIds.length : phaseIndex + 1, n: flowPhaseIds.length })),
   );
   inner.append(progressRow);
   const progressTrack = flowElement("progress", "flow-progress-track");
   progressTrack.max = 100;
   progressTrack.value = progress;
-  progressTrack.setAttribute("aria-label", "Orkestra faz ilerlemesi");
+  progressTrack.setAttribute("aria-label", t("flowcard.progress_aria"));
   inner.append(progressTrack);
 
   const scroll = flowElement("div", "flow-stage-scroll");
   scroll.tabIndex = 0;
   scroll.setAttribute("role", "group");
-  scroll.setAttribute("aria-label", "Orkestra akış fazları. Dar ekranlarda yatay kaydır.");
+  scroll.setAttribute("aria-label", t("flowcard.stages_aria"));
   const stageList = flowElement("ol", "flow-stage-list");
-  for (let index = 0; index < flowPhases.length; index += 1) {
-    const [id, label] = flowPhases[index];
+  for (let index = 0; index < flowPhaseIds.length; index += 1) {
+    const label = flowPhaseLabel(flowPhaseIds[index]);
     const step = flowElement("li", "flow-stage");
     step.setAttribute("role", "listitem");
     if (index < phaseIndex || (completed && index <= phaseIndex)) step.classList.add("is-complete");
@@ -512,7 +633,7 @@ function buildFlowCard(run) {
     }
     const marker = index < phaseIndex || (completed && index <= phaseIndex) ? "✓" : String(index + 1).padStart(2, "0");
     step.append(flowElement("span", "flow-stage-dot", marker), flowElement("span", "flow-stage-label", label));
-    step.title = `${label}${index === phaseIndex ? " · şu anki faz" : ""}`;
+    step.title = `${label}${index === phaseIndex ? t("flowcard.current_phase") : ""}`;
     stageList.append(step);
   }
   scroll.append(stageList);
@@ -522,11 +643,11 @@ function buildFlowCard(run) {
   current.append(flowElement("span", "flow-current-mark", completed ? "✓" : String(phaseIndex + 1).padStart(2, "0")));
   const currentCopy = flowElement("div", "flow-current-copy");
   const liveText = run.live && typeof run.live.text === "string" ? run.live.text : "";
-  const currentHeading = flowElement("b", "", currentPhase[1]);
+  const currentHeading = flowElement("b", "", currentPhase);
   const duration = flowElement("span", "flow-current-duration");
   duration.dataset.phaseSince = String(run.phase_since || "");
   currentHeading.append(document.createTextNode(" · "), duration);
-  currentCopy.append(currentHeading, flowElement("p", "", liveText || (completed ? "Bu çalışma tamamlandı." : "Aşama güncellendiğinde canlı durum burada görünür.")));
+  currentCopy.append(currentHeading, flowElement("p", "", liveText || (completed ? t("flowcard.run_done") : t("flowcard.live_fallback"))));
   current.append(currentCopy);
   inner.append(current);
 
@@ -535,19 +656,19 @@ function buildFlowCard(run) {
   inner.append(lower);
 
   const gateRow = flowElement("div", "flow-gates");
-  const approveIndex = flowPhases.findIndex(([id]) => id === "approve");
+  const approveIndex = flowPhaseIds.indexOf("approve");
   const approval = run.approved
-    ? "Onaylandı"
+    ? t("flowcard.approved")
     : phaseIndex < approveIndex
-      ? "Henüz istenmedi"
+      ? t("flowcard.not_requested")
       : run.status === "awaiting_user"
-        ? "Yanıtın bekleniyor"
-        : "Bekleniyor";
+        ? t("flowcard.waiting_you")
+        : t("flowcard.pending");
   const gates = run.gates || {};
   gateRow.append(
-    flowGate("Plan onayı", approval),
-    flowGate("Başlangıç kapısı", gates.baseline || "—"),
-    flowGate("Regresyon kontrolü", gates.verify || "—"),
+    flowGate(t("flowcard.gate_approval"), approval),
+    flowGate(t("flowcard.gate_baseline"), gates.baseline || "—"),
+    flowGate(t("flowcard.gate_regression"), gates.verify || "—"),
   );
   inner.append(gateRow);
 
@@ -555,8 +676,8 @@ function buildFlowCard(run) {
   footer.append(
     flowElement("span", "", flowUpdatedText(run)),
     flowElement("span", "", Number(run.tasks_total)
-      ? `${Number(run.tasks_done) || 0}/${Number(run.tasks_total)} görev tamamlandı`
-      : "Görev planı henüz oluşmadı"),
+      ? t("flowcard.tasks_done", { done: Number(run.tasks_done) || 0, total: Number(run.tasks_total) })
+      : t("flowcard.no_task_plan")),
   );
   card.append(inner, footer);
   return card;
@@ -564,7 +685,7 @@ function buildFlowCard(run) {
 
 function flowSignature(run) {
   return JSON.stringify([
-    run.updated, run.status, run.phase, run.phase_index, run.approved, run.live,
+    state.lang, run.updated, run.status, run.phase, run.phase_index, run.approved, run.live,
     run.agents, run.current_tasks, run.tasks_done, run.tasks_total, run.gates, run.activity,
   ]);
 }
@@ -583,13 +704,12 @@ function renderFlows(runs) {
     .sort((left, right) => timeValue(right) - timeValue(left))
     .slice(0, 4);
   const visible = [...open, ...recent];
-  const summary = $("flow-summary");
-  summary.textContent = open.length
-    ? `${open.length} açık akış${recent.length ? ` · ${recent.length} son run` : ""}`
+  bind("flow-summary", () => (open.length
+    ? t("flow.summary_open", { n: open.length }) + (recent.length ? t("flow.summary_recent", { n: recent.length }) : "")
     : recent.length
-      ? `Aktif akış yok · ${recent.length} son run`
-      : "Şu an açık akış yok";
-  summary.parentElement.classList.toggle("has-active", open.length > 0);
+      ? t("flow.summary_idle", { n: recent.length })
+      : t("flow.summary_none")));
+  $("flow-summary").parentElement.classList.toggle("has-active", open.length > 0);
 
   const list = $("flows-list");
   const existing = new Map([...list.querySelectorAll(".flow-card")].map((card) => [card.dataset.runId, card]));
@@ -600,8 +720,8 @@ function renderFlows(runs) {
     const orbit = flowElement("span", "empty-orbit");
     orbit.setAttribute("aria-hidden", "true");
     orbit.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
-    empty.append(orbit, flowElement("b", "", "Orkestra hazır"));
-    empty.append(flowElement("span", "", "Bir çalışma başladığında fazları, ajanları ve son hareketleri burada canlı izleyeceksin."));
+    empty.append(orbit, flowElement("b", "", t("flow.empty_title")));
+    empty.append(flowElement("span", "", t("flow.empty_body")));
     list.append(empty);
     return;
   }
@@ -630,6 +750,7 @@ function renderFlows(runs) {
   for (const [runId, card] of existing) {
     if (!retained.has(runId)) card.remove();
   }
+  for (const stale of list.querySelectorAll(":scope > .flow-empty")) stale.remove();
 }
 
 async function refreshJobs() {
@@ -637,11 +758,13 @@ async function refreshJobs() {
   state.polling = true;
   try {
     const data = await api("/jobs");
+    state.jobs = data.jobs;
     renderJobs(data.jobs);
-    $("jobs-updated").textContent = `Güncellendi ${new Date().toLocaleTimeString("tr-TR")}`;
+    const when = new Date();
+    bind("jobs-updated", () => t("jobs.updated", { time: when.toLocaleTimeString(locale()) }));
   } catch (error) {
-    $("jobs-updated").textContent = error.message;
-    if (error.message.includes("unauthorized")) setStatus("Token geçersiz; yeniden bağlan");
+    bind("jobs-updated", () => error.message);
+    if (error.message.includes("unauthorized")) setStatus("status.bad_token");
   } finally {
     state.polling = false;
   }
@@ -652,12 +775,16 @@ async function refreshFlows() {
   state.flowPolling = true;
   try {
     const data = await api("/runs");
+    state.runs = data.runs;
     renderFlows(data.runs);
     updatePhaseTimers();
-    $("flows-updated").textContent = `Gerçek run verisi · ${new Date().toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`;
+    const when = new Date();
+    bind("flows-updated", () => t("flow.updated", {
+      time: when.toLocaleTimeString(locale(), { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+    }));
   } catch (error) {
-    $("flows-updated").textContent = `Akış yenilenemedi: ${error.message}`;
-    if (error.message.includes("unauthorized")) setStatus("Token geçersiz; yeniden bağlan");
+    bind("flows-updated", () => t("flow.refresh_failed", { error: error.message }));
+    if (error.message.includes("unauthorized")) setStatus("status.bad_token");
   } finally {
     state.flowPolling = false;
   }
@@ -700,7 +827,7 @@ async function startJob(event) {
     state.messages.set(job.id, [{ role: "user", text: request }]);
     $("request-input").value = "";
     $("consent-check").checked = false;
-    $("request-count").textContent = "0 / 10.000";
+    $("request-count").textContent = requestCountText();
     await Promise.all([refreshJobs(), refreshFlows()]);
   } catch (error) {
     $("job-error").textContent = error.message;
@@ -734,7 +861,7 @@ async function sendReply(event, id, input, button) {
 }
 
 async function cancelJob(id, button) {
-  if (!window.confirm("Bu Orkestra işini durdurmak istediğine emin misin?")) return;
+  if (!window.confirm(t("job.confirm_stop"))) return;
   button.disabled = true;
   const card = button.closest(".job-card");
   const error = card.querySelector(".job-error");
@@ -752,6 +879,8 @@ async function cancelJob(id, button) {
 
 function disconnect() {
   state.token = "";
+  state.jobs = null;
+  state.runs = null;
   clearTimeout(state.timer);
   clearTimeout(state.flowTimer);
   state.flowPolling = false;
@@ -765,7 +894,7 @@ function disconnect() {
   $("flows-list").replaceChildren();
   $("bridge-token").value = "";
   $("connect-error").hidden = true;
-  setStatus("Bağlı değil");
+  setStatus("status.disconnected");
 }
 
 $("connect-form").addEventListener("submit", connect);
@@ -777,10 +906,12 @@ $("project-select").addEventListener("change", () => {
   });
 });
 $("request-input").addEventListener("input", () => {
-  $("request-count").textContent = `${$("request-input").value.length.toLocaleString("tr-TR")} / 10.000`;
+  $("request-count").textContent = requestCountText();
   updateStartButton();
 });
 $("engine-select").addEventListener("change", updateStartButton);
 $("consent-check").addEventListener("change", updateStartButton);
 $("refresh-button").addEventListener("click", () => Promise.all([refreshJobs(), refreshFlows()]));
 $("disconnect-button").addEventListener("click", disconnect);
+$("lang-button").addEventListener("click", toggleLanguage);
+initLanguage();

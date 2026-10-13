@@ -20,15 +20,18 @@ from __future__ import annotations
 import fnmatch
 import os
 import re
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from . import cliparse as CP
 from . import shellparse as sp
 from .gates import normalize_pkg
+from .lazy import LazyModule
 from .paths import is_headless, orkestra_home
 from .util import is_relative_to, resolve_path
+
+# The CLI's own parser (argparse: ~15 ms to import and build). A hook reaches it only for the few `orkestra ...` lines
+# whose decision depends on the parse (see _mentions): `orkestra status` costs nothing.
+CP = LazyModule("cliparse", __package__)
 
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 READ_TOOLS = {"Read"}
@@ -74,11 +77,22 @@ CONTENT_DUMPERS = {
 TEMP_PREFIXES = ("/tmp/", "/private/tmp/", "/var/folders/", "/private/var/folders/", "/dev/")
 
 
-@dataclass
 class Decision:
-    action: str = "allow"          # allow | deny
-    reason: str = ""
-    guard: str = ""
+    """A guard's answer. A plain class with dataclass semantics (init, eq, repr): `dataclasses` costs a hook 5 ms."""
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, action: str = "allow", reason: str = "", guard: str = ""):
+        self.action = action           # allow | deny
+        self.reason = reason
+        self.guard = guard
+
+    def __eq__(self, other: object) -> bool:
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        return (self.action, self.reason, self.guard) == (other.action, other.reason, other.guard)
+
+    def __repr__(self) -> str:
+        return f"Decision(action={self.action!r}, reason={self.reason!r}, guard={self.guard!r})"
 
     @property
     def denied(self) -> bool:
@@ -94,19 +108,49 @@ def deny(guard: str, reason: str) -> Decision:
 
 # ====================================================================== helpers
 
+_WINDOWS_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def _norm_path_markers(p: str) -> str:
+    """Windows separators as `/`. On POSIX a backslash is an ordinary file-name character (`/tmp\\x` is not inside
+    /tmp), so only drive and UNC paths (and every path on Windows) are rewritten."""
+    p = p or ""
+    return p.replace("\\", "/") if os.name == "nt" or _WINDOWS_PATH.match(p) else p
+
+
+def _windows_temp_roots() -> list:
+    roots = []
+    for key in ("TEMP", "TMP", "LOCALAPPDATA"):
+        val = os.environ.get(key, "")
+        if not val:
+            continue
+        root = _norm_path_markers(val).rstrip("/")
+        if key == "LOCALAPPDATA":
+            root = root + "/Temp"
+        if root:
+            roots.append(root.casefold() + "/")
+    return roots
+
+
 def _is_temp(p: str) -> bool:
-    tmpdir = os.environ.get("TMPDIR", "").rstrip("/")
-    return p.startswith(TEMP_PREFIXES) or p == "/dev/null" \
-        or (bool(tmpdir) and p.casefold().startswith(tmpdir.casefold() + "/"))     # paths may arrive case-folded
+    n = _norm_path_markers(p)
+    tmpdir = _norm_path_markers(os.environ.get("TMPDIR", "")).rstrip("/")
+    if n.startswith(TEMP_PREFIXES) or n == "/dev/null":
+        return True
+    if tmpdir and n.casefold().startswith(tmpdir.casefold() + "/"):
+        return True
+    cf = n.casefold()
+    return any(cf.startswith(r) for r in _windows_temp_roots())
 
 
 def _is_temp_subdir(base: str) -> bool:
-    """A directory strictly BELOW a temp root (`/tmp/x`, not `/tmp` itself): `rm -rf /tmp/*` is not a scratch write."""
-    b = base.rstrip("/").casefold() + "/"
+    """Directory strictly below a temp root (scratch dirs), not the root itself."""
+    b = _norm_path_markers(base).rstrip("/").casefold() + "/"
     roots = [r for r in TEMP_PREFIXES if r != "/dev/"]
-    tmpdir = os.environ.get("TMPDIR", "")
+    tmpdir = _norm_path_markers(os.environ.get("TMPDIR", ""))
     if tmpdir:
         roots.append(tmpdir.rstrip("/").casefold() + "/")
+    roots.extend(_windows_temp_roots())
     return any(b.startswith(r) and len(b) > len(r) for r in roots)
 
 
@@ -247,6 +291,18 @@ def _recursive_rm_targets(program: str, args: List[str]) -> Optional[List[str]]:
 
 def bash_write_targets(seg: sp.Segment, cwd: str) -> List[str]:
     """Best-effort list of absolute paths a segment writes. "<cwd>/*" means 'unknown files under cwd'."""
+    targets = raw_write_targets(seg)
+    out = []
+    for t in targets:
+        if t == "*":
+            out.append(str(Path(cwd).resolve(strict=False)) + "/*")
+        elif t and not t.startswith("-"):
+            out.append(str(resolve_path(t, cwd)))
+    return out
+
+
+def raw_write_targets(seg: sp.Segment) -> List[str]:
+    """The path words a segment writes, exactly as typed (unresolved; "*" = unknown files under cwd)."""
     targets: List[str] = []
     for op, target in seg.redirects:
         if op in (">", ">>", ">|", "&>", "&>>", "<>", ">&") and target and target != "/dev/null" \
@@ -288,13 +344,82 @@ def bash_write_targets(seg: sp.Segment, cwd: str) -> List[str]:
         targets.append("*")
     elif prog == "go" and a[:1] == ["fmt"]:
         targets.append("*")
-    out = []
-    for t in targets:
-        if t == "*":
-            out.append(str(Path(cwd).resolve(strict=False)) + "/*")
-        elif t and not t.startswith("-"):
-            out.append(str(resolve_path(t, cwd)))
-    return out
+    return targets
+
+
+# A write target the hook cannot resolve: the shell expands it after the check. Temp variables are exempt.
+_VAR_PATH_RE = re.compile(r"\$|`")
+_TEMP_VAR_RE = re.compile(r"^\$(?:\{(?:TMPDIR|TMP|TEMP)(?::?-[^}$`]*)?\}|(?:TMPDIR|TMP|TEMP)(?![A-Za-z0-9_]))(?:/|$)")
+_ASSIGN_RE = re.compile(r"(?:^|[;&|\n(]|\b(?:export|declare|local|readonly|typeset)\s+(?:-\w+\s+)?)\s*"
+                        r"([A-Za-z_][A-Za-z0-9_]*)=((?:\"[^\"$`\\\n]*\"|'[^'\n]*'|[^\s\"'$`;&|()<>\\]*))")
+
+
+_TEMP_DEFAULT_RE = re.compile(r"^/(?:private/)?(?:var/)?tmp(?:/|$)|^/private/var/folders/")
+_ANY_ASSIGN_RE = re.compile(r"(?:^|[;&|\n(]|\b(?:export|declare|local|readonly|typeset)\s+(?:-\w+\s+)?)\s*([A-Za-z_][A-Za-z0-9_]*)=")
+_REBIND_RE = re.compile(r"\b(?:unset|read|for|select|getopts|mapfile|readarray|printf\s+-v|declare|typeset|local)\b[^;&|\n]*")
+
+
+def _rebinds(command: str, name: str) -> bool:
+    """Does the command assign `name` by anything but a plain `NAME=literal` (unset, read, for, printf -v ...)?"""
+    return any(re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", m.group(0))
+               for m in _REBIND_RE.finditer(command or ""))
+
+
+def is_temp_var_path(target: str, command: str = "") -> bool:
+    """`$TMPDIR/x`, `${TMPDIR:-/tmp}/x`: a temp-directory variable followed by a literal remainder. Not when the
+    remainder climbs out with `..`, when a `:-` default is not itself a temp directory, or when `command` assigns the
+    variable (it is then whatever the command made it)."""
+    m = _TEMP_VAR_RE.match(target)
+    if not m or _VAR_PATH_RE.search(target[m.end():]) or ".." in target[m.end():].split("/"):
+        return False
+    default = re.search(r":?-([^}]*)\}", m.group(0))
+    if default and not _TEMP_DEFAULT_RE.match(default.group(1)):
+        return False
+    name = re.search(r"TMPDIR|TMP|TEMP", m.group(0)).group(0)
+    return not (command and (re.search(r"(?<![A-Za-z0-9_])" + name + r"=", command) or _rebinds(command, name)))
+
+
+def literal_assignments(command: str) -> Dict[str, Tuple[int, str]]:
+    """{NAME: (position, literal value)} for `NAME=literal` assignments of a command line (values without $ or backtick).
+    A name is left out when the shell could read something else than this value: it is assigned more than once (in any
+    form), only for one command (`X=v cmd`), inside a subshell, or rebound by unset / read / for."""
+    command = command or ""
+    counts: Dict[str, int] = {}
+    for m in _ANY_ASSIGN_RE.finditer(command):
+        counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    found: Dict[str, Tuple[int, str]] = {}
+    for m in _ASSIGN_RE.finditer(command):
+        name, val = m.group(1), m.group(2)
+        if counts.get(name, 0) != 1 or _rebinds(command, name):
+            continue
+        if m.group(0).lstrip()[:1] == "(" or re.match(r"[ \t]+[^\s;&|()<>#]", command[m.end():]):
+            continue                                    # a subshell, or `NAME=v command` (the value lives for one command)
+        if val[:1] in "\"'" and val[-1:] == val[:1] and len(val) >= 2:
+            val = val[1:-1]
+        found[name] = (m.start(1), val)
+    return found
+
+
+def expand_literal_vars(target: str, command: str) -> Optional[str]:
+    """`target` with every $VAR / ${VAR} replaced by a literal assigned EARLIER in `command`; None when some variable
+    (or a backtick / `$(`) cannot be resolved that way."""
+    if "`" in target or "$(" in target:
+        return None
+    assigns = literal_assignments(command)
+    bad = False
+
+    def sub(m: "re.Match") -> str:
+        nonlocal bad
+        name = m.group(1) or m.group(2)
+        hit = assigns.get(name)
+        use = (command or "").find(m.group(0))
+        if hit is None or (use >= 0 and hit[0] >= use):
+            bad = True
+            return m.group(0)
+        return hit[1]
+
+    out = re.sub(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))", sub, target)
+    return None if bad or _VAR_PATH_RE.search(out) else out
 
 
 # ====================================================================== global guards
@@ -582,10 +707,11 @@ def _gh_subkind(seg: sp.Segment) -> Tuple[str, Optional[str]]:
 
 
 GRANT_HINT = {
-    "commit": "commit (e.g. 'commitle')", "push": "push (e.g. 'pushla')", "force": "force push",
-    "amend": "commit --amend", "branch": "branch create/switch (e.g. 'yeni branch aç')",
-    "pr": "PR (e.g. 'PR aç')", "gh_write": "a GitHub write", "discard": "discarding changes",
-    "sync": "merge/rebase/pull", "tag": "a tag", "stash": "stash (e.g. 'stashle')",
+    "commit": "commit (e.g. 'commit this' / 'commitle')", "push": "push (e.g. 'push it' / 'pushla')",
+    "force": "force push",
+    "amend": "commit --amend", "branch": "branch create/switch (e.g. 'create a branch' / 'yeni branch aç')",
+    "pr": "PR (e.g. 'open a PR' / 'PR aç')", "gh_write": "a GitHub write", "discard": "discarding changes",
+    "sync": "merge/rebase/pull", "tag": "a tag", "stash": "stash (e.g. 'stash my changes' / 'stashle')",
     "hard_reset": "a hard reset / git clean (say 'reset --hard' or 'git clean' explicitly)",
 }
 
@@ -825,7 +951,7 @@ def wait_guard(event: Dict[str, Any], binding: Dict[str, Any], segs: List[sp.Seg
     sleeps = [_sleep_seconds(s) for s in segs]
     python = bool(re.search(r"\bpython3?\b", stripped))
     loop = _has_wait_loop(stripped) or (python and bool(PY_WAIT_RE.search(raw)))
-    touches = bool(RUN_ARTIFACT_RE.search(stripped)) or "/.orkestra/" in cwd
+    touches = bool(RUN_ARTIFACT_RE.search(stripped)) or "/.orkestra/" in _norm_path_markers(cwd)
     waits = loop or max(sleeps or [0.0]) >= 10
     polls_run = touches and waits
     polls_output = waits and bool(TASK_OUTPUT_RE.search(stripped))   # may be the session's own background command
@@ -907,11 +1033,161 @@ def _cli_info(seg: sp.Segment) -> Tuple[str, List[str], str]:
     return hit
 
 
+# Subcommand names whose parse decides something. argparse picks a subcommand by an exact argument (no abbreviation of
+# subcommand names), so a call that contains none of these words cannot parse to one of them. tests pin the first one
+# to cliparse.RUNS_A_COMMAND and the second to run-control commands.
+_RUNS_A_COMMAND = ("tdd", "evidence")
+
+
+def _mentions(args: Iterable[str], names: Iterable[str]) -> bool:
+    """Does one of `args` equal one of `names`? (the cheap test before a parse that would load argparse)"""
+    wanted = set(names)
+    return any(a in wanted for a in args)
+
+
 def _cli_subcommand(seg: sp.Segment) -> Optional[str]:
     """None for other programs; "" when the command line does not parse (the CLI would refuse it)."""
     if seg.program != "orkestra":
         return None
     return _cli_info(seg)[0]
+
+
+# ---------------------------------------------------------------- run control: who may pause / abort / resume a run
+# A run has ONE driver: the chat bound to it (sessions/<id>.json, heartbeat = the file's mtime). Pause storms and
+# stolen runs came from other chats and subagents steering a run they do not drive (`-p` of another project, advice to
+# "pause on topic change", agents of one workflow sharing a session id). While the driver is alive (heard from within
+# the watchdog lease) only the driver changes the run, unless the USER asks for it in the current message.
+
+# command -> the control words of the user's message (intent.control_grants) that permit it
+CONTROL_COMMANDS = {"pause": ("pause",), "abort": ("abort",), "resume": ("resume",), "unblock": ("resume",),
+                    "block": ("pause", "abort", "resume"), "await": ("pause", "abort", "resume")}
+CONTROL_EXAMPLE = {"pause": "pause the run", "abort": "abort the run", "resume": "continue", "unblock": "continue",
+                   "block": "pause the run", "await": "pause the run"}
+
+
+def _cli_project(arg: Optional[str], cwd: str) -> Optional[Path]:
+    """The project folder `orkestra -p <arg>` resolves to, found the way cli._resolve_project finds it (None: the CLI
+    would refuse, or there is nothing to find). test_binding_model pins the two together."""
+    from . import paths as P
+    ws = P.workspace_root()
+    if not arg:
+        return P.find_project_root(Path(cwd))
+    cand = Path(os.path.expanduser(arg))
+    if not cand.is_absolute():
+        local = (Path(cwd) / arg).resolve(strict=False)
+        in_ws = (ws / arg).resolve(strict=False)
+        if arg in (".", "..") or arg.startswith(("./", "../")):
+            cand = local
+        elif in_ws.is_dir() and in_ws != ws:
+            cand = in_ws
+        else:
+            cand = local
+        if cand.is_dir() and cand != ws:
+            cand = P.find_project_root(cand) or cand
+    cand = cand.resolve(strict=False)
+    return cand if cand.is_dir() and cand != ws else None
+
+
+def is_orkestra_word(word: str) -> bool:
+    """Is this word the orkestra CLI (any path to it; on Windows also `orkestra.cmd` / `.exe` / `.ps1`)?"""
+    name = (word or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return re.sub(r"\.(?:cmd|exe|bat|ps1)$", "", name, flags=re.I).lower() == "orkestra"
+
+
+def _orkestra_argv(seg: sp.Segment) -> Optional[List[str]]:
+    """The arguments of an `orkestra ...` call: also `python3 <path>/orkestra ...`."""
+    if is_orkestra_word(seg.program):
+        return list(seg.args)
+    if INTERPRETER_RE.match(seg.program or ""):
+        args = _skip_interpreter_flags(list(seg.args))
+        if args and is_orkestra_word(args[0]):
+            return args[1:]
+    return None
+
+
+# Interpreter options that take their value as the next word (`python3 -X utf8 <script>`); -c / -m / -e name code, not a script.
+_INTERPRETER_VALUE_FLAGS = {"-X", "-W", "-r", "--require", "--import", "--loader", "--experimental-loader"}
+
+
+def _skip_interpreter_flags(args: List[str]) -> List[str]:
+    """`python3 -u -B <script> ...` -> `<script> ...`: the options before the script do not change what runs. Stops at
+    the first word that is not an option, and returns [] for code given inline (-c / -m / -e / -)."""
+    k = 0
+    while k < len(args) and args[k].startswith("-") and args[k] != "-":
+        flag = args[k]
+        if flag in ("-c", "-m", "-e", "--eval", "--print", "-p"):
+            return []
+        k += 2 if flag in _INTERPRETER_VALUE_FLAGS else 1
+    return args[k:]
+
+
+def control_targets(segs: List[sp.Segment], cwd: str) -> List[Tuple[str, Path, str]]:
+    """[(command, project, run id)] for every pause / abort / resume / unblock / block / await in the command line."""
+    from . import state as ST
+    out: List[Tuple[str, Path, str]] = []
+    for seg, scwd in with_cwd(segs, cwd):
+        argv = _orkestra_argv(seg)
+        if argv is None:
+            continue
+        if not _mentions(argv, CONTROL_COMMANDS):      # cannot parse to a control command: skip the parser
+            continue
+        try:
+            key = CP.inspect(argv)[0]
+        except Exception:
+            continue
+        if key not in CONTROL_COMMANDS:
+            continue
+        proj_arg, run_arg = CP.global_values(argv)
+        project = _cli_project(proj_arg, scwd)
+        if project is None:
+            continue
+        run_id = run_arg or ST.project_active_run(project)
+        if run_id:
+            out.append((key, project, run_id))
+    return out
+
+
+def ownership_guard(event: Dict[str, Any], segs: List[sp.Segment], cfg: Dict[str, Any], grants: Iterable[str]) -> Decision:
+    """Deny `orkestra pause|abort|resume|unblock|block|await` for a run another chat drives (see above)."""
+    cmd = (event.get("tool_input") or {}).get("command") or ""
+    if event.get("tool_name") != "Bash" or "orkestra" not in cmd:
+        return ALLOW
+    from . import state as ST
+    granted = set(grants)
+    lease = float(((cfg.get("watchdog") or {}).get("lease_seconds")) or 120)
+    sid = ST._safe(str(event.get("session_id") or ""))
+    subagent = bool(event.get("agent_type") or event.get("agent_id"))
+    for key, project, run_id in control_targets(segs, event.get("cwd") or os.getcwd()):
+        st = ST.read_json(ST.state_path(project, run_id))
+        if not isinstance(st, dict) or st.get("status") in ST.TERMINAL_STATUSES:
+            continue                                    # nothing to protect; the CLI reports what is wrong
+        alive = [s for s in ST.run_sessions(project, run_id) if s["age"] < lease]
+        if not alive or (not subagent and sid in {s["id"] for s in alive}):
+            continue                                    # nobody drives it, or the caller is the driver
+        if granted & set(CONTROL_COMMANDS[key]):
+            continue                                    # the user asked for it in this very message
+        from .engines import short_sid
+        driver = alive[0]
+        who = ("This call comes from a subagent, not from the chat that drives the run" if subagent
+               else "This chat is not the driver")
+        return deny("roles",
+                    f"`orkestra {key}` would change run {run_id} ({project}), which session {short_sid(driver['id'])} is "
+                    f"driving (heard from {driver['age']} s ago; a driver counts as alive for {int(lease)} s). {who}. Two "
+                    f"chats steering one run is what caused pause/resume storms: only the user decides. Do not retry.\n"
+                    f"unblock: tell the user; once their message asks for it (for example \"{CONTROL_EXAMPLE[key]}\") this "
+                    f"call is allowed, or they run `orkestra {key} -p {project}` themselves.")
+    return ALLOW
+
+
+def unblock_line(event: Dict[str, Any], binding: Dict[str, Any]) -> str:
+    """The last line of every run-guard denial: the way out, so that nobody is left without one. The chat that drives
+    the run can pause or abort it; any other agent says so to the user, who decides."""
+    project, run_id = binding.get("project"), binding.get("run_id")
+    if event.get("agent_type") or event.get("agent_id"):
+        return (f"unblock: this chat is not the driver of run {run_id} (project {project}); do not retry. Tell the user: "
+                f"only they can decide, e.g. `orkestra pause -p {project}` or `orkestra abort \"<reason>\" -p {project}`.")
+    return (f"unblock: if this run should not govern this chat, run `orkestra pause -p {project}` "
+            f"(or `orkestra abort \"<reason>\" -p {project}` to end it).")
 
 
 def _classify(path: str, project: Path, feature_dir: Path) -> str:
@@ -983,7 +1259,14 @@ INTERNALS_RE = re.compile(
     + re.escape(_PLUGIN_DIR) + r"(?![\w-])")
 READONLY_PROGRAMS = {"grep", "rg", "egrep", "fgrep", "cat", "head", "tail", "less", "more", "ls", "wc", "stat", "file",
                      "diff", "nl", "sort", "uniq", "cut", "bat", "cd", "true", ":", "echo", "printf", "orkestra", "pwd",
-                     "tree", "du", "which", "realpath", "basename", "dirname", "jq"}
+                     "tree", "du", "which", "realpath", "basename", "dirname", "jq",
+                     # inspection that names a path and changes nothing (`find` only without -exec/-delete/-fprint ...)
+                     "readlink", "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "cksum", "od", "hexdump", "strings",
+                     "column", "tr", "rev", "fold", "paste", "comm", "expand", "df"}
+FIND_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"}
+# programs that run what they are given (a script on stdin, an inline program): in a command that names the internals
+# they count as acting whatever their own arguments say (`cat <hook> | awk '{system($0)}'`)
+RUNNER_PROGRAMS = {"eval", "source", ".", "exec", "osascript", "lua", "tclsh", "expect", "awk", "gawk", "mawk", "nawk"}
 GIT_LOOKS = {"log", "show", "diff", "grep", "blame", "status", "ls-files", "cat-file", "shortlog", "describe"}
 FORGERY_MSG = ("This names orkestra's own hook entry points or library. They are run by the agent host and the "
                "`orkestra` CLI only: a command or file of yours must not call, import or drive them — recording an "
@@ -991,7 +1274,7 @@ FORGERY_MSG = ("This names orkestra's own hook entry points or library. They are
                "questions). Read-only inspection is fine. Normal project commands in the plan (tests/builds) remain "
                "allowed; do not retry this action through another interpreter. For run state use `orkestra status --json`, "
                "`orkestra next --json` or `orkestra gate last`. If you need the user's approval: show the summary, run "
-               "`orkestra await \"plan onayı\"` and end your turn.")
+               "`orkestra await \"plan approval\"` (Turkish conversation: \"plan onayı\") and end your turn.")
 
 
 def _is_orkestra_repo(project: Path) -> bool:
@@ -1011,19 +1294,116 @@ def _git_verb(args: List[str]) -> str:
     return ""
 
 
+def _strip_shell_comments(text: str) -> str:
+    """The command without its `# ...` comments (quote-aware: a `#` inside quotes is data, one in the middle of a word
+    is no comment, and a heredoc never gets here). The shell never runs a comment, so a path named only in one is
+    not a call (`python3 -c 'print(1)'  # looks at <plugin>/lib`)."""
+    out: List[str] = []
+    i, n, quote = 0, len(text), ""
+    escaped_to = -1                 # index right after an escape pair: `x\ #` is one word, not a comment
+    while i < n:
+        ch = text[i]
+        if quote:
+            out.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+        elif ch == "\\" and i + 1 < n:
+            out.append(text[i:i + 2])
+            i += 2
+            escaped_to = i
+            continue
+        elif ch in "\"'":
+            quote = ch
+            out.append(ch)
+        elif ch == "#" and i != escaped_to and (i == 0 or text[i - 1] in " \t\n;&|()"):
+            j = text.find("\n", i)
+            if j < 0:
+                break
+            i = j
+            continue
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+# programs that change files whatever their arguments show (`... | xargs sed -i s/a/b/` gets its files from a pipe)
+WRITER_PROGRAMS = {"tee", "rm", "rmdir", "unlink", "shred", "touch", "truncate", "mkdir", "mv", "cp", "rsync", "install",
+                   "ln", "ditto", "dd", "patch"}
+
+
+def _writes(seg: sp.Segment) -> bool:
+    prog, a = seg.program, seg.args
+    if prog in WRITER_PROGRAMS or prog in FORMATTERS:
+        return True
+    if prog in ("sed", "gsed"):
+        return any(x.startswith("--in-place") or re.match(r"^-[a-zA-Z]*i", x) for x in a)
+    if prog == "perl":
+        return any(re.match(r"^-\w*i", x) for x in a)
+    if prog == "git" and a[:1] == ["apply"]:
+        return True
+    if prog in ("cargo", "go", "dart", "flutter"):
+        return bool({"fmt", "format"} & set(a[:1]))
+    return bool(bash_write_targets(seg, "/"))
+
+
+def _looks_readonly(seg: sp.Segment) -> bool:
+    prog = seg.program
+    if prog in READONLY_PROGRAMS:
+        return True
+    if prog == "sed":
+        return not any(a == "--in-place" or re.match(r"^-[a-zA-Z]*i", a) for a in seg.args)
+    if prog == "git":
+        return _git_verb(seg.args) in GIT_LOOKS
+    if prog == "find":
+        return not any(a in FIND_ACTIONS for a in seg.args)
+    return False
+
+
+# machine introspection that changes nothing in its plain forms (`sysctl -n hw.ncpu`, `date`, `uname -a`, `ps -o pid= -p 1`)
+INTROSPECTION_PROGRAMS = {"date", "uname", "whoami", "id", "hostname", "sw_vers", "ps", "uptime", "nproc", "arch",
+                          "sysctl", "getconf", "groups", "locale", "vm_stat", "lscpu"}
+
+
+def _introspects(seg: sp.Segment) -> bool:
+    """A machine-introspection program in a form that cannot change the system (no `sysctl -w` / `name=value`, no
+    `date -s`)."""
+    if seg.program not in INTROSPECTION_PROGRAMS:
+        return False
+    for a in seg.args:
+        if seg.program == "sysctl" and (a in ("-w", "-f") or "=" in a or a.startswith("--write")):
+            return False
+        if seg.program == "date" and (a.startswith("-s") or a.startswith("--set") or re.fullmatch(r"\d{8,12}(\.\d\d)?", a)):
+            return False
+    return True
+
+
 def _names_internals_and_acts(full: str, segs: List[sp.Segment]) -> bool:
-    """The command text names orkestra's internals and does more than read."""
+    """The command text names orkestra's internals and does more than read.
+
+    Reading (ls, grep, cat, find without -exec ...) of the plugin is fine, and so is plain machine introspection
+    (`sysctl -n hw.ncpu`, `date`, `uname -a`) next to it. Acting is: a heredoc or a write (redirect, tee, cp, sed -i ...)
+    anywhere in such a command, an interpreter or other runner anywhere in it (it could run what the rest names), and
+    every other program, whatever its own arguments show: a dynamic program name, a command substitution, `curl -o`,
+    `make` or `tar` could all be the one that changes the plugin."""
     if not INTERNALS_RE.search(full[:100000]):
         return False
     if "<<" in full:
         return True
+    if not INTERNALS_RE.search(_strip_shell_comments(full)[:100000]):
+        return False                                     # only a comment mentions them
     for seg in segs:
-        looks = seg.program in READONLY_PROGRAMS \
-            or (seg.program == "sed" and not any(a == "--in-place" or re.match(r"^-[a-zA-Z]*i", a) for a in seg.args)) \
-            or (seg.program == "git" and _git_verb(seg.args) in GIT_LOOKS)
-        if not looks:
-            return True
         if any(op.strip("&0123456789").startswith(">") and not t.startswith("/dev/") for op, t in seg.redirects):
+            return True
+        if INTERPRETER_RE.match(seg.program or "") or seg.program in RUNNER_PROGRAMS:
+            return True
+        if _writes(seg):
+            return True
+        if not (_looks_readonly(seg) or _introspects(seg)):
             return True
     return False
 
@@ -1096,7 +1476,7 @@ def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any
             return ALLOW
         if approved and str(path).casefold() == str(spec_path).casefold():
             return deny("internals", "spec.md is frozen after user approval. Record deviations in plan.md "
-                                     "'Plan değişiklik günlüğü' and, if scope changes, go back with "
+                                     "'Plan changelog' (Turkish plan: 'Plan değişiklik günlüğü') and, if scope changes, go back with "
                                      "`orkestra phase back plan` to get re-approval.")
         if role in ("readonly", "other"):
             if kind != "feature":
@@ -1131,6 +1511,7 @@ def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any
 
     if not own_repo and _names_internals_and_acts((event.get("tool_input") or {}).get("command") or "", segs):
         return deny("internals", FORGERY_MSG)
+    full_cmd = (event.get("tool_input") or {}).get("command") or ""
     for seg, scwd in with_cwd(segs, cwd):
         recursive_targets = _recursive_rm_targets(seg.program, seg.args)
         if recursive_targets is not None:
@@ -1144,6 +1525,8 @@ def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any
                 if _classify(resolved, project, fdir) != "temp":
                     return deny("destructive", "Recursive deletion is blocked outside a dedicated temporary subdirectory. "
                                                    "Remove exact planned files instead.")
+        if role is None and seg.program == "orkestra":
+            continue                                # the orchestrator may run every subcommand: no parse needed
         sub = _cli_subcommand(seg)
         if sub is not None:
             if sub == "":
@@ -1158,6 +1541,18 @@ def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any
                     and not (event.get("agent_type") == "orkestra:verifier" and sub == "gate:verify"):
                 return deny("roles", f"`orkestra {sub.replace(':', ' ')}` is not allowed for read-only agents.")
             continue
+        for raw_t in raw_write_targets(seg):
+            if not (_VAR_PATH_RE.search(raw_t) and guards.get("isolation", True)) or is_temp_var_path(raw_t, full_cmd):
+                continue
+            expanded = expand_literal_vars(raw_t, full_cmd)
+            if expanded is None:
+                return deny("isolation", f"`{raw_t}` is a write target with an unexpanded variable or backtick: the "
+                                         f"hook checks the path before the shell expands it, so it cannot tell where "
+                                         f"this writes. Write the literal path (inside {project}), or assign the "
+                                         f"variable to a literal earlier in the same command.")
+            d = check_target(str(resolve_path(expanded, scwd)), f"bash:{seg.program}")
+            if d.denied:
+                return d
         for t in bash_write_targets(seg, scwd):
             d = check_target(t, f"bash:{seg.program}")
             if d.denied:
@@ -1165,7 +1560,7 @@ def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any
         if not own_repo and _calls_hook_entry(seg, scwd):
             return deny("internals", FORGERY_MSG)
         raw = seg.raw
-        if seg.program in SCRIPT_PROGRAMS and "/.orkestra/runs" in (scwd.casefold() + "/"):
+        if seg.program in SCRIPT_PROGRAMS and "/.orkestra/runs" in (_norm_path_markers(scwd).casefold() + "/"):
             # relative paths ARE run state here: strict as soon as a machine-state name appears, else the write test
             clean = re.sub(r"&?>&?\s*(?:/dev/null\b|\d\b)", " ", raw)
             if (SCRIPT_STRICT_RE if MACHINE_STATE_RE.search(raw) else SCRIPT_WRITE_RE).search(clean):
@@ -1214,7 +1609,8 @@ def expand_cli_commands(segs: List[sp.Segment]) -> List[sp.Segment]:
     todo = [(seg, 0) for seg in segs if seg.program == "orkestra"]
     while todo:
         seg, depth = todo.pop()
-        rest = _cli_info(seg)[1]                    # exactly the list the CLI hands to the shell
+        # exactly the list the CLI hands to the shell (only `tdd` / `evidence` run one: no parse for the other commands)
+        rest = _cli_info(seg)[1] if _mentions(seg.args, _RUNS_A_COMMAND) else []
         if not rest:
             continue
         if depth >= MAX_CLI_NESTING:
@@ -1271,6 +1667,7 @@ def _has_key(obj: Any, names: Tuple[str, ...], depth: int = 0) -> bool:
 def pre_tool_decision(event: Dict[str, Any], cfg: Dict[str, Any], binding: Optional[Dict[str, Any]],
                       grants: Iterable[str]) -> Decision:
     event = normalize_event(event)
+    grants = list(grants)
     tool = event.get("tool_name") or ""
     guards = cfg.get("guards") or {}
     segs: List[sp.Segment] = []
@@ -1284,6 +1681,10 @@ def pre_tool_decision(event: Dict[str, Any], cfg: Dict[str, Any], binding: Optio
             return deny("complex", f"This command is too large to check in one call (more than {MAX_REDIRECTS} different "
                                    f"redirect targets or {MAX_SEGMENTS} commands). Split it, or put it in a script file "
                                    f"under the project and run that.")
+        if any(seg.program == sp.NESTED_TOO_DEEP for seg in segs):
+            return deny("complex", f"This command nests shells, `eval` or `$(...)` more than {sp.MAX_DEPTH} levels deep, "
+                                   f"which cannot be checked. Run the inner command directly, or put it in a script "
+                                   f"file under the project and run that.")
     if guards.get("secrets", True):
         d = secrets_guard(event, cfg, segs)
         if d.denied:
@@ -1296,10 +1697,15 @@ def pre_tool_decision(event: Dict[str, Any], cfg: Dict[str, Any], binding: Optio
             return deny("internals", "`orkestra tdd|evidence` wrapped inside itself more than "
                                      f"{MAX_CLI_NESTING} times cannot be analysed. Run the inner command directly.")
         for seg in segs:                            # nested calls are in `segs` too (expand_cli_commands)
-            if _cli_subcommand(seg) == "rollback" and "--yes" in seg.args and "discard" not in set(grants):
+            if "rollback" in seg.args and "--yes" in seg.args and _cli_subcommand(seg) == "rollback" \
+                    and "discard" not in set(grants):
                 return deny("rollback", "`orkestra rollback --yes` reverts files and needs the user's explicit request "
-                                        "in the current message (/orkestra:rollback or 'değişiklikleri geri al'). "
+                                        "in the current message (/orkestra:rollback, 'discard the changes' or "
+                                        "'değişiklikleri geri al'). "
                                         "Show the dry run instead.")
+        d = ownership_guard(event, segs, cfg, grants)
+        if d.denied:
+            return d
         if guards.get("git", True):
             ev = dict(event, _bound=bool(binding))
             d = git_guard(ev, segs, set(grants))
@@ -1317,5 +1723,5 @@ def pre_tool_decision(event: Dict[str, Any], cfg: Dict[str, Any], binding: Optio
     if binding:
         d = run_guard(event, cfg, binding, segs)
         if d.denied:
-            return d
+            return Decision(d.action, d.reason + "\n" + unblock_line(event, binding), d.guard)   # always a way out
     return ALLOW

@@ -1,205 +1,350 @@
-# Orkestra — özet (sürüm 1.6.0, 6 Ekim 2026)
+# Orkestra: summary (version 1.6.0, October 6, 2026)
 
-Bu dosya Orkestra'nın tamamını tek yerde özetler. Kullanım ayrıntısı `README.md`'de, sürüm geçmişi `CHANGELOG.md`'de,
-görsel anlatım `docs/orkestra-mimari.html`'de, katkı kuralları `CONTRIBUTING.md`'dedir.
+> Türkçe: [ORKESTRA.tr.md](ORKESTRA.tr.md) · This file is the canonical English reference; the Turkish one carries the same content.
 
-## Ne olduğu
+This file summarizes all of Orkestra in one place. Usage details are in `README.md`, release history in `CHANGELOG.md`,
+the visual walkthrough in `docs/architecture.html`, contribution rules in `CONTRIBUTING.md`.
 
-Orkestra bir Claude Code eklentisidir. Bir geliştirme isteğini on fazdan geçirir: giriş, keşif, netleştirme, plan,
-**senin onayın**, uygulama, doğrulama, inceleme, teslim, bitti. Kurallar modelin iyi niyetine bırakılmaz: faz sırasını
-ve kanıtı bir komut satırı aracı (`orkestra`) tutar, yasakları Claude Code hook'ları her araç çağrısında denetler.
+## What it is
 
-Planı sen onaylamadan kaynak koda yazılamaz. Her görev önce başarısız, sonra geçen test kanıtıyla kapanır. Run başında
-geçen her kontrol (test, lint, tip, build) sonda da geçmek zorundadır. Commit, push, deploy ve mağaza yüklemesi akışın
-parçası değildir; yalnız o mesajda açıkça istersen yapılır.
+Orkestra is a Claude Code plugin. It takes a development request through ten phases: intake, discovery, clarification,
+plan, **your approval**, implementation, verification, review, delivery, done. The rules are not left to the model's
+goodwill: a command line tool (`orkestra`) keeps the phase order and the evidence, and Claude Code hooks check the
+prohibitions on every tool call.
 
-## Mimari
+Source code cannot be written until you approve the plan. Every task is closed with evidence of a test that failed
+first and then passed. Every check that passed at the start of a run (tests, lint, types, build) must still pass at the
+end. Commit, push, deploy and store uploads are not part of the flow; they happen only when you explicitly ask for
+them in that very message.
 
-Dört parça var; hepsi `plugins/orkestra/` altında ve yerinde yüklenir (kopyalanmaz):
+## Language
 
-| Parça | Yer | İş |
+Orkestra serves people in English and Turkish; English is the default. The language of human-facing text (dashboards,
+`watch`, activity lines, notifications, run artifacts, installer and bridge replies, `--help`) is resolved in this
+order, first hit wins:
+
+1. the `ORKESTRA_LANG` environment variable (`en`, `tr` or `auto`);
+2. the `lang` key of `~/.orkestra/config.json` (`en`, `tr` or `auto`; the default is `auto`);
+3. the OS locale (`LC_ALL`, `LC_MESSAGES`, `LANG`, `LANGUAGE`; a `tr…` locale selects Turkish; on Windows, when none of them is set, the user locale);
+4. English.
+
+`orkestra lang show` prints the language in use and where it comes from; `orkestra lang en|tr|auto` saves the choice
+(the `lang` key above); `--lang en|tr` switches a single command.
+
+What stays the same in both languages:
+
+- Text the model reads (skills, agents, playbooks, `orkestra next` hints, guard messages) is English.
+- What you type is understood in both languages: `commit this` / `commitle`, `approve` / `onay`, and so on.
+- The section headings of `request.md`, `spec.md`, `plan.md` and `report.md` exist in both languages
+  (`lib/orkestra_core/messages/protocol.py`). Every parser accepts both spellings, so a run started in one language
+  can be continued in the other, and old Turkish runs keep working.
+- Document templates live in `plugins/orkestra/templates/en/` and `plugins/orkestra/templates/tr/`;
+  `orkestra template <name>` prints the one for the active language.
+
+## Architecture
+
+There are four parts, all under `plugins/orkestra/`, loaded in place (not copied):
+
+| Part | Location | Job |
 |---|---|---|
-| Skill'ler ve playbook'lar | `skills/` | Ana oturuma (orkestratör) her fazda ne yapacağını söyleyen metinler. Faz başına bir playbook; isteğe bağlı kontrol listeleri yalnız değişen dosyalar eşleşince yüklenir. |
-| Ajanlar | `agents/` | Sekiz alt-ajan: scout, researcher, architect, plan-critic, implementer, reviewer, adversary, verifier. Yalnız implementer kaynak koda yazabilir. |
-| CLI | `bin/orkestra` → `lib/orkestra_core/` | Durum makinesi (`runs.py`, `state.py`), kapılar (`gates.py`), TDD ve kanıt (`evidence.py`), geri alma yedekleri (`snapshot.py`), sıradaki adım ve süre (`tempo.py`), izleme (`monitor.py`, `usage.py`), dış tarama (`watchdog.py`). |
-| Hook'lar | `hooks/hooks.json` → `hooks/dispatch.py` | Altı olayın tek giriş noktası: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStop. Guard kararları `guards.py`'de; kabuk komutunu `shellparse.py`, `orkestra …` satırını CLI'nin kendi ayrıştırıcısı (`cliparse.py`) okur. Hook içindeki bir hata oturumu kilitlemez (izin verir, `~/.orkestra/logs/hooks.log`'a yazar); 8 saniyede bitmeyen denetim ise komutu reddeder. |
+| Skills and playbooks | `skills/` | Texts that tell the main session (the orchestrator) what to do in each phase. One playbook per phase; optional checklists load only when the changed files match. |
+| Agents | `agents/` | Eight subagents: scout, researcher, architect, plan-critic, implementer, reviewer, adversary, verifier. Only the implementer may write source code. |
+| CLI | `bin/orkestra` → `lib/orkestra_core/` | State machine (`runs.py`, `state.py`), gates (`gates.py`), TDD and evidence (`evidence.py`), rollback backups (`snapshot.py`), next step and timing (`tempo.py`), monitoring (`monitor.py`, `usage.py`), external scan (`watchdog.py`). |
+| Hooks | `hooks/hooks.json` → `hooks/dispatch.py` | The single entry point for ten events: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop, SubagentStop, and four that keep the activity feed honest (failed tool calls, permission prompts, API errors, session end): PostToolUseFailure, Notification, StopFailure, SessionEnd. `dispatch.py` is a stub; the code is `lib/orkestra_core/hookmain.py`, and events that provably do nothing exit before it loads. Guard decisions live in `guards.py`; `shellparse.py` reads the shell command and the CLI's own parser (`cliparse.py`) reads the `orkestra …` line. An error inside a hook never locks the session (it allows the call and logs to `~/.orkestra/logs/hooks.log`). One deadline covers a whole hook: 6 s of CPU or 9 s of wall clock; a PreToolUse call that reaches it is refused (guard `complex`, or `busy` when the machine was only slow), any other event ends quietly. New hook entries only take effect in newly opened sessions. |
 
-`bridge/` ayrı bir süreçtir: Telegram, n8n ya da OpenClaw'dan gelen isteği başsız bir oturuma (Claude Code ya da
-Cursor) çevirir. Aynı hook'lar orada da çalışır.
+`bridge/` is a separate process: it turns a request coming from Telegram, n8n or OpenClaw into a headless session
+(Claude Code, Cursor or GitHub Copilot). The same hooks run there too.
 
-### İki motor (1.5.0)
+### Engines (Cursor arrived with 1.5.0)
 
-Bir run'ı Claude Code (varsayılan) ya da Cursor sürer; seçim istek başınadır (`orkestra run --engine cursor`,
-`/yap cursor <proje> <istek>`, bridge'de `"engine": "cursor"`, Cursor sohbetinde `/orkestra-run`). Durum makinesi,
-kapılar, kanıt ve guard'lar tektir. Motora özgü olan her şey üç dosyadadır:
+A run is driven by Claude Code (the default), Cursor or GitHub Copilot; the choice is made per request (`orkestra run --engine cursor`,
+`/run cursor <project> <request>` in the bridge (`/yap` in Turkish), `"engine": "cursor"` in the bridge API,
+`/orkestra-run` in a Cursor chat). The state machine, gates, evidence and guards are shared. Everything
+engine-specific lives in three files:
 
-| Dosya | İş |
+| File | Job |
 |---|---|
-| `lib/orkestra_core/engines.py` | Motor adları, oturum anahtarı (`cursor-<sohbet>`), komut satırları, ilk istem, metin çevirisi (`orkestra:reviewer` → `orkestra-reviewer`, yalnız Claude'da doğru cümlelerin Cursor karşılığı). |
-| `hooks/cursor_hook.py` | Cursor olaylarını `dispatch.py`'nin işleyicilerine çevirir: alt-sohbet → ana oturum eşlemesi, istem/tur izleme, kabuk dizini izleme (`shellcwd.py`), kendisini ajanın başlattığını tanıma. |
-| `lib/orkestra_core/cursorkit.py` | Cursor skill/alt-ajan dosyalarını üretir (`plugins/orkestra/cursor/`), `~/.cursor`'a kurar, `hooks.json`'ı birleştirir. |
+| `lib/orkestra_core/engines.py` | Engine names, the session key (`cursor-<chat>`), command lines, the first prompt, text translation (`orkestra:reviewer` → `orkestra-reviewer`, the Cursor counterpart of sentences that are only true in Claude). |
+| `hooks/cursor_hook.py` | Translates Cursor events into `dispatch.py` handlers: subchat → main session mapping, prompt/turn tracking, shell directory tracking (`shellcwd.py`), recognizing that an agent started it. |
+| `lib/orkestra_core/cursorkit.py` | Generates the Cursor skill/subagent files (`plugins/orkestra/cursor/`), installs them into `~/.cursor`, merges `hooks.json`. |
 
-Cursor'da ölçülen ve tasarımı belirleyen davranışlar: her alt-ajan ayrı bir sohbettir ve olaylarında türü yoktur;
-baskı kipinde (`agent -p`) istem ve durma olayı gelmez; kabuk dizinini çağrılar arasında korur ama olayda bildirmez;
-sıfırdan farklı çıkan komut `postToolUseFailure` ile biter; alt-ajan bitişi için olay yoktur. Ayrıntı ve örnek yükler:
-`CHANGELOG.md` (1.5.0), `tests/fixtures/cursor/`.
+Behaviors measured in Cursor that shaped the design: every subagent is a separate chat and its events carry no type;
+in print mode (`agent -p`) no prompt or stop event arrives; the shell directory is kept across calls but not reported
+in the event; a command that exits non-zero ends with `postToolUseFailure`; there is no event for a subagent finishing.
+Details and sample payloads: `CHANGELOG.md` (1.5.0), `tests/fixtures/cursor/`.
 
-## Komutlar
+## Commands
 
-Sohbet içinde: `/orkestra:run <istek>`, `/orkestra:status`, `/orkestra:resume`, `/orkestra:onboard`,
-`/orkestra:rollback`, `/orkestra:ship` (commit + push; yalnız sen çağırırsın). Cursor'da aynıları tire ile:
+In chat: `/orkestra:run <request>`, `/orkestra:status`, `/orkestra:resume`, `/orkestra:onboard`,
+`/orkestra:rollback`, `/orkestra:ship` (commit + push; only you can invoke it). In Cursor the same ones use a dash:
 `/orkestra-run` … `/orkestra-ship`.
 
-Terminalde (`python3 $ORKESTRA_ROOT/plugins/orkestra/bin/orkestra …` veya `./plugins/orkestra/bin/orkestra`; kısaltmak için README'deki `alias`):
+In a terminal (`python3 $ORKESTRA_ROOT/plugins/orkestra/bin/orkestra …` or `./plugins/orkestra/bin/orkestra`; once the installer has put `orkestra` on your PATH, just `orkestra …`):
 
-| Komut | İş |
+| Command | Job |
 |---|---|
-| `watch` · `dashboard --open` | Canlı görünüm (terminal · http://127.0.0.1:47616). Salt-okunur. |
-| Bridge chat UI | http://127.0.0.1:47615/ · proje/Claude/Cursor seç; faz haritası, ajan ağı, görevler ve son hook hareketlerini izle. |
-| `status -p <proje>` · `context` | Run'ın fazı, görevleri, kanıt eksikleri. |
-| `next -p <proje>` | Sıradaki tek adım. Aynı durumda hep aynı cevap. |
-| `tempo -p <proje> [--run <id>]` | Süre dökümü: fazlar, görev başına süre, inceleme retleri, ölü bekleme payı. |
-| `watchdog [--dry-run\|--quiet\|--launchd]` | Oturum dışından tarama ve bildirim. |
-| `agents [clear] -p <proje>` | Arka plandaki alt-ajan kayıtları. |
-| `doctor` | Ortam ve hook öz-testi. |
-| `run [--engine claude\|cursor] -p <proje> "<istek>"` | Seçilen motorun kendi arayüzünü projede açıp run'ı başlatır. |
-| `cursor install \| uninstall \| status \| build` | Cursor tarafı: skill, alt-ajan ve hook kurulumu (senin `hooks.json` girdilerin korunur). |
+| `watch` · `dashboard --open` | Live view (terminal · http://127.0.0.1:47616). Read-only. |
+| Bridge chat UI | http://127.0.0.1:47615/ · pick the project and Claude/Cursor/Copilot; follow the phase map, the agent network, tasks and the latest hook activity. |
+| `status -p <project>` · `context` | The run's phase, tasks, evidence gaps. |
+| `next -p <project>` | The single next step. The same state always gives the same answer. |
+| `tempo -p <project> [--run <id>]` | Time breakdown: phases, time per task, review rejects, share of dead wait. |
+| `watchdog [--dry-run\|--quiet\|--launchd]` | One scan of every open run from outside the session; notifies. |
+| `watchdog --loop\|--daemon\|--status` | The fast watcher: `--loop` runs it in the foreground, `--daemon` starts it detached (POSIX), `--status` shows whether it runs and what it flags (`--json` for a machine view). See Monitoring. |
+| `wait [--max <s>] -p <project>` | Headless runs: wait inside the process (no tokens) for subagent reports, then print the next step. Default cap 540 s. An interactive session does not block. |
+| `gate verify [--resume\|--all] -p <project>` | The no-regression check. `--resume` continues an interrupted verify; `--all` re-runs every gate in full. |
+| `brief [--review] <task>` | The brief for one task; with `--review` the reviewer's packet (acceptance, red and green tails, report, diff of its files). |
+| `agents [clear] -p <project>` | Records of background subagents. |
+| `doctor` | Environment and hook self-test. |
+| `lang [show\|en\|tr\|auto]` | The language of human-facing text and where it comes from; `en`, `tr` and `auto` save the choice. `--lang` on any command switches that one call. |
+| `await\|block\|unblock\|pause\|abort -p <project> --reason "<text>"` | The reason may also be given as plain words. `orkestra --version` prints the version. |
+| `run [--engine claude\|cursor\|copilot] -p <project> "<request>"` | Opens the chosen engine's own interface in the project and starts the run. |
+| `cursor install \| uninstall \| status \| build` | The Cursor side: install skills, subagents and hooks (your own `hooks.json` entries are kept). |
+| `copilot install \| uninstall \| status` | The Copilot side: install the hooks (your own `hooks.json` entries are kept). |
 
-Geri kalan alt komutları (`phase`, `task`, `tdd`, `gate`, `evidence`, `plan check`, `memory` …) orkestratör ve ajanlar
-kullanır; elle çağırman gerekmez. Seçenekler tam yazılır; kısaltma (`--no` gibi) kabul edilmez.
+The orchestrator and the agents use the remaining subcommands (`phase`, `task`, `tdd`, `gate`, `evidence`,
+`plan check`, `memory` …); you never need to call them by hand. Options are written in full; abbreviations (such as
+`--no`) are not accepted.
 
-## Dosyalar
+## Files
 
-Her projede `.orkestra/` oluşur:
+Every project gets a `.orkestra/` folder:
 
-- `features/NNN-slug/` — insanın okuduğu belgeler: `request.md`, `context.md`, `spec.md`, `plan.md`, `ledger.md`
-  (her faz geçişi ve kanıt satırı), `tasks/`, `reviews/`, `verification.md`, `report.md`. Git'e girebilir.
-- `runs/NNN-slug/` — makine durumu: `state.json`, `approval.json`, `agents.json`, `activity.jsonl`, kanıt logları,
-  dosya yedekleri. Git'e girmez; yalnız CLI ve hook'lar yazar.
-- `memory/` — proje hafızası: `PROJECT.md`, `FEATURES.md`, `specs/`, `DECISIONS.md`, `LEARNINGS.md`.
-- `config.json` — projenin kapı komutları. `current` — açık run'a kısa yol.
+- `features/NNN-slug/`: the documents a person reads: `request.md`, `context.md`, `spec.md`, `plan.md`, `ledger.md`
+  (every phase transition and evidence line), `tasks/`, `reviews/`, `verification.md`, `report.md`. May go into git.
+- `runs/NNN-slug/`: machine state: `state.json`, `approval.json`, `agents.json`, `activity.jsonl`, evidence logs,
+  file backups. Never goes into git; only the CLI and the hooks write it.
+- `memory/`: project memory: `PROJECT.md`, `FEATURES.md`, `specs/`, `DECISIONS.md`, `LEARNINGS.md`.
+- `config.json`: the project's gate commands. `current`: a shortcut to the open run.
 
-Makinede `~/.orkestra/`: `config.json` (guard anahtarları, `watchdog` eşikleri), oturum–run bağları, loglar, bridge
-ayarı. Model bu klasöre yazamaz.
+On the machine, `~/.orkestra/` holds: `config.json` (guard switches, `watchdog` thresholds, `lang`), session-to-run
+bindings, logs, the bridge settings. The model cannot write to this folder.
 
-## Guard'lar
+## Guards
 
-Her Claude Code oturumunda: **git** (commit/push/branch yalnız o mesajda istenirse; alt-ajan raporu izin taşımaz),
-**secrets** (`.env*`, anahtar dosyaları okunamaz ve yazılamaz), **store** (EAS/Expo yüklemeleri), **home**
-(`~/.orkestra`), **rollback**, **complex** (denetlenemeyecek kadar büyük komut).
+In every Claude Code session: **git** (commit/push/branch only when asked in that very message; a subagent report
+carries no permission), **secrets** (`.env*` and key files can be neither read nor written), **store** (EAS/Expo
+uploads), **home** (`~/.orkestra`), **rollback**, **complex** (a command too large to be inspected).
 
-Yalnız run'a bağlı oturumda: **phase** (onaydan önce kaynak koda yazma yok), **isolation** (proje dışına yazma yok),
-**deps** (onaysız paket yok), **deploy**, **roles** (salt-okur ajanlar yalnız rapor yazar), **internals** (makine
-durumuna elle ya da betikle yazma yok; onay cevabı gömülemez), **wait** (alt-ajan için uyuma ve yoklama yok),
-**dialogs** (ekranda sistem penceresi açan komut yok), **Stop** (run aktifken tur bitirilirse sıradaki adımla devam
-ettirilir; alt-ajan çalışırken bitmesine izin verilir).
+Only in a session bound to a run: **phase** (no writes to source before approval), **isolation** (no writes outside the
+project), **deps** (no unapproved packages), **deploy**, **destructive** (recursive deletion only inside a dedicated
+temporary subfolder), **roles** (read-only agents write only their report),
+**internals** (no hand-written or scripted writes to machine state; the approval answer cannot be embedded; also
+`orkestra pause|abort|resume|unblock|block|await` of a run another chat drives, which only your own message lifts), **wait**
+(no sleeping or polling for a subagent), **dialogs** (no command that opens a system window on the screen), **Stop**
+(ending the turn while a run is active is answered with the next step, at most twice per state of progress and six times
+per 30 minutes; ending it while a subagent is running is allowed).
 
-Bilinçli istisna: `/tmp/<klasör>` (ve `$TMPDIR` altı) izolasyondan muaftır, çünkü ajanların deneme ve kopya için bir
-yere ihtiyacı var. Geçici kökün kendisi (`/tmp/*`) muaf değildir.
+Every denial of a run guard ends with an `unblock:` line, the way out: the driving chat can `orkestra pause` or
+`orkestra abort` the run, any other agent tells you. A refused call is counted per guard, tool, target and actor: the 2nd
+identical refusal adds a note, the 3rd becomes "denied Nx: do not retry; <alternative>" (an exact `orkestra ...`
+rewrite where one exists), and the 8th within 10 minutes blocks the run and records a `loop` row. The decision itself
+never changes. Two more refusals come from the hook itself: `busy` (the call could not be checked in 9 s on a busy
+machine; retry the same call once) and `approval` (a question in an autopilot run).
 
-Dokuz guard `~/.orkestra/config.json` → `guards` altından kapatılabilir. `guards.test_syntax` ters yönde bir
-seçenektir ve kapalı gelir: açılırsa `[[ a > b ]]` ve `(( n > 100 ))` yönlendirme değil karşılaştırma olarak okunur.
-bash'e karşı doğrulandı, zsh'e karşı doğrulanmadı; o yüzden kapalı.
+A deliberate exception: `/tmp/<folder>` (and anything under `$TMPDIR`) is exempt from isolation, because agents need a
+place for experiments and copies. The temp root itself (`/tmp/*`) is not exempt.
 
-## İzleme
+Nine guards can be switched off under `guards` in `~/.orkestra/config.json`. `guards.test_syntax` is an option in the
+opposite direction and ships turned off: when enabled, `[[ a > b ]]` and `(( n > 100 ))` are read as comparisons, not as
+redirections. It was verified against bash and not against zsh, which is why it is off.
 
-`watch` ve `dashboard` her run için fazı, o fazda geçen süreyi, görev ve kanıt ilerlemesini, kapı sonuçlarını, token
-kullanımını, son araç çağrılarını ve **duraklama sınıfını** gösterir:
+## Monitoring
 
-1. seni bekliyor (soru, onay, bloke, tur bitti) · 2. ölü bekleme (alt-ajan bitti, ana oturum ilerlemiyor) ·
-3. asılı komut · 4. sessiz oturum (10 dakikadır kayıt yok) · 5. döngü (aynı ret ya da aynı komut 3 kez).
+`watch` and `dashboard` show, for each run, the phase, the time spent in it, task and evidence progress, gate results,
+token usage, the latest tool calls and the **stall class**:
 
-`watchdog` aynı sınıflandırmayı oturumun dışından yapar ve yeni olayda bir kez macOS bildirimi gönderir. Bridge
-çalışıyorsa dakikada bir kendisi koşar; çalışmıyorsa `orkestra watchdog --launchd` bir LaunchAgent dosyası yazar.
-Otomatik devam yalnız başsız başlatılmış run'lar içindir (en çok 3 kez, aynı oturumda, o oturumun süreci yaşarken
-asla). Etkileşimli pencereden yürüttüğün run kendiliğinden sürdürülmez.
+1. waiting for you (question, approval, blocked, paused, turn ended) · 2. dead wait (a stopped subagent's report is
+60 s overdue, the registry says so, and the whole run was silent since) · 3. hung command (open for `hung_command_seconds`,
+900 s, or `gate_command_seconds`, 1800 s, while no agent wrote any row since it started) · 4. silent session (no record
+for 10 minutes) · 5. loop (the same rejection or the same command 3 times, a third review round).
 
-## Süre ölçümü ve tempo
+Every class is a plain predicate on rows, registry files and clocks; none is "the model has been quiet", because a
+thinking model is not a stall. A false stall costs more than a late one.
 
-4–5 Ekim'de 1.2.1 ile koşan beş run'da ölçülenler (`orkestra tempo`):
+`watchdog` makes the same classification from outside the session and sends a desktop notification (macOS, or Linux with `notify-send`) once per new event.
+When the bridge is running it runs by itself every minute; when it is not, `orkestra watchdog --launchd` writes a
+LaunchAgent file. Automatic resume is only for runs started headless (at most 3 times, in the same session, and never
+while that session's process is alive). A run you drive from an interactive window is never resumed on its own.
 
-| Run | Süre | Görev | İnceleme reddi | Ölü bekleme payı |
+### The fast watcher
+
+`orkestra watchdog --loop|--daemon|--status` (`lib/orkestra_core/fastwatch.py`). One per machine: a locked pid file
+(`~/.orkestra/watchdog.pid`; the lock dies with the process, so a leftover after `kill -9` is taken over). It checks every
+open run every 5 s (1 s while a stall is about to be declared, 15 s with no open run), re-reads a file only when its
+size or mtime changed, and spends no tokens. SessionStart starts it when none runs (POSIX; `watchdog.autostart`,
+`ORKESTRA_NO_DAEMON=1` turns it off); the bridge hosts it as a thread; it exits after `watchdog.daemon_idle_minutes` with
+no open run and no live session.
+
+| Predicate | True when | Settle time |
+|---|---|---|
+| deny loop | the same refusal 3 times in 120 s (8 times in 600 s: the run should be blocked) | none |
+| control flips | 3 pause/resume status changes in 10 min | none |
+| paused but working | a paused run whose agents ran a tool in the last 60 s | 5 s |
+| report overdue | a stopped subagent's report is due, no hand-back, no main action, whole run silent | 60 s |
+| idle active | an autopilot run's turn ended with work left and the state did not move | 20 s |
+| permission wait | the host shows a permission prompt nobody answered | 30 s |
+| hung command | an open command past its limit while no agent wrote a row since it started, and its process shows no CPU | 15 or 30 min |
+| API error | a model or API error ended the turn and nothing happened since | retry ladder |
+| dead session | every bound session's host process is gone | none |
+| hooks degraded | 3 hook errors in `hooks.log` within 60 s | none |
+
+What it does: one notification per incident (then after 30 min, 2 h, 8 h and a day, at most 5 in all); and it heals only
+what is provably stale: a binding to a missing or closed run, an open command that a later row of the same agent
+outlived (an honest synthetic `end` row), subagent records of agents that are gone, one ledger line for a flip storm.
+For a headless run it resumes the session with the capped `claude -p --resume` (3 per run, after 10 s, 60 s, 300 s, never
+while the session's process or a bridge job is alive). What it cannot do: run on Windows, approve a prompt or answer a
+question, kill a process it did not start, or tell a slow command from a stuck one without the CPU sample. After 3 failed
+ticks it stops healing and only notifies. Everything it does is in `~/.orkestra/logs/watchdog.log` (rotated at 1 MB).
+
+## Timing and tempo
+
+Measured on five runs with 1.2.1 on October 4-5 (`orkestra tempo`):
+
+| Run | Duration | Tasks | Review rejects | Share of dead wait |
 |---|---|---|---|---|
-| game-app · kalan işler | 12 sa 37 dk | 28 | 17 | %29 |
-| deals-app · derin analiz | 6 sa 57 dk | 57 | 67 | %19 |
-| mobile-app 001 | 5 sa 55 dk | 27 | 13 | %34 |
-| mobile-app 002 | 5 sa 58 dk | 28 | 19 | %26 |
-| mobile-app 003 | 11 sa 2 dk (5 sa 18 dk'sı onay beklemesi) | 62 | 0 | %12 |
+| game-app · remaining work | 12 h 37 min | 28 | 17 | 29% |
+| deals-app · deep analysis | 6 h 57 min | 57 | 67 | 19% |
+| mobile-app 001 | 5 h 55 min | 27 | 13 | 34% |
+| mobile-app 002 | 5 h 58 min | 28 | 19 | 26% |
+| mobile-app 003 | 11 h 2 min (5 h 18 min of it waiting for approval) | 62 | 0 | 12% |
 
-İki büyük kayıp vardı. Birincisi ölü bekleme: Claude Code alt-ajanı arka planda çalıştırıp raporu yeni mesajla
-getirirken Stop hook'u turun bitmesini engelliyor, model de `sleep` döngüsüyle bekliyordu. 1.4.0'da ajan çalışırken
-tur bitebilir, bekleme komutları reddedilir. İkincisi gereksiz inceleme turu: 116 reddin 35'i yalnız küçük notlar
-içindi. Artık PASS alan görev yeniden açılmaz, notlar final incelemeye taşınır, üçüncü FAIL sana sorulur.
+There were two big losses. The first was dead wait: while Claude Code ran a subagent in the background and delivered the
+report as a new message, the Stop hook prevented the turn from ending and the model waited in a `sleep` loop. Since 1.4.0
+the turn may end while an agent runs, and waiting commands are rejected. The second was needless review rounds: 35 of
+116 rejects were only for minor notes. Now a task that gets PASS is not reopened, notes move to the final review, and
+the third FAIL is put to you.
 
-Bu değişikliklerin süreye etkisi henüz ölçülmedi. 1.4.0 ile koşan ilk run'dan sonra `orkestra tempo` aynı tabloyu verir;
-karşılaştırma oradan yapılır.
+The effect of these changes on duration has not been measured yet. After the first run on 1.4.0, `orkestra tempo` gives
+the same table; the comparison is made from there.
 
-Kesintisiz devam: yarıda kalan run için ayrı bir "nerede kaldım" kaydı yoktur. `orkestra next` cevabı state, kanıt ve
-inceleme dosyalarından hesaplar; oturum kapansa, bağlam sıkışsa ya da yeni pencere açsan da aynı alt-adımı bulur.
-`/orkestra:resume` bunu kullanır.
+Seamless continuation: there is no separate "where was I" record for an interrupted run. `orkestra next` computes the
+answer from the state, evidence and review files; even if the session closes, the context is compacted or you open a
+new window, it finds the same sub-step. `/orkestra:resume` uses it.
 
-## Kapsam
+## Reliability: caps, locks and gates
 
-Orkestra, hook'ları etkin Claude Code, Cursor ve GitHub Copilot oturumlarında çalışır; tam akış ancak bir run
-başlatıldığında devreye girer. İlk kurulum: `orkestra setup` (veya `cursor install` / `copilot install`).
+No agent may block another, nothing may loop without a bound, and waiting costs no tokens.
 
-- `/orkestra:run` (Claude/Copilot) veya `/orkestra-run` (Cursor) ile ve bridge üzerinden gelen istek: tam akış.
-- Run başlatmadan yazılan istek: yalnız "her oturumda" guard'ları. Plan, onay ve TDD yoktur.
-- Açık run varken aynı projede run'a bağlı olmayan ikinci oturum: uyarı alır ama dosyaları değiştirebilir.
-- Hook'suz Copilot oturumu, Cursor'ın Orkestra dışı ajanı, Codex, Gemini CLI, claude.ai sohbeti ve Cowork: kapsam dışı.
-- Bridge (Telegram/n8n/OpenClaw/local workbench) Claude Code, Cursor ve Copilot motorlarını başlatır
-  (`/yap copilot: …`, `POST /runs` with `"engine": "copilot"`).
+**Control plane.** A chat is bound to a run only when the main chat ran `orkestra start|resume` itself (an unbind comes
+from `pause`, `abort` or `phase next`), the printed marker's `home=` is this hook's `ORKESTRA_HOME`, and the run exists, is
+open and has an absolute project path. Subagents, `cat` of a log and sandbox copies of the CLI bind nothing. A live
+binding is kept with one ledger line and one warning; a bogus one heals itself; a neutral message never unbinds.
+`pause`, `abort`, `resume`, `unblock`, `block` and `await` of a run another chat drives are refused unless the user's
+message asks for it (a driver is alive for `watchdog.lease_seconds`). A call that changes nothing (pause of a paused run)
+is a no-op and writes no row. A `status` activity row shows who paused or resumed.
 
-## Koordinasyon
+**Caps.**
 
-Bu klasörü üç agent günceller: orkestra-core (eklenti ve bridge), openclaw-agent (`integrations/openclaw/`),
-ecc-karpathy (`vendor/ecc`, `vendor/karpathy`, isteğe bağlı playbook'lar, bu belge). Kurallar `CONTRIBUTING.md`'de;
-en önemlileri: açık run varken eklenti dosyası değiştirilmez; değişiklikten önce yedek ve md5 alınır, iş ayrı bir
-kopyada yapılıp testler orada koşulur, canlı klasöre tek seferde aktarılır; commit, push ve branch yalnız insan kullanıcı / depo sahibinin açık isteğiyle yapılır.
+| What | Cap | Then |
+|---|---|---|
+| identical refusals | 2nd note, 3rd "do not retry", 8th in 10 min | the run is blocked, a `loop` row is written |
+| Stop nudges | 2 per state of progress, 6 per 30 min per run | the turn ends; autopilot nudges never send the model to ask a question |
+| review rounds of a task | 3 | manual: the user rules; autopilot: the task is blocked and `--force` cannot lift it (`task defer` or `block` are the ways on) |
+| identical dispatches | `tempo.max_dispatches` (3) without new evidence | `orkestra next` answers `escalate` |
+| subagent registry | no sign of life for `watchdog.agent_silent_seconds` (150 s) | the agent is listed as lost |
+| bridge turn | `bridge.turn_timeout_seconds` (7200 s) wall clock, `bridge.turn_idle_seconds` (1800 s) without run activity | the turn is interrupted (SIGINT, its process group 20 s later) and the run resumed; a turn with an open command is never idle |
+| headless spend | `headless.max_budget_usd` (0 = off) | passed to `claude -p --max-budget-usd` |
 
-CLI'ye yeni seçenek ya da alt komut eklenirken tek yer `lib/orkestra_core/cliparse.py`'dir: guard'lar komut satırını
-oradaki ayrıştırıcıyla okur.
+**Locks and deadlines.** A lock is waited for 2 s in a hook (then the hook goes on unlocked and logs one line; a state
+transaction raises a one-line error) and 10 s in the CLI; the error names the holder's pid, command and age.
+`ORKESTRA_LOCK_TIMEOUT` overrides both. Slow work (git baselines, the test-file scan, usage totals) runs before the lock is
+taken, and every git call is time-boxed and runs with `GIT_OPTIONAL_LOCKS=0`. The hook deadline is in Architecture.
 
-## Bakım ve geri alma
+**Waiting.** In a headless run `orkestra wait [--max N]` polls every 2 s inside the process and returns on the first of:
+no subagent running, a new report due, a hand-back, a review or task file changing, the run leaving `active`, or the cap
+(540 s by default, below the 600 s a Bash call may run). Run it again if the verdict still says running.
 
-Test:
+**Gates.** Each gate runs in its own process group with a streaming log in `evidence/`; a timeout (`timeout`, 900 s by
+default) or an idle stall (`idle_timeout`, off unless set) stops the whole group (SIGTERM, SIGKILL after 3 s).
+`gate verify` re-uses what is provably unchanged: a gate whose baseline run timed out or took 120 s or more is not re-run
+(shown as "failed at baseline"), a gate with `paths` globs and no changed file is carried forward from the last passing
+verify (shown as "PASS (carried)"), a fast baseline failure is re-run with a shortened timeout. `--resume` skips the gates
+finished for the same change stamp; `--all`, `ORKESTRA_GATES_FULL=1` or `gates_rerun_failed_baseline` run everything in
+full. `gates_parallel` above 1 runs typecheck, lint and test gates side by side (at most half the CPUs).
+
+**Configuration keys added by this work** (`~/.orkestra/config.json`, defaults in `paths.DEFAULT_GLOBAL_CONFIG`):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `tempo.max_dispatches` | `3` | Identical dispatches without new evidence before `next` escalates. |
+| `watchdog.agent_silent_seconds` | `150` | A registered subagent with no sign of life this long is lost. |
+| `watchdog.autostart` | `true` | SessionStart may start the fast watcher. |
+| `watchdog.daemon_idle_minutes` | `30` | The detached watcher exits after this long with no open run and no live session. |
+| `gates_parallel` | `1` | Concurrent typecheck, lint and test gates (a project `config.json` value wins). |
+| `gates_rerun_failed_baseline` | `false` | `true`: `gate verify` re-runs gates that failed or timed out at baseline. |
+| `headless.max_budget_usd` | `0` | Above 0, a spend ceiling for headless turns. |
+| `bridge.turn_timeout_seconds` | `7200` | Wall-clock budget of one bridge turn. |
+| `bridge.turn_idle_seconds` | `1800` | A bridge turn without run activity this long is interrupted and resumed. |
+
+A value of the wrong type in `config.json` is ignored in favour of the default (`doctor` names it).
+
+## Scope
+
+Orkestra works in Claude Code, Cursor and GitHub Copilot sessions that have the hooks enabled; the full flow only
+kicks in once a run is started. First setup: `orkestra setup` (or `cursor install` / `copilot install`).
+
+- A request that comes through `/orkestra:run` (Claude/Copilot) or `/orkestra-run` (Cursor) and through the bridge: the full flow.
+- A request typed without starting a run: only the "every session" guards apply. There is no plan, approval or TDD.
+- A second session in the same project that is not bound to the run while a run is open: it gets a warning but can change files.
+- A Copilot session without hooks, Cursor's non-Orkestra agent, Codex, Gemini CLI, a claude.ai chat and Cowork: out of scope.
+- The bridge (Telegram/n8n/OpenClaw/local workbench) starts the Claude Code, Cursor and Copilot engines
+  (`/run copilot: …` (`/yap` in Turkish), `POST /jobs` with `"engine": "copilot"`).
+
+## Coordination
+
+Three agents update this folder: orkestra-core (the plugin and the bridge), openclaw-agent (`integrations/openclaw/`),
+ecc-karpathy (`vendor/ecc`, `vendor/karpathy`, optional playbooks, this document). The rules are in `CONTRIBUTING.md`;
+the most important ones: no plugin file is changed while a run is open; a backup and an md5 are taken before a change,
+the work is done in a separate copy and the tests run there, then it is transferred to the live folder in one go;
+commit, push and branch happen only at the explicit request of the human user / repository owner.
+
+When a new option or subcommand is added to the CLI, the single place is `lib/orkestra_core/cliparse.py`: the guards
+read the command line with the parser there.
+
+## Maintenance and rollback
+
+Tests:
 
 ```bash
-cd ./plugins/orkestra/tests && python3 -m unittest discover -s . -q   # 357 test
-cd ./bridge/tests && python3 -m unittest discover -s . -q             # 19 test
-cd ./integrations/openclaw/plugin && npm test                          # 15 test
+cd ./plugins/orkestra/tests && python3 -m unittest discover -s . -q
+cd ./bridge/tests && python3 -m unittest discover -s . -q
+cd ./integrations/openclaw/plugin && npm test
 python3 ./plugins/orkestra/bin/orkestra doctor
 ```
 
-Eklenti yerinde yüklendiği için kod değişikliği için kurulum gerekmez: hook'lar ve CLI her çağrıda diskteki dosyayı
-okur. Ajan ve skill metinleri ile `hooks.json` yeni açılan Claude Code oturumunda geçerli olur. Bridge uzun yaşayan bir
-süreçtir; bridge kodu değiştiyse yeniden başlatılır. `install.sh` yalnız ilk kurulum, MCP ekleme ve testleri bu
-makinede koşmak için gerekir.
+Because the plugin is loaded in place, a code change needs no installation: the hooks and the CLI read the file on disk
+on every call. Agent and skill texts and `hooks.json` take effect in a newly opened Claude Code session. The bridge is a
+long-lived process; restart it when the bridge code changed. `install.sh` is needed only for the first installation,
+adding the MCP, and running the tests on this machine.
 
-Bir sürümü geri almak (açık run yokken): depoda her sürüm bir etikettir.
+Rolling back a version (when no run is open): the changelog names every version; check out the commit that released it.
+The repository has no release tags.
 
 ```bash
-python3 plugins/orkestra/bin/orkestra cursor uninstall   # yalnız 1.5.0'ın altına inerken (Cursor desteği 1.5.0 ile geldi)
-git fetch --tags && git checkout v1.4.0                  # istenen sürüm
+python3 plugins/orkestra/bin/orkestra cursor uninstall   # only when going below 1.5.0 (Cursor support arrived with 1.5.0)
+git log --oneline -- CHANGELOG.md                        # find the commit of the version you want
+git checkout <commit>                                    # (if release tags exist one day: git fetch --tags && git checkout v1.4.0)
 cd plugins/orkestra/tests && python3 -m unittest discover -s . -q
 ```
 
-Depoyu git ile almadıysan aynı şey o sürümün arşiviyle yapılır (GitHub "Releases"). Bir run'ın proje
-dosyalarında yaptığı değişikliği geri almak ayrı bir iştir: `/orkestra:rollback`.
+If you did not get the repository with git, download the commit you want from GitHub as a ZIP and do the same with it.
+Undoing the changes a run made to a project's files is a separate matter: `/orkestra:rollback`.
 
-Sabitlenmiş referansları yenilemek: `bash install.sh --refresh-vendor` (kaynak ve commit'ler `vendor/PINNED.md`'de).
+Refreshing the pinned references: `bash install.sh --refresh-vendor` (sources and commits are in `vendor/PINNED.md`).
 
-## Açık konular
+## Open items
 
-- CI matrisi Python 3.9, 3.13 ve 3.14 için Linux/macOS'ta yapılandırıldı; tam yerel test paketi Python 3.14.7'de koştu.
-- Cursor motoru komut satırı aracıyla (`agent` 2026.10.01) beş gerçek XS run'da denendi; Cursor IDE penceresi ayrıca
-  denenmedi (aynı hook sözleşmesi; IDE'ye özgü bir fark gözlenmedi çünkü bakılmadı).
-- Cursor, Claude Code'un eklenti kaydındaki eski orkestra kopyasını (1.0.0, `~/.claude/plugins/cache/…`) da yükler;
-  o kopyanın hook'ları Cursor sohbetlerinde eski kurallarla cevap verir (ör. `klasör/**` Grep'ini reddeder).
-  `claude plugin update orkestra@orkestra-local` kaydı yeniler; Claude Code'un yerinde yüklemesine etkisi denenmedi.
-- Kendi kendini onaylama gerçek bir run'da görüldü ve üç katmanla kapatıldı (CHANGELOG 1.5.0); ortamını temizleyip
-  üst süreçlerinden kopan, adları gizleyen bir betik hâlâ aşabilir. Claude Code tarafında hook'un "beni ajan başlattı"
-  denetimi yok (Claude Code'un süreç düzeni ölçülmedi); komut ve içerik denetimi iki motorda da var.
-- Cursor run'larında token sayımı ve implementer için bitiş anındaki TDD kanıtı uyarısı yok.
-- Token maliyeti (run başına 76–546 milyon cache okuma) ölçülüyor ama azaltılmadı.
-- Kapsam boşlukları yukarıdaki gibi duruyor.
+- The CI matrix is configured for Python 3.9, 3.11, 3.13 and 3.14 on Linux, macOS and Windows; the full local test suite ran on Python 3.14.7.
+- The Cursor engine was tried on five real XS runs with the command line tool (`agent` 2026.10.01); the Cursor IDE window
+  was not tried separately (same hook contract; no IDE-specific difference was observed because none was looked for).
+- Cursor also loads the old orkestra copy in Claude Code's plugin registry (1.0.0, `~/.claude/plugins/cache/…`);
+  that copy's hooks answer in Cursor chats with the old rules (for example it rejects a `folder/**` Grep).
+  `claude plugin update orkestra@orkestra-local` refreshes the registry; its effect on Claude Code's in-place loading
+  has not been tried.
+- Self-approval was seen in a real run and closed with three layers (CHANGELOG 1.5.0); a script that cleans its
+  environment, detaches from its parent processes and hides names can still get around it. On the Claude Code side the
+  hook has no "an agent started me" check (Claude Code's process layout was not measured); the command and content checks
+  exist on both engines.
+- In Cursor runs there is no token counting and no warning about the implementer's TDD evidence at finish time.
+- Token cost (76-546 million cache reads per run) is measured but not reduced.
+- The scope gaps stand as above.

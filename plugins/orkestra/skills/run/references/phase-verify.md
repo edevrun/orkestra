@@ -11,4 +11,4 @@ Goal: fresh proof that nothing that worked is broken and an honest, traceable ou
    `PASS_WITH_NOTES` may proceed only when accepted deferrals are explicitly marked `DEFERRED/UNVERIFIED`; failed acceptance criteria remain `FAIL`.
 4. `orkestra phase next` re-checks deterministically: gates green after the last change, traceability with verifiable
    references only (no invented files/tests), test integrity (no removed tests, skip/only markers or new suppressions
-   unless listed in the approved plan's `## İstisnalar`), and dependencies.
+   unless listed in the approved plan's `## Exceptions` or, in a Turkish plan, `## İstisnalar`), and dependencies.

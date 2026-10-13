@@ -10,13 +10,13 @@ Please report ways to bypass a guard, forge an approval, or make a hook leak dat
 
 Include:
 
-- Orkestra version (`orkestra version` or the release tag)
+- Orkestra version (`orkestra version` or the release tag), your OS and Python version
 - Engine and host version (Claude Code, Cursor CLI/IDE, or Copilot)
 - Exact command or tool call that demonstrates the issue
 - Whether a run was bound (`orkestra status`) and the phase, if relevant
 
-Do not open a public issue with a working exploit. We will acknowledge private reports and coordinate a fix before
-any disclosure.
+You may write in English or Turkish. Do not open a public issue with a working exploit. We will acknowledge private
+reports and coordinate a fix before any disclosure.
 
 ## Threat surface (product)
 
@@ -28,7 +28,7 @@ diffs in a target project (those playbooks live under `plugins/orkestra/skills/`
 - Hooks deny or allow **tool calls** from a bound agent session. They do not isolate processes, filesystems, or
   network. The agent runs as your OS user.
 - Claude Code and Cursor hooks are **fail-open**: if a hook crashes or times out, the call is allowed so a broken
-  guard cannot lock you out of the editor. Treat fail-open as availability over hard deny — that remains the
+  guard cannot lock you out of the editor. Treat fail-open as availability over hard deny: that remains the
   product decision for those engines.
 - Copilot `PreToolUse` is **fail-closed**: a hook crash or invalid payload returns `permissionDecision: deny` and
   blocks the tool call. Other Copilot hook events still fail open. Do not assume one fail policy across engines.
@@ -42,7 +42,8 @@ diffs in a target project (those playbooks live under `plugins/orkestra/skills/`
 ### Local bridge
 
 - The optional HTTP bridge (`bridge/orkestra_bridge.py`) listens on **loopback** (`127.0.0.1`) only. The shared
-  secret is `~/.orkestra/bridge.secret.json` (mode 600). Anything that can call loopback as your user can use a
+  secret is `~/.orkestra/bridge.secret.json` (mode 600 on macOS and Linux; on Windows it sits in your user profile and
+  relies on that folder's permissions). Anything that can call loopback as your user can use a
   stolen token.
 - The browser workbench keeps the token in page memory only (not URL, not persistent browser storage). It is not a
   boundary against other local programs.
@@ -57,8 +58,9 @@ diffs in a target project (those playbooks live under `plugins/orkestra/skills/`
 ## What Orkestra stores
 
 State and logs live in `<project>/.orkestra/` and `~/.orkestra/`. The bridge token is in
-`~/.orkestra/bridge.secret.json` (mode 600) and the bridge listens on `127.0.0.1` only. Nothing is sent to any
-server by Orkestra itself.
+`~/.orkestra/bridge.secret.json` (mode 600 where the OS supports it) and the bridge listens on `127.0.0.1` only. Orkestra sends nothing to a server on its
+own. The traffic that exists is what you configure: the bridge's Telegram bot (`api.telegram.org`) and `callback_url`, the
+watchdog's `notify.webhook_url`, and `install.sh --refresh-vendor` (GitHub).
 
 The local browser UI is served by that loopback bridge. It asks you to enter the token, does not put it in the URL
 or browser storage, and keeps it in page memory only. The selected Claude Code or Cursor client may send prompts and

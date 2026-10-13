@@ -235,17 +235,19 @@ class TestCursorDialect(Sub):
 
     def test_answers_survive_any_locale(self):
         self.start()
-        payload = {"conversation_id": CONV, "generation_id": "g", "hook_event_name": "preToolUse", "tool_name": "Write",
-                   "tool_input": {"file_path": str(self.proj / "çalışma — şema.py")}, "workspace_roots": [str(self.proj)]}
-        for enc in ({"PYTHONIOENCODING": "ascii"}, {"PYTHONIOENCODING": "latin-1"}, {"LC_ALL": "C", "PYTHONUTF8": "0",
-                                                                                      "PYTHONCOERCECLOCALE": "0"}):
+        for n, enc in enumerate( ({"PYTHONIOENCODING": "ascii"}, {"PYTHONIOENCODING": "latin-1"}, {"LC_ALL": "C", "PYTHONUTF8": "0",
+                                                                                      "PYTHONCOERCECLOCALE": "0"})):
+            # a different file per round: the same refusal three times would (by design) switch to the short "do not retry" text
+            name = f"çalışma — şema{n}.py"
+            payload = {"conversation_id": CONV, "generation_id": "g", "hook_event_name": "preToolUse", "tool_name": "Write",
+                       "tool_input": {"file_path": str(self.proj / name)}, "workspace_roots": [str(self.proj)]}
             cp = subprocess.run([sys.executable, str(helpers.CURSOR_HOOK), "preToolUse"], input=json.dumps(payload).encode(),
                                 capture_output=True, env=dict(os.environ, **enc))
             self.assertEqual(cp.returncode, 0, cp.stderr)
             out = json.loads(cp.stdout.decode("ascii"))
             self.assertEqual(out["permission"], "deny", enc)
             self.assertIn("plan is not approved", out["user_message"])
-            self.assertIn("çalışma — şema.py", out["user_message"])                 # non-ASCII text arrives intact
+            self.assertIn(name, out["user_message"])                 # non-ASCII text arrives intact
 
     def test_corrupt_side_files_do_not_switch_the_guards_off(self):
         self.to_implement()
@@ -388,6 +390,7 @@ class TestShellDirectory(Sub):
         self.chook("sessionEnd", gen=CONV, reason="completed")                      # a new process, a new shell
         self.assertEqual(self.shell("ls"), {"permission": "allow"})
 
+    @unittest.skipUnless(os.name != "nt", "os.symlink fixture (FR-007)")
     def test_more_ways_to_move(self):
         home = "/home/u"
         for cmd, want in (("'cd' sub", "/p/sub"), ("\\cd sub", "/p/sub"), ("c\\d sub", "/p/sub"), ("command -p cd sub", "/p/sub"),
@@ -524,6 +527,7 @@ class TestSelfApproval(Sub):
             self.assertTrue(self.denied(self.hook("PreToolUse", {"session_id": "sess-9", "tool_name": tool,
                                                                  "cwd": str(self.proj), "tool_input": ti})), tool)
 
+    @unittest.skipUnless(os.name != "nt", "/bin/sh -c wrapper fixture (FR-007)")
     def test_run_anyway_it_records_nothing(self):
         """The second layer: the hook itself recognises that an agent command started it."""
         self.start()
@@ -724,6 +728,27 @@ class TestLightPrompts(helpers.Sandbox):
         base_env = {k: v for k, v in os.environ.items() if k not in helpers._AGENT_ENV}
         if env:
             base_env.update(env)
+        if os.name == "nt":
+            spawn = (
+                "flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)\n"
+                "cp = subprocess.run([sys.executable, '-c', body, hooks, event],\n"
+                "                    input=payload, capture_output=True, text=True, env=env, creationflags=flags)\n"
+                "open(out, 'w', encoding='utf-8').write("
+                "cp.stdout if cp.returncode == 0 else ('__ERR__\\n' + str(cp.returncode) + '\\n' + (cp.stderr or '')))\n"
+            )
+        else:
+            spawn = (
+                "if os.fork() == 0:\n"
+                "    os.setsid()\n"
+                "    if os.fork() == 0:\n"
+                "        cp = subprocess.run([sys.executable, '-c', body, hooks, event],\n"
+                "                            input=payload, capture_output=True, text=True, env=env)\n"
+                "        open(out, 'w', encoding='utf-8').write("
+                "cp.stdout if cp.returncode == 0 else ('__ERR__\\n' + str(cp.returncode) + '\\n' + (cp.stderr or '')))\n"
+                "        os._exit(0)\n"
+                "    os._exit(0)\n"
+                "os.wait()\n"
+            )
         code = (
             "import os, sys, json, subprocess\n"
             f"out = {str(out_path)!r}\n"
@@ -737,16 +762,7 @@ class TestLightPrompts(helpers.Sandbox):
             "sys.argv = ['cursor_hook.py', sys.argv[2]]; import cursor_hook as C; C.main(); "
             "sys.stdout.write(chr(10) + json.dumps(sorted(m for m in sys.modules if m in \" + repr(heavy) + \")));\"\n"
             ")\n"
-            "if os.fork() == 0:\n"
-            "    os.setsid()\n"
-            "    if os.fork() == 0:\n"
-            "        cp = subprocess.run([sys.executable, '-c', body, hooks, event],\n"
-            "                            input=payload, capture_output=True, text=True, env=env)\n"
-            "        open(out, 'w', encoding='utf-8').write("
-            "cp.stdout if cp.returncode == 0 else ('__ERR__\\n' + str(cp.returncode) + '\\n' + (cp.stderr or '')))\n"
-            "        os._exit(0)\n"
-            "    os._exit(0)\n"
-            "os.wait()\n"
+            + spawn
         )
         subprocess.run([sys.executable, "-c", code], env=base_env, check=True, timeout=60)
         deadline = time.time() + 60
@@ -818,9 +834,14 @@ class TestLightPrompts(helpers.Sandbox):
         self.assertTrue(out.get("continue"))
         (self.home / "sessions").mkdir(parents=True, exist_ok=True)
         other = "c0ffee11-" + uuid.uuid4().hex[:12]
-        (self.home / "sessions" / f"cursor-{other}.json").write_text(json.dumps({"project": str(self.proj), "run_id": "001-x"}))
+        # 2026-10-12: a binding to a run that does not exist is dropped when a hook sees it, so the run must be real
+        run_dir = self.proj / ".orkestra" / "runs" / "001-x"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "state.json").write_text(json.dumps({"run_id": "001-x", "phase": "intake", "status": "active"}))
         for event, extra in (("beforeSubmitPrompt", {"prompt": "devam et"}), ("stop", {"status": "completed"}),
                              ("subagentStart", {"subagent_id": "s-1", "subagent_type": "orkestra-implementer"})):
+            # (rewritten per event: with a real run, the Stop hook of the second one releases a turn that drove nothing)
+            (self.home / "sessions" / f"cursor-{other}.json").write_text(json.dumps({"project": str(self.proj), "run_id": "001-x"}))
             payload = dict(self.base, conversation_id=other, **extra)
             if event == "subagentStart":
                 payload = dict(self.base, parent_conversation_id=other, **extra)
@@ -901,6 +922,7 @@ class TestCursorKitEdges(helpers.Sandbox):
                 with self.assertRaises(EN.EngineError):
                     self.CK.uninstall()
 
+    @unittest.skipUnless(os.name != "nt", "os.symlink fixture (FR-007)")
     def test_symlinked_hooks_json_and_a_dangling_shim(self):
         dot = self.tmp / "dotfiles"
         dot.mkdir()
@@ -916,6 +938,7 @@ class TestCursorKitEdges(helpers.Sandbox):
         self.assertEqual(os.path.realpath(self.shim / "orkestra"), os.path.realpath(helpers.BIN))
         self.assertTrue(self.CK.hooks_installed())
 
+    @unittest.skipUnless(os.name != "nt", "#!/bin/sh make_exec fixture (FR-007)")
     def test_second_install_changes_nothing_whatever_the_path_and_copy_mode_too(self):
         self.CK.install()
         first = (self.chome / "hooks.json").read_text()

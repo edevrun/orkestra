@@ -1,5 +1,6 @@
 """End-to-end CLI + hook flow on real temporary git/non-git projects (no network, no model)."""
 import json
+import os
 import re
 import unittest
 from pathlib import Path
@@ -58,6 +59,7 @@ approved_dependencies: []
 """
 
 
+@unittest.skipUnless(os.name != "nt", "point_current symlink / POSIX flow fixtures (FR-007)")
 class FlowBase(helpers.Sandbox):
     def setUp(self):
         super().setUp()
@@ -158,7 +160,7 @@ class TestHappyPath(FlowBase):
         self.phase_next()  # intake → discover
         cp = self.phase_next(expect_ok=False)
         self.assertIn("context.md", cp.stderr)
-        self.assertIn("baseline", cp.stderr)
+        self.assertNotIn("baseline", cp.stderr)     # intentional change: the baseline is required for implement, not clarify
         (self.fdir / "context.md").write_text("# Context\n" + ("calc.py defines add(); tests in tests/. " * 10))
         out = self.cli("gate", "baseline", "-p", "demo").stdout
         self.assertIn("PASS", out)
@@ -686,7 +688,9 @@ class TestStopHijackGuards(FlowBase):
         self.start()
         out = self.hook("UserPromptSubmit", {
             "session_id": self.sid, "prompt_id": "p-dash", "cwd": str(self.proj),
-            "prompt": "make this dashboard friendlier",
+            # 2026-10-12: only an EXPLICIT signal unbinds ("make this dashboard friendlier" alone keeps the binding,
+            # test_binding_model.TestOffTopic); this one says to let go of the run
+            "prompt": "forget this run, make this dashboard friendlier",
         })
         self.assertIn("Unbound", json.dumps(out))
         ST = importlib.import_module("orkestra_core.state")

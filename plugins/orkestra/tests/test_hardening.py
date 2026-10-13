@@ -5,10 +5,12 @@ import copy
 import io
 import json
 import os
+import shlex
 import subprocess
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import helpers  # noqa: F401
 from test_flow import PLAN
@@ -450,7 +452,8 @@ class TestHookOutputAndGrants(Base):
         marker = [ln for ln in out.splitlines() if ln.startswith("[orkestra:bind]")][0]
         cp = subprocess.run([helpers.sys.executable, str(helpers.DISPATCH), "PostToolUse"], capture_output=True, text=True,
                             input=json.dumps({"session_id": "sess-2", "tool_name": "Bash", "hook_event_name": "PostToolUse",
-                                              "tool_input": {"command": "x"}, "cwd": str(self.proj),
+                                              # 2026-10-12: a marker counts only in the output of `orkestra start|resume`
+                                              "tool_input": {"command": "orkestra resume"}, "cwd": str(self.proj),
                                               "tool_response": {"stdout": marker + "\n" + marker + "\n", "stderr": ""}}))
         obj = json.loads(cp.stdout)                                          # raises on "Extra data"
         self.assertEqual(obj["hookSpecificOutput"]["additionalContext"].count("WARNING"), 1)
@@ -594,6 +597,37 @@ class TestForeignTestsExemption(TempoBase):
         self.assertIn("tests changed by a concurrent task", self.cli("report", "evidence", "-p", "demo").stdout)
 
 
+class TestCommandsThatCannotStart(TempoBase):
+    """A program that cannot start (Windows: list argv, no shell) is recorded as exit 127, which `tdd red` refuses as
+    "not a real failure". It used to escape as an OSError and end the command with 'could not read or write a file'."""
+
+    def test_evidence_records_127_with_the_reason_in_the_log(self):
+        self.start()
+        with mock.patch.object(R, "_run_shell_or_list", side_effect=FileNotFoundError(2, "no such file")):
+            rec = R.run_evidence(self.proj, self.rid, "smoke", ["orkestra-no-such-program-xyz", "arg"])
+        self.assertEqual(rec["exit"], 127)
+        self.assertIn("could not start the command", Path(rec["log"]).read_text(encoding="utf-8"))
+
+    def test_tdd_red_does_not_accept_a_program_that_cannot_start(self):
+        self.to_implement()
+        self.cli("task", "start", "T001", "-p", "demo")
+        with mock.patch.object(R, "_run_shell_or_list", side_effect=FileNotFoundError(2, "no such file")):
+            rec = R.tdd_record(self.proj, self.rid, "T001", "red", ["orkestra-no-such-program-xyz", "arg"])
+        self.assertEqual(rec["exit"], 127)
+        self.assertFalse(rec["ok"])
+
+    def test_the_recorded_command_stays_the_posix_quoted_form_on_every_os(self):
+        """Red and green are compared by this record: it must not depend on how the command was started."""
+        self.to_implement()
+        self.cli("task", "start", "T001", "-p", "demo")
+        argv = [helpers.sys.executable, "-c", "import sys; sys.exit(1)"]
+        with mock.patch.object(R, "_run_shell_or_list", return_value=mock.Mock(returncode=1, stdout=b"", stderr=b"")) as run:
+            rec = R.tdd_record(self.proj, self.rid, "T001", "red", argv)
+        self.assertEqual(rec["cmd"], shlex.join(argv))
+        self.assertEqual(run.call_args.kwargs["argv"], argv)
+        self.assertEqual(run.call_args.args[0], shlex.join(argv))
+
+
 # ====================================================================== watchdog / classifier (findings 1, 11)
 
 class TestStallAndWatchdog(unittest.TestCase):
@@ -617,6 +651,7 @@ class TestStallAndWatchdog(unittest.TestCase):
         self.assertTrue(d["resume"] and d["needs_dead_process"])
         self.assertFalse(W.resume_decision(view(cls=3, mode="interactive"), wcfg(auto_resume="all"), {}, 10_000.0)["resume"])
 
+    @unittest.skipUnless(os.name != "nt", "POSIX sleep binary (FR-007)")
     def test_our_own_resume_process_blocks_a_second_one_while_it_lives(self):
         proc = subprocess.Popen(["sleep", "30"])
         try:

@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import re
 import shlex
-from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", ";;", "|&", "{", "}"}
@@ -22,6 +21,9 @@ CLOSING_KEYWORDS = {"fi", "done", "esac"}
 REDIRECT_OPS = {">", ">>", ">|", "&>", "&>>", "<", "<<", "<<<", "<>", ">&", "<&"}
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
 MAX_DEPTH = 4
+# Program name of the one segment returned for a command nested deeper than MAX_DEPTH (bash -c / eval / $(...)): it
+# cannot be analysed, so the guards must refuse it. Returning nothing would read as "nothing to check" and allow it.
+NESTED_TOO_DEEP = "<orkestra-shell-nested-too-deep>"
 # Opt-in (config: guards.test_syntax, default off): understand `[[ a > b ]]`, `(( n > 100 ))` and `$(( 5 > 3 ))` as
 # comparisons instead of redirects. Off, those forms are read the strict 1.3.0 way (a `>` inside them counts as a
 # write target — a false positive for read-only agents and before approval, never a missed write). The recogniser
@@ -29,15 +31,29 @@ MAX_DEPTH = 4
 TEST_SYNTAX = False
 
 
-@dataclass
 class Segment:
-    program: str                     # basename of the executable, e.g. "git"
-    args: List[str] = field(default_factory=list)
-    redirects: List[Tuple[str, str]] = field(default_factory=list)  # (op, target)
-    raw: str = ""
+    """One simple command. A plain class with dataclass semantics (init, eq, repr): importing `dataclasses` costs a
+    hook 5 ms of start-up."""
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, program: str, args: Optional[List[str]] = None,
+                 redirects: Optional[List[Tuple[str, str]]] = None, raw: str = ""):
+        self.program = program           # basename of the executable, e.g. "git"
+        self.args = [] if args is None else args
+        self.redirects = [] if redirects is None else redirects     # (op, target)
+        self.raw = raw
 
     def argv(self) -> List[str]:
         return [self.program] + self.args
+
+    def __eq__(self, other: object) -> bool:
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        return (self.program, self.args, self.redirects, self.raw) == (other.program, other.args, other.redirects, other.raw)
+
+    def __repr__(self) -> str:
+        return (f"Segment(program={self.program!r}, args={self.args!r}, redirects={self.redirects!r}, "
+                f"raw={self.raw!r})")
 
 
 # ---------------------------------------------------------------- pre-processing
@@ -122,6 +138,7 @@ def _newlines_to_semicolons(cmd: str) -> str:
     out = []
     in_single = in_double = False
     i, n = 0, len(cmd)
+    escaped_to = -1                 # index right after an escape pair: a `#` there continues the word (`x\ #` is no comment)
     while i < n:
         ch = cmd[i]
         if ch == "\\" and i + 1 < n:
@@ -130,6 +147,7 @@ def _newlines_to_semicolons(cmd: str) -> str:
                 continue
             out.append(cmd[i:i + 2])
             i += 2
+            escaped_to = i
             continue
         if ch == "'" and not in_double:
             in_single = not in_single
@@ -138,6 +156,14 @@ def _newlines_to_semicolons(cmd: str) -> str:
         elif ch == "\n" and not in_single and not in_double:
             out.append(" ; ")
             i += 1
+            continue
+        elif (ch == "#" and not in_single and not in_double and i != escaped_to
+              and (i == 0 or cmd[i - 1] in " \t\n;&|()")):
+            # a comment runs to the end of ITS line only; the newline (next command) is kept
+            j = cmd.find("\n", i)
+            if j < 0:
+                break
+            i = j
             continue
         out.append(ch)
         i += 1
@@ -332,7 +358,7 @@ def _tokenize(cmd: str) -> List[str]:
     try:
         lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|()<>")
         lex.whitespace_split = True
-        lex.commenters = "#"
+        lex.commenters = ""                        # comments are removed in _newlines_to_semicolons; a mid-word # is data
         return list(lex)
     except ValueError:
         # unbalanced quotes: degrade to a crude split that still exposes words
@@ -532,8 +558,10 @@ def _strip_tests(cmd: str) -> str:
 # ---------------------------------------------------------------- public api
 
 def segments(cmd: str, _depth: int = 0, _plain_sh: Optional[bool] = None) -> List[Segment]:
-    if not cmd or _depth > MAX_DEPTH:
+    if not cmd:
         return []
+    if _depth > MAX_DEPTH:
+        return [Segment(program=NESTED_TOO_DEEP, raw=cmd[:200])] if cmd.strip() else []
     if _plain_sh is None:
         # `[[ … ]]` and `(( … ))` are syntax in bash/zsh only. If a plain POSIX shell is involved anywhere in the
         # command (`sh -c`, `dash <<EOF`), they are ordinary commands there and their `>` DOES write a file.
@@ -616,11 +644,21 @@ GIT_GLOBAL_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", 
                          "--config-env", "--list-cmds", "--attr-source"}
 
 
-@dataclass
 class GitCall:
-    sub: str
-    args: List[str]
-    globals: List[str] = field(default_factory=list)
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, sub: str, args: List[str], globals: Optional[List[str]] = None):
+        self.sub = sub
+        self.args = args
+        self.globals = [] if globals is None else globals
+
+    def __eq__(self, other: object) -> bool:
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        return (self.sub, self.args, self.globals) == (other.sub, other.args, other.globals)
+
+    def __repr__(self) -> str:
+        return f"GitCall(sub={self.sub!r}, args={self.args!r}, globals={self.globals!r})"
 
 
 def git_call(seg: Segment) -> Optional[GitCall]:

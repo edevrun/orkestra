@@ -82,6 +82,7 @@ a { color: var(--accent-dark); }
 h1, h2, p { margin-top: 0; }
 h1 { max-width: 720px; margin-bottom: 12px; font-size: clamp(34px, 5vw, 56px); line-height: 1.04; letter-spacing: -.055em; }
 h1 span { color: var(--accent-dark); }
+h1 span.plain { color: inherit; }
 h2 { margin-bottom: 8px; font-size: 21px; line-height: 1.2; letter-spacing: -.025em; }
 .hero-copy { max-width: 660px; margin-bottom: 23px; color: var(--muted); font-size: 17px; }
 .phase-strip { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 11px; font-weight: 650; }
@@ -334,7 +335,7 @@ code { padding: 1px 4px; border-radius: 4px; background: var(--bg); font-size: .
     .local-tag { display: none; }
     .top-actions { gap: 6px; }
     .connection-status { max-width: 82px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-    #disconnect-button { padding-right: 7px; padding-left: 7px; font-size: 10px; }
+    #disconnect-button, #lang-button { padding-right: 7px; padding-left: 7px; font-size: 10px; }
   }
   .flow-project-name { overflow-wrap: anywhere; }
   .flow-summary { padding: 6px 8px; font-size: 9px; }

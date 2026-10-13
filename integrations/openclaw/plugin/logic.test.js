@@ -1,9 +1,14 @@
 // integrations/openclaw/plugin/logic.test.js — node --test logic.test.js
+// These assertions predate the English default and read the Turkish texts: pinned to Turkish like the Python suite
+// (plugins/orkestra/tests/helpers.py). English, both-language and language-resolution cases: logic.i18n.test.js,
+// lang.test.js, messages.test.js.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
   diffJobs, expandOptionReply, findOpenRun, formatBusyProject, formatNotification, formatStatus, parseJobRef, parseSentMessageIds,
 } from "./logic.js";
+
+process.env.ORKESTRA_LANG = "tr";
 
 const JOB = "0123456789ab";
 

@@ -22,6 +22,13 @@ First-time setup: [ONBOARDING.md](ONBOARDING.md).
    ```
 7. **No git commit, push, deploy, or store upload** unless the human asks in that message.
 8. **Language.** Reply to the user in Turkish when they write Turkish; code comments and model-facing text stay English.
+9. **Localization.** Human-facing text (dashboards, `watch`, notifications, run artifacts, installers, bridge replies,
+   `--help`) lives in the English and Turkish catalogs `plugins/orkestra/lib/orkestra_core/messages/*.py` and is read with
+   `i18n.t(...)`; the only other tables are `bridge/ui/i18n.js`, `integrations/openclaw/plugin/messages.js` and the
+   installers' own message pairs. Protocol tokens (section headings, AskUserQuestion headers and options) are accepted in
+   both languages by every parser (`messages/protocol.py`), and intent vocabulary only grows. The plugin suite is pinned to
+   Turkish (`tests/helpers.py` sets `ORKESTRA_LANG=tr`), so new tests set `ORKESTRA_LANG=en` and `tr` explicitly. A new
+   language follows "Adding a language" in CONTRIBUTING.md.
 
 ## Out of scope here
 

@@ -1,0 +1,115 @@
+name: Bug report / Hata bildirimi
+description: Report a defect in Orkestra (guards, CLI, engines, bridge, installers, docs). English or Turkish is fine.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Write in English or Turkish (Türkçe de olur).
+
+        **Security problems** (a guard bypass, a forged approval, a hook that leaks data) do not belong in a public issue.
+        Use [private reporting](https://github.com/soft-ai-solutions/orkestra/security/advisories/new) and read
+        [SECURITY.md](https://github.com/soft-ai-solutions/orkestra/blob/main/SECURITY.md) first.
+
+        Do **not** paste API keys, bridge tokens, `.env` contents or private project paths.
+  - type: input
+    id: version
+    attributes:
+      label: Orkestra version
+      description: Output of `orkestra --version`, or the release tag or commit if you run from a checkout.
+      placeholder: orkestra 1.6.0
+    validations:
+      required: true
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      description: Which agent was driving the run, or which part of Orkestra is affected.
+      options:
+        - Claude Code
+        - Cursor
+        - GitHub Copilot
+        - Bridge (Telegram, n8n, OpenClaw or the local web UI)
+        - Installer (install.sh, install.ps1, install.py)
+        - Not engine-specific
+    validations:
+      required: true
+  - type: input
+    id: host_version
+    attributes:
+      label: Engine or host version
+      description: For example the output of `claude --version`, the Cursor CLI or IDE version, or the Copilot CLI or VS Code version.
+    validations:
+      required: false
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - macOS
+        - Linux
+        - Windows (native)
+        - Windows (WSL)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python3 --version` (Windows, `py -3 --version`).
+      placeholder: Python 3.12.4
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: Output of `orkestra doctor`
+      description: Paste the whole output. It shows the Python, git, hook and engine checks and the language in use.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands or chat messages, in order. A minimal repro in a fresh folder is best.
+      placeholder: |
+        1.
+        2.
+        3.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead. Include the exact message, and the language it appeared in if that matters.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and evidence
+      description: |
+        Relevant `orkestra status` output, a snippet of `~/.orkestra/logs/hooks.log` or of the run's `activity.jsonl`.
+        Redact secrets.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched the existing issues and the FAQ in the README.
+          required: true
+        - label: I removed secrets, tokens and private paths from everything I pasted.
+          required: true

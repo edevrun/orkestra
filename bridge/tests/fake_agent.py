@@ -48,19 +48,29 @@ def fire(event, **fields):
             out.unlink(missing_ok=True)
         except OSError:
             pass
+        if os.name == "nt":
+            spawn = (
+                "flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)\n"
+                "cp = subprocess.run(cmd, shell=True, input=payload, capture_output=True, text=True, env=env, creationflags=flags)\n"
+                "open(out, 'w', encoding='utf-8').write(cp.stdout or '')\n"
+            )
+        else:
+            spawn = (
+                "if os.fork() == 0:\n"
+                "    os.setsid()\n"
+                "    if os.fork() == 0:\n"
+                "        cp = subprocess.run(cmd, shell=True, input=payload, capture_output=True, text=True, env=env)\n"
+                "        open(out, 'w', encoding='utf-8').write(cp.stdout or '')\n"
+                "        os._exit(0)\n"
+                "    os._exit(0)\n"
+                "os.wait()\n"
+            )
         script = (
             "import os, subprocess, sys, time\n"
             f"out, cmd, payload = {str(out)!r}, {entry['command']!r}, {json.dumps(json.dumps(payload))}\n"
             f"drop = {drop!r}\n"
             "env = {k: v for k, v in os.environ.items() if k not in drop}\n"
-            "if os.fork() == 0:\n"
-            "    os.setsid()\n"
-            "    if os.fork() == 0:\n"
-            "        cp = subprocess.run(cmd, shell=True, input=payload, capture_output=True, text=True, env=env)\n"
-            "        open(out, 'w', encoding='utf-8').write(cp.stdout or '')\n"
-            "        os._exit(0)\n"
-            "    os._exit(0)\n"
-            "os.wait()\n"
+            + spawn
         )
         subprocess.run([sys.executable, "-c", script], check=False, timeout=60)
         for _ in range(200):

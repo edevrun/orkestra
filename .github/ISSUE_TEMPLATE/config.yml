@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability / Güvenlik açığı bildir
+    url: https://github.com/soft-ai-solutions/orkestra/security/advisories/new
+    about: A guard bypass, a forged approval or a hook that leaks data goes through private reporting. Please do not open a public issue. Read SECURITY.md first.
+  - name: Security policy / Güvenlik politikası
+    url: https://github.com/soft-ai-solutions/orkestra/blob/main/SECURITY.md
+    about: What counts as a vulnerability, what to include, and what Orkestra does and does not protect against.
+  - name: Troubleshooting / Sorun giderme
+    url: https://github.com/soft-ai-solutions/orkestra/blob/main/README.md#faq-and-troubleshooting
+    about: Run `orkestra doctor` first. The FAQ covers the common installation and PATH problems (Türkçe README.tr.md içinde).

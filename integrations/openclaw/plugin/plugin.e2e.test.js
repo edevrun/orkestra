@@ -10,6 +10,10 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 import { fileURLToPath } from "node:url";
 
+// The assertions below predate the English default and read Turkish texts: the plugin, the bridge and the CLI it
+// spawns all inherit this. The English side of the same flow is the last test; logic/index tests cover the rest.
+process.env.ORKESTRA_LANG = "tr";
+
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const ORKESTRA = path.resolve(HERE, "../../..");
 const BRIDGE = path.join(ORKESTRA, "bridge/orkestra_bridge.py");
@@ -98,7 +102,7 @@ before(async () => {
   // Plugin copy whose `openclaw/plugin-sdk/*` import resolves to the installed OpenClaw.
   const pluginDir = path.join(tmp, "plugin");
   fs.mkdirSync(path.join(pluginDir, "node_modules"), { recursive: true });
-  for (const f of ["index.js", "logic.js", "client.js", "package.json"]) {
+  for (const f of ["index.js", "logic.js", "client.js", "lang.js", "messages.js", "package.json"]) {
     fs.copyFileSync(path.join(HERE, f), path.join(pluginDir, f));
   }
   fs.symlinkSync(
@@ -225,8 +229,9 @@ after(async () => {
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
-test("registers /yap, /durum, /iptal, before_dispatch and the notifier", { skip: E2E_SKIP }, () => {
-  assert.deepEqual(Object.keys(commands).sort(), ["durum", "iptal", "yap"]);
+test("registers /yap, /durum, /iptal (and their English names), before_dispatch and the notifier", { skip: E2E_SKIP }, () => {
+  // Each Turkish command also exists as /run, /runs and /cancel (/status is reserved by OpenClaw itself).
+  assert.deepEqual(Object.keys(commands).sort(), ["cancel", "durum", "iptal", "run", "runs", "yap"]);
   assert.equal(typeof hooks.before_dispatch, "function");
   assert.equal(service.id, "orkestra-bridge-notifier");
   for (const def of Object.values(commands)) {
@@ -414,6 +419,20 @@ test("full flow: /yap → question → reply-to with a letter → that job gets 
     () => sent.find((m) => m.includes(`iş ${jobId}`) && m.includes("İptal")),
     "cancel notice",
   );
+});
+
+test("the same plugin speaks English when asked to, and refuses the busy desktop project in English", { skip: E2E_SKIP }, async () => {
+  process.env.ORKESTRA_LANG = "en";
+  try {
+    const status = (await commands.runs.handler({})).text;
+    assert.match(status, /^🎼 Orkestra status\nOpen runs \(1\):\n• demo2: masaüstü işi\n/);
+    assert.doesNotMatch(status, /Açık run/);
+    const busy = (await commands.run.handler({ args: "demo2 another job" })).text;
+    assert.match(busy, /^⛔ Not started: project \[demo2\] already has an open Orkestra run: "masaüstü işi"/);
+    assert.match((await commands.run.handler({ args: "" })).text, /^Usage: \/run /);
+  } finally {
+    process.env.ORKESTRA_LANG = "tr";
+  }
 });
 
 test("a restarted notifier does not repeat old notifications", { skip: E2E_SKIP }, async () => {

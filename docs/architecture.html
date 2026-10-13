@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Orkestra: architecture and flow</title>
+<link rel="alternate" hreflang="tr" href="orkestra-mimari.html">
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--fg:#1b2130;--mut:#667085;--line:#e2e5ea;--soft:#eef0f4;--acc:#4338ca;--acc-soft:#eef0ff;
+--ok:#15803d;--ok-soft:#e8f6ec;--warn:#b45309;--warn-soft:#fdf3e1;--bad:#b91c1c;--bad-soft:#fdecec;--unk:#475569;--unk-soft:#eef1f5}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1117;--card:#161b24;--fg:#e7eaf0;--mut:#98a2b3;--line:#272e3a;--soft:#1e2531;
+--acc:#a5b4fc;--acc-soft:#1f2440;--ok:#4ade80;--ok-soft:#12291b;--warn:#fbbf24;--warn-soft:#2e2410;--bad:#f87171;--bad-soft:#321616;--unk:#cbd5e1;--unk-soft:#1f2632}}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+a{color:var(--acc)}
+code{font:13px/1.4 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;background:var(--soft);padding:1px 5px;border-radius:5px;overflow-wrap:anywhere}
+header{padding:36px 20px 8px;max-width:1160px;margin:0 auto}
+h1{font-size:30px;line-height:1.2;margin:0 0 8px;letter-spacing:-.01em}
+.lead{font-size:17px;color:var(--mut);max-width:820px;margin:0}
+.meta{margin-top:14px;font-size:13px;color:var(--mut)}
+nav{position:sticky;top:0;z-index:5;background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+nav div{max-width:1160px;margin:0 auto;padding:10px 20px;display:flex;gap:6px 16px;flex-wrap:wrap;font-size:13px}
+nav a{text-decoration:none;color:var(--mut);font-weight:600}
+nav a:hover{color:var(--acc)}
+main{max-width:1160px;margin:0 auto;padding:8px 20px 64px}
+section{margin-top:36px;scroll-margin-top:56px}
+h2{font-size:21px;margin:0 0 4px;letter-spacing:-.005em}
+h3{font-size:15px;margin:0 0 8px}
+.sub{color:var(--mut);margin:0 0 14px;max-width:860px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px 20px}
+.grid{display:grid;gap:14px}
+.g2{grid-template-columns:repeat(2,minmax(0,1fr))}
+.g4{grid-template-columns:repeat(4,minmax(0,1fr))}
+@media(max-width:820px){.g2{grid-template-columns:minmax(0,1fr)}.g4{grid-template-columns:repeat(2,minmax(0,1fr))}h1{font-size:25px}}
+.card,.stat{min-width:0}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+.stat b{display:block;font-size:26px;line-height:1.1;font-variant-numeric:tabular-nums}
+.stat span{color:var(--mut);font-size:13px}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th{text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--mut);padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:9px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+tr:last-child td{border-bottom:0}
+td.n{font-variant-numeric:tabular-nums;white-space:nowrap}
+.chip{display:inline-block;font-size:12px;font-weight:700;padding:2px 9px;border-radius:999px;white-space:nowrap}
+.c-ok{background:var(--ok-soft);color:var(--ok)}.c-warn{background:var(--warn-soft);color:var(--warn)}
+.c-bad{background:var(--bad-soft);color:var(--bad)}.c-unk{background:var(--unk-soft);color:var(--unk)}.c-acc{background:var(--acc-soft);color:var(--acc)}
+ul{margin:0;padding-left:20px}li{margin:4px 0}
+.note{border-left:4px solid var(--acc);background:var(--acc-soft);border-radius:8px;padding:10px 14px;margin-top:14px}
+.note.warn{border-color:var(--warn);background:var(--warn-soft)}
+details{margin-top:14px}summary{cursor:pointer;font-weight:600;color:var(--acc)}
+pre{background:var(--soft);border-radius:10px;padding:12px 14px;overflow-x:auto;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin:0}
+/* phase rail */
+.rail{display:flex;gap:6px;min-width:980px;align-items:stretch}
+.ph{flex:1;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px 8px;text-align:center;position:relative}
+.ph .num{font-size:11px;color:var(--mut);font-variant-numeric:tabular-nums}
+.ph .nm{font-weight:700;font-size:13px;margin:2px 0}
+.ph .tr{font-size:12px;color:var(--mut)}
+.ph .who{font-size:11px;margin-top:6px;color:var(--mut);line-height:1.3}
+.ph.you{border-color:var(--warn);background:var(--warn-soft)}
+.ph.you .nm{color:var(--warn)}
+.ph.code{border-color:var(--acc)}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin-top:10px}
+.dot{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px;border:1px solid var(--line)}
+/* svg */
+svg text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.bx{fill:var(--card);stroke:var(--line);stroke-width:1.2}
+.bx-acc{fill:var(--acc-soft);stroke:var(--acc);stroke-width:1.4}
+.bx-soft{fill:var(--soft);stroke:var(--line);stroke-width:1}
+.bx-big{fill:none;stroke:var(--mut);stroke-width:1.2;stroke-dasharray:5 4}
+.t{fill:var(--fg);font-size:14px;font-weight:700}
+.s{fill:var(--mut);font-size:12px}
+.sa{fill:var(--acc);font-size:12px;font-weight:600}
+.ar{stroke:var(--mut);stroke-width:1.5;fill:none}
+.ard{stroke:var(--mut);stroke-width:1.3;fill:none;stroke-dasharray:4 4}
+.langsw{margin:0 0 10px;font-size:13px;color:var(--mut)}
+footer{max-width:1160px;margin:0 auto;padding:0 20px 48px;color:var(--mut);font-size:13px}
+</style>
+</head>
+<body>
+<header>
+  <p class="langsw">English · <a href="orkestra-mimari.html" hreflang="tr" lang="tr">Türkçe</a></p>
+  <h1>Orkestra: architecture and flow</h1>
+  <p class="lead">Orkestra is a plugin for Claude Code, Cursor and GitHub Copilot: it takes a development request through discovery, questions, a plan, your approval, test-first implementation, verification, review and delivery. It does not leave the rules to the model's goodwill; a command line tool and hooks enforce them.</p>
+  <p class="meta">Version 1.6.0 · This page was brought back in line with the code on 12 October 2026 (two languages, Copilot, Windows, installers; first written on 4 October). Run statistics, the hook test and the issue table date from 4-5 October and are marked as such · Live view: <code>orkestra dashboard --open</code></p>
+</header>
+<nav><div>
+  <a href="#summary">Summary</a><a href="#architecture">Architecture</a><a href="#engines">Three engines</a><a href="#flow">Flow</a><a href="#team">Agent team</a>
+  <a href="#guards">Guards</a><a href="#tempo">Tempo and resume</a><a href="#scope">Scope: which requests go through?</a><a href="#evidence">Evidence</a>
+  <a href="#files">Files</a><a href="#monitoring">Monitoring</a><a href="#runs">Recent runs</a><a href="#issues">Issues and their status</a>
+</div></nav>
+<main>
+
+<section id="summary">
+  <div class="grid g4">
+    <div class="stat"><b>10</b><span>phases, the order is fixed by code</span></div>
+    <div class="stat"><b>8</b><span>specialist subagents</span></div>
+    <div class="stat"><b>10</b><span>hook events, one entry point</span></div>
+    <div class="stat"><b>3</b><span>engines: Claude Code, Cursor, Copilot</span></div>
+  </div>
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card">
+      <h3>What it does</h3>
+      <ul>
+        <li>You write the request: <code>/orkestra:run add CSV export to the shop</code></li>
+        <li>It learns the project, asks only the questions that change the outcome, and writes <code>spec.md</code> and <code>plan.md</code>.</li>
+        <li>Not one line of source code can be written until the plan is approved.</li>
+        <li>Every task is closed with evidence of a failing test first and a passing test after.</li>
+        <li>Every check that passed at the start (tests, lint, types, build) must still pass at the end.</li>
+        <li>After an independent review and an adversarial test it writes the report and updates the project memory.</li>
+        <li>It speaks two languages: output, document templates and <code>--help</code> are English or Turkish (<code>orkestra lang</code>).</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>What it does not do</h3>
+      <ul>
+        <li>It does not commit, push, branch or open a PR unless you ask for it in that very message.</li>
+        <li>It does not run deploys, store uploads or production database changes.</li>
+        <li>It does not read or write <code>.env</code> and key files.</li>
+        <li>During a run it does not write to another project and does not install unapproved packages.</li>
+        <li>It does not promise 100% correctness: the aim is that a gate, a hook or a review catches the mistake before it reaches the codebase.</li>
+        <li>It does not supervise tools other than Claude Code, Cursor and Copilot; in Cursor only the chats that carry an orkestra run. See <a href="#engines">Three engines</a> and <a href="#scope">Scope</a>.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="architecture">
+  <h2>Architecture</h2>
+  <p class="sub">Four parts work together: the orchestrator (the run skill) drives the work, the CLI keeps state and evidence, hooks check every tool call, and the agent team does the pieces of the job. State lives in files, not in the model's memory.</p>
+  <div class="card scroll">
+  <svg viewBox="0 0 1120 580" width="100%" style="min-width:920px" role="img" aria-label="Orkestra architecture diagram">
+    <defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--mut)"/></marker></defs>
+
+    <text class="s" x="16" y="22">ENTRY POINTS</text>
+    <rect class="bx" x="16" y="34" width="220" height="64" rx="10"/>
+    <text class="t" x="28" y="60">Agent chat</text><text class="s" x="28" y="80">/orkestra:run · /orkestra-run</text>
+    <rect class="bx" x="16" y="150" width="220" height="44" rx="10"/><text class="t" x="28" y="177">Telegram  /run · /yap …</text>
+    <rect class="bx" x="16" y="204" width="220" height="44" rx="10"/><text class="t" x="28" y="231">n8n webhook</text>
+    <rect class="bx" x="16" y="258" width="220" height="44" rx="10"/><text class="t" x="28" y="285">OpenClaw</text>
+
+    <rect class="bx-soft" x="268" y="166" width="150" height="120" rx="10"/>
+    <text class="t" x="280" y="192">bridge</text><text class="s" x="280" y="212">127.0.0.1:47615</text>
+    <text class="s" x="280" y="238">headless session:</text><text class="s" x="280" y="256">claude -p · agent -p</text><text class="s" x="280" y="274">copilot -p …</text>
+
+    <rect class="bx-big" x="450" y="24" width="400" height="300" rx="14"/>
+    <text class="s" x="464" y="46">SESSION: CLAUDE CODE · CURSOR · COPILOT</text>
+    <rect class="bx" x="470" y="58" width="360" height="56" rx="10"/>
+    <text class="t" x="482" y="82">Orchestrator: the run skill</text><text class="s" x="482" y="101">runs the phases in order, calls the agents</text>
+    <rect class="bx" x="470" y="124" width="360" height="62" rx="10"/>
+    <text class="t" x="482" y="148">Agent team (8 subagents)</text>
+    <text class="s" x="482" y="166">scout · researcher · architect · plan-critic</text>
+    <text class="s" x="482" y="181">implementer · reviewer · adversary · verifier</text>
+    <rect class="bx-acc" x="470" y="198" width="360" height="112" rx="10"/>
+    <text class="t" x="482" y="221">Hooks: hooks/dispatch.py</text>
+    <text class="s" x="482" y="241">UserPromptSubmit: git permission, approval record</text>
+    <text class="s" x="482" y="258">PreToolUse: guard decision (allow / deny) + backup</text>
+    <text class="s" x="482" y="275">PostToolUse: session binding, answers, touched file</text>
+    <text class="s" x="482" y="292">Stop / SubagentStop: no leaving the work half done</text>
+
+    <rect class="bx" x="882" y="24" width="222" height="300" rx="14"/>
+    <text class="t" x="896" y="50">orkestra CLI</text>
+    <text class="s" x="896" y="74">state machine (10 phases)</text>
+    <text class="s" x="896" y="94">phase transition preconditions</text>
+    <text class="s" x="896" y="114">gates: baseline → verify</text>
+    <text class="s" x="896" y="134">TDD evidence: red → green</text>
+    <text class="s" x="896" y="154">integrity and traceability</text>
+    <text class="s" x="896" y="174">plan / review / deps checks</text>
+    <text class="s" x="896" y="194">memory · report · rollback</text>
+    <text class="s" x="896" y="214">playbook · template · doctor</text>
+    <text class="sa" x="896" y="246">The model cannot skip these gates:</text>
+    <text class="sa" x="896" y="263">`phase next` refuses until</text>
+    <text class="sa" x="896" y="280">the conditions hold.</text>
+
+    <rect class="bx" x="16" y="372" width="402" height="96" rx="12"/>
+    <text class="t" x="28" y="398">Project source code</text>
+    <text class="s" x="28" y="420">Changed by Edit / Write / Bash and MCP editing tools.</text>
+    <text class="s" x="28" y="438">Every call passes the PreToolUse guard first;</text>
+    <text class="s" x="28" y="456">a file is backed up before its first change.</text>
+
+    <rect class="bx" x="450" y="372" width="400" height="96" rx="12"/>
+    <text class="t" x="462" y="398">&lt;project&gt;/.orkestra/</text>
+    <text class="s" x="462" y="420">features/NNN-…  request, spec, plan, ledger, review, report</text>
+    <text class="s" x="462" y="438">runs/  state.json, activity.jsonl, evidence logs, backups</text>
+    <text class="s" x="462" y="456">memory/  project memory  ·  config.json  gate commands</text>
+
+    <rect class="bx" x="882" y="372" width="222" height="96" rx="12"/>
+    <text class="t" x="896" y="398">~/.orkestra/</text>
+    <text class="s" x="896" y="420">config.json  guard switches</text>
+    <text class="s" x="896" y="438">sessions/  session ↔ run binding</text>
+    <text class="s" x="896" y="456">grants · logs/hooks.log</text>
+
+    <rect class="bx-soft" x="16" y="504" width="1088" height="60" rx="12"/>
+    <text class="t" x="28" y="529">Monitoring (read-only)</text>
+    <text class="s" x="28" y="549">orkestra watch · dashboard http://127.0.0.1:47616 · Telegram /status (/durum) · sources: state.json, activity.jsonl, ledger.md and the token counts in the session logs</text>
+
+    <path class="ar" marker-end="url(#ah)" d="M236 66H450"/>
+    <path class="ar" marker-end="url(#ah)" d="M236 172H268"/>
+    <path class="ar" marker-end="url(#ah)" d="M236 226H268"/>
+    <path class="ar" marker-end="url(#ah)" d="M236 280H268"/>
+    <path class="ar" marker-end="url(#ah)" d="M418 226H450"/>
+    <path class="ar" marker-start="url(#ah)" marker-end="url(#ah)" d="M830 86H882"/>
+    <text class="s" x="832" y="106">command</text>
+    <path class="ar" marker-end="url(#ah)" d="M470 290L340 372"/>
+    <text class="s" x="330" y="336">tool call</text>
+    <path class="ar" marker-end="url(#ah)" d="M650 310V372"/>
+    <text class="s" x="658" y="346">activity log, backup</text>
+    <path class="ar" marker-end="url(#ah)" d="M930 324L850 380"/>
+    <path class="ar" marker-end="url(#ah)" d="M1030 324V372"/>
+    <path class="ard" marker-end="url(#ah)" d="M650 504V468"/>
+    <text class="s" x="658" y="492">reads</text>
+  </svg>
+  </div>
+  <div class="note">Hooks <b>fail open</b> (Claude Code and Cursor): if an error occurs inside <code>dispatch.py</code> the session is not locked, the error is written to <code>~/.orkestra/logs/hooks.log</code> and the tool call is allowed. This keeps a guard error from stopping your work; the price is that the guard did not run at that moment. <b>In Copilot, <code>PreToolUse</code> fails closed</b>: if the hook crashes or the payload is invalid, the tool call is denied. Cursor and Copilot events are translated to the same handlers by <code>cursor_hook.py</code> and <code>copilot_hook.py</code>.</div>
+</section>
+
+<section id="engines">
+  <h2>Three engines: Claude Code, Cursor and Copilot</h2>
+  <p class="sub">A run is driven by Claude Code (the default), by Cursor (since 1.5.0) or by GitHub Copilot; you choose when you give the request. The state machine, gates, evidence and guards are one: there is no copy per engine, only one translator each for Cursor and Copilot events that feeds the same handlers (<code>hooks/cursor_hook.py</code>, <code>hooks/copilot_hook.py</code>).</p>
+  <div class="card scroll">
+  <table>
+    <tr><th>From</th><th>Claude (default)</th><th>Cursor</th><th>Copilot</th></tr>
+    <tr><td>Chat</td><td><code>/orkestra:run &lt;request&gt;</code></td><td><code>/orkestra-run &lt;request&gt;</code> (IDE or <code>agent</code>)</td><td><code>/orkestra:run &lt;request&gt;</code> (VS Code or Copilot CLI)</td></tr>
+    <tr><td>Terminal</td><td><code>orkestra run -p &lt;project&gt; "&lt;request&gt;"</code></td><td><code>orkestra run --engine cursor -p &lt;project&gt; "&lt;request&gt;"</code></td><td><code>orkestra run --engine copilot -p &lt;project&gt; "&lt;request&gt;"</code></td></tr>
+    <tr><td>Telegram</td><td><code>/run &lt;project&gt; &lt;request&gt;</code> (<code>/yap</code>)</td><td><code>/run cursor &lt;project&gt; &lt;request&gt;</code></td><td><code>/run copilot: &lt;project&gt; &lt;request&gt;</code></td></tr>
+    <tr><td>Bridge API</td><td><code>{"project", "request"}</code></td><td>extra field: <code>"engine": "cursor"</code></td><td>extra field: <code>"engine": "copilot"</code></td></tr>
+  </table>
+  </div>
+  <div class="grid g2" style="margin-top:14px">
+    <div class="card">
+      <h3>Behaviors measured in Cursor that shaped the design</h3>
+      <ul>
+        <li>Every subagent is a separate chat and its events carry no agent type: the main session's <code>Task</code> call is recorded, the subchat is matched by the text of its first message; its first calls arrive before the transcript exists and are judged by the role of the pending launch.</li>
+        <li>There is no AskUserQuestion: the question and the plan approval happen as text in the chat (<code>orkestra await</code>, you write <code>approve</code>, the hook records it).</li>
+        <li>In print mode (<code>agent -p</code>) no prompt or stop event arrives: the bridge and the watchdog report the prompt to the hook layer themselves.</li>
+        <li>The shell keeps its directory between calls but does not report it in the event: <code>cd</code> is tracked command by command; if it cannot be tracked, the next command has to start with an absolute <code>cd</code>.</li>
+        <li>A command that exits non-zero ends with a separate event (<code>postToolUseFailure</code>); there is no event for a subagent finishing, the return is inferred from the main session's next move.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Installation and limits</h3>
+      <ul>
+        <li><code>orkestra cursor install</code>: links skills and subagents into <code>~/.cursor</code>, adds hook entries to <code>~/.cursor/hooks.json</code> without touching your entries (backup first), puts the <code>orkestra</code> command on PATH. <code>uninstall</code> undoes it.</li>
+        <li>Cursor chats unrelated to an orkestra run are left alone. A chat that carried a run stays subject to the git / secrets / store rules after the run closes. For all Cursor chats: <code>engine.cursor.global_guards</code>.</li>
+        <li>Without the hooks installed, the bridge and the watchdog do not start a Cursor turn; <code>orkestra start</code> also does not work in a chat the hooks cannot see.</li>
+        <li>Tried with the command line tool on five real runs; the IDE window was not tried separately. There is no token counting for Cursor runs and no TDD warning for the implementer at finish time.</li>
+        <li><b>Self-approval:</b> in one trial the model ran the hook script itself and approved its own plan instead of waiting for approval. It was closed (command and file content checks + the hook recognizing that an agent started it + an explicit prohibition text), but the guards are not a sandbox.</li>
+        <li><b>Copilot:</b> <code>orkestra copilot install</code> writes the hook entries; you enable the Orkestra agent plugin and the <code>SessionStart</code>, <code>UserPromptSubmit</code>, <code>PreToolUse</code>, <code>PostToolUse</code> hooks in the host (VS Code or Copilot CLI) yourself. A Copilot session without hooks must not start a guarded run. Copilot CLI launches default to the model <code>gpt-6-luna</code> with reasoning effort <code>max</code>.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="flow">
+  <h2>Flow: how a request progresses</h2>
+  <p class="sub">Every phase transition is made with <code>orkestra phase next</code>. The CLI checks the conditions in the table; it prints the unmet condition and refuses the transition.</p>
+  <div class="scroll"><div class="rail">
+    <div class="ph"><div class="num">1</div><div class="nm">intake</div><div class="tr">intake</div><div class="who">orchestrator</div></div>
+    <div class="ph"><div class="num">2</div><div class="nm">discover</div><div class="tr">discovery</div><div class="who">scout, researcher</div></div>
+    <div class="ph"><div class="num">3</div><div class="nm">clarify</div><div class="tr">clarification</div><div class="who">questions to you</div></div>
+    <div class="ph"><div class="num">4</div><div class="nm">plan</div><div class="tr">plan</div><div class="who">architect, plan-critic</div></div>
+    <div class="ph you"><div class="num">5</div><div class="nm">approve</div><div class="tr">approval</div><div class="who">YOUR APPROVAL</div></div>
+    <div class="ph code"><div class="num">6</div><div class="nm">implement</div><div class="tr">implementation</div><div class="who">implementer, reviewer</div></div>
+    <div class="ph code"><div class="num">7</div><div class="nm">verify</div><div class="tr">verification</div><div class="who">gates, verifier</div></div>
+    <div class="ph code"><div class="num">8</div><div class="nm">review</div><div class="tr">review</div><div class="who">reviewer, adversary</div></div>
+    <div class="ph code"><div class="num">9</div><div class="nm">deliver</div><div class="tr">delivery</div><div class="who">report, memory</div></div>
+    <div class="ph"><div class="num">10</div><div class="nm">done</div><div class="tr">done</div><div class="who">&nbsp;</div></div>
+  </div></div>
+  <div class="legend"><span><span class="dot" style="background:var(--warn-soft);border-color:var(--warn)"></span>The only point that unlocks writing to source code</span><span><span class="dot" style="border-color:var(--acc)"></span>Phases in which source code can change</span><span><span class="dot"></span>Phases that can write only under <code>.orkestra/</code></span></div>
+
+  <div class="card scroll" style="margin-top:14px">
+  <table>
+    <tr><th>Phase</th><th>What happens</th><th>Condition to move on (checked by code)</th></tr>
+    <tr><td><b>intake</b></td><td>The request is restated in one sentence; type, size (XS/S/M/L), risk and affected surfaces are classified.</td><td><code>request.md</code> exists.</td></tr>
+    <tr><td><b>discover</b></td><td>Scouts map the relevant files; if needed the researcher verifies current documentation; the starting result of the gates (baseline) is recorded.</td><td><code>context.md</code> is filled; baseline gates are recorded.</td></tr>
+    <tr><td><b>clarify</b></td><td>Only questions that change the outcome are asked (at most 4 per call, at most 2 rounds). <code>spec.md</code> is written.</td><td><code>spec.md</code> exists, has a "Clarifications" section and FR/SC ids.</td></tr>
+    <tr><td><b>plan</b></td><td>The architect writes <code>plan.md</code> with atomic TDD tasks; the plan-critic tries to refute the plan.</td><td><code>orkestra plan check</code> is clean (the files in the plan are real); plan-critic verdict is PASS (the critic may be skipped on an XS run).</td></tr>
+    <tr><td><b>approve</b></td><td>The plan summary is shown and "Plan approval" is asked. The model cannot give the approval; only the hook records it.</td><td>An approval record exists and the spec/plan have not changed since the approval.</td></tr>
+    <tr><td><b>implement</b></td><td>Each task: failing test (red) → smallest code → passing test (green) → task review.</td><td>All tasks are closed; every task that needs TDD has green evidence.</td></tr>
+    <tr><td><b>verify</b></td><td><code>orkestra gate verify</code> re-runs all gates; the verifier ties every requirement to evidence.</td><td>No regression; no file changed since the last gate run; <code>verification.md</code> is PASS.</td></tr>
+    <tr><td><b>review</b></td><td>Reviewer and adversary look independently; every finding is decided as fix / defer / reject.</td><td><code>reviews/triage.md</code> exists, no open finding; the gates are green again after the fixes.</td></tr>
+    <tr><td><b>deliver</b></td><td><code>report.md</code> is written; the CLI builds its evidence block from machine data; memory is updated.</td><td>The report exists, the evidence block is untouched, there is an entry in <code>FEATURES.md</code>.</td></tr>
+  </table>
+  </div>
+  <div class="note">If a task review is <b>PASS</b> the task closes; minor notes do not reopen it, they move to the final review. <b>FAIL</b> reopens the task; if the same task gets a third FAIL, the decision is put to you. At every step <code>orkestra next</code> names the single next job (see <a href="#tempo">Tempo and resume</a>).</div>
+  <div class="note">The places where you intervene: the clarifying questions and the plan approval. Everything in between is autonomous. Commit and push are not part of the flow; they happen only if you call <code>/orkestra:ship</code> or ask for them explicitly in that message.</div>
+</section>
+
+<section id="team">
+  <h2>Agent team</h2>
+  <p class="sub">The orchestrator is the main session. Subagents work in a separate context, write the detail to a file and return with a few lines. Read-only agents are blocked by a guard from writing to source code.</p>
+  <div class="card scroll">
+  <table>
+    <tr><th>Agent</th><th>Model</th><th>Job</th><th>Where it may write</th></tr>
+    <tr><td><b>scout</b></td><td>haiku</td><td>Code map: relevant files, symbols, tests (can run in parallel)</td><td>run folder only</td></tr>
+    <tr><td><b>researcher</b></td><td>sonnet</td><td>Verification of current documentation for the installed version</td><td>run folder only</td></tr>
+    <tr><td><b>architect</b></td><td>opus</td><td><code>spec.md</code> and <code>plan.md</code></td><td>run folder only</td></tr>
+    <tr><td><b>plan-critic</b></td><td>opus</td><td>Tries to refute the plan before it reaches you</td><td>run folder only</td></tr>
+    <tr><td><b>implementer</b></td><td>sonnet</td><td>One task, strict TDD</td><td>project source code (task scope)</td></tr>
+    <tr><td><b>reviewer</b></td><td>opus</td><td>Spec conformance, correctness, regression risk</td><td>run folder only</td></tr>
+    <tr><td><b>adversary</b></td><td>opus</td><td>Edge cases, security, failure modes</td><td>run folder only</td></tr>
+    <tr><td><b>verifier</b></td><td>sonnet</td><td>Verification from the requirement backwards, <code>verification.md</code></td><td>run folder only</td></tr>
+  </table>
+  </div>
+</section>
+
+<section id="guards">
+  <h2>Guards: rules enforced by hooks</h2>
+  <p class="sub">There are two layers. The first runs in every session where the plugin is loaded. The second applies only in a session bound to a run. Nine guards (git, secrets, store, isolation, deploy, deps, phase, wait, dialogs) can be switched off one by one in <code>~/.orkestra/config.json</code>.</p>
+  <div class="grid g2">
+    <div class="card">
+      <h3><span class="chip c-acc">In every session</span> with or without a run</h3>
+      <ul>
+        <li><b>git</b>: add, commit, push, branch, merge, reset, stash run only if explicitly requested in that message; the permission does not carry over to the next message. <code>--no-verify</code>, force-push to main and git config changes never run.</li>
+        <li><b>secrets</b>: <code>.env*</code>, <code>*.p8</code>, <code>*.pem</code>, service-account JSON files, <code>.npmrc</code> with tokens etc. cannot be read, written or moved.</li>
+        <li><b>store</b>: <code>eas build</code> (non-local), <code>eas submit</code>, <code>eas update</code>, <code>expo publish</code> are blocked.</li>
+        <li><b>home</b>: <code>~/.orkestra</code> cannot be changed by the model.</li>
+        <li><b>rollback</b>: <code>orkestra rollback --yes</code> only on your explicit request.</li>
+        <li><b>complex</b>: a command with more than 200 distinct redirect targets or more than 2000 commands, or one whose check does not finish within the hook's deadline (6 s of CPU, 9 s of wall clock), is rejected. Reason: a hook that times out leaves the command unchecked.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3><span class="chip c-warn">Only during a run</span> in the bound session</h3>
+      <ul>
+        <li><b>phase</b>: source code cannot be written before the plan is approved.</li>
+        <li><b>isolation</b>: no writing outside the run's project (temporary folders excepted).</li>
+        <li><b>deps</b>: no package that the plan did not approve can be installed.</li>
+        <li><b>deploy</b>: deploy, publish, production migration, ssh and remote rsync do not run.</li>
+        <li><b>destructive</b>: recursive deletion (<code>rm -r</code>) with targets it cannot name, or anywhere but a dedicated temporary subfolder, does not run.</li>
+        <li><b>roles</b>: read-only agents write only their report; the implementer cannot use the orchestrator's commands.</li>
+        <li><b>internals</b>: no hand-written or scripted writes to machine state (<code>.orkestra/runs</code>); reading evidence and activity logs is allowed; after approval <code>spec.md</code> is frozen; the model cannot embed an answer anywhere in an approval question.</li>
+        <li><b>wait</b>: the main session cannot run <code>sleep</code> or a polling loop to wait for a subagent; it cannot poll the run's files in a loop.</li>
+        <li><b>dialogs</b>: commands that open a macOS system window on your screen (keychain password prompt, <code>osascript</code> dialog, <code>xcode-select --install</code>) do not run.</li>
+        <li><b>Stop</b>: if the model tries to end the turn while a run is active, it is continued by naming the next step (at most 2 times per message). If a subagent is running in the background or its report is on the way, the turn may end; the report arrives as a new message and continues the flow.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="note">How command lines are read: the guard reads <code>orkestra …</code> lines with the CLI's own parser, so what the guard sees is what runs (no option abbreviations). The command behind <code>orkestra tdd</code> and <code>orkestra evidence</code> passes the same guards. Redirections with no program (<code>exec 3&gt;file</code>, <code>&gt; file</code>) count as writes. Paths are compared case-insensitively (macOS disks do not distinguish case). Below <code>/tmp/&lt;folder&gt;</code> is deliberately exempt from isolation; the root itself (<code>/tmp/*</code>) is not.</div>
+</section>
+
+<section id="tempo">
+  <h2>Tempo and resuming without a break</h2>
+  <p class="sub">In the records of the five runs on 4-5 October, 12-34% of the wall clock was spent as "subagent finished, main session still in a waiting command". 1.4.0 removes that wait and makes the sub-step an interrupted run continues from computable from files.</p>
+  <div class="grid g2">
+    <div class="card">
+      <h3>How the wait went away</h3>
+      <ul>
+        <li>Claude Code runs subagents in the background; the report reaches the main session as a new message. Before, the Stop hook prevented the turn from ending, so the model waited in a <code>sleep</code> loop.</li>
+        <li>Hooks write every background agent they start to <code>.orkestra/runs/&lt;run&gt;/agents.json</code>. While an agent runs the turn may end; when the report arrives, the hook adds the next step to the message.</li>
+        <li>The record cannot park a run: it drops when the report arrives and when a session restarts; if there is no subagent trace for 10 minutes it does not count (<code>next</code> names the normal step and leaves a note).</li>
+        <li>Report messages do not count as user messages: they give no approval, no rejection and no git permission.</li>
+        <li>In headless work (<code>claude -p</code>, bridge) the process ends with the turn, so the waiting is done inside the turn.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Resuming where it stopped</h3>
+      <ul>
+        <li><code>orkestra next</code> gives the single next step. The task's sub-step (started · red exists · green is stale · waiting for review · review FAIL round N · review PASS) is derived from the state, the evidence and the review file; there is no separate "where was I" record.</li>
+        <li>The same state always gives the same answer: a task with evidence is not rewritten, the decision in the file is applied, questions and approvals are never answered for you.</li>
+        <li>Session start, <code>resume</code>, <code>context</code>, <code>status</code>, the Stop message and the arrival of a report use the same computation.</li>
+        <li>Calling <code>task start</code> and <code>task done</code> again writes nothing twice.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="card scroll" style="margin-top:14px">
+  <table>
+    <tr><th>Class</th><th>State</th><th>How it is recognized</th><th>What happens</th></tr>
+    <tr><td class="n">1</td><td>Waiting for you</td><td>An open question, approval, blocked, paused or turn ended</td><td>One notification after 5 minutes. It never continues in your place.</td></tr>
+    <tr><td class="n">2</td><td>Dead wait</td><td>A stopped subagent's report is 60 s overdue and the whole run was silent since</td><td>Notification; repeats after 30 minutes, 2 h, 8 h and a day, then stops.</td></tr>
+    <tr><td class="n">3</td><td>Hung command</td><td>A command has been open for 15 minutes (gate/test: 30 minutes) and no agent wrote any row since it started</td><td>Notification. The command is not killed.</td></tr>
+    <tr><td class="n">4</td><td>Silent session</td><td>No record for 10 minutes</td><td>Notification. A run started headless is resumed in the same session at most 3 times.</td></tr>
+    <tr><td class="n">5</td><td>Loop</td><td>The same guard denial or the same command 3 times; 3 review rounds on the same task</td><td>Shown as a flag next to the other classes.</td></tr>
+  </table>
+  </div>
+  <div class="note"><code>orkestra watch</code> and the dashboard show these classes; <code>orkestra watchdog</code> scans from outside the session and sends a desktop notification (macOS and Linux; on Windows use the webhook or the bridge), and Telegram too if the bridge is running. Automatic resume is only for runs started headless and never runs while a Claude process or bridge job of that session is alive. A run you drive from an interactive window is not resumed on its own; if you want, set <code>watchdog.auto_resume</code> to <code>all</code>. The thresholds are under <code>~/.orkestra/config.json</code> → <code>watchdog</code>. On macOS and Linux a fast watcher (<code>orkestra watchdog --status</code>) applies the same kind of plain predicates every 5 seconds without spending tokens.</div>
+</section>
+
+<section id="scope">
+  <h2>Scope: which of your AI requests go through orkestra control?</h2>
+  <p class="sub"><b>Not all of them.</b> Orkestra works in Claude Code sessions, in Cursor (after <code>orkestra cursor install</code>) and in GitHub Copilot (when the hooks are enabled). The full flow only starts once a run is started; in Cursor, chats that carry no run are not touched at all. Other AI tools do not go through orkestra.</p>
+  <div class="card scroll">
+  <table>
+    <tr><th>Where you make the request</th><th>Status</th><th>What applies</th><th>Basis</th></tr>
+    <tr><td><b>Claude Code</b>, with <code>/orkestra:run</code></td><td><span class="chip c-ok">Full</span></td><td>The 10-phase flow, plan approval, TDD evidence, gates and all guards.</td><td>The hook test (below) and the records of that day's 4 runs.</td></tr>
+    <tr><td><b>Telegram <code>/run</code> (<code>/yap</code>), n8n webhook, OpenClaw</b></td><td><span class="chip c-ok">Full</span></td><td>The bridge opens a headless Claude Code, Cursor or Copilot session; the same hooks run, and approval is recorded only from your "approve" reply.</td><td>README and the contract file (<code>integrations/openclaw/CONTRACT.md</code>); the bridge test suite. I did not try it live.</td></tr>
+    <tr><td><b>Claude Code</b>, a request typed without starting a run</td><td><span class="chip c-warn">Partial</span></td><td>Only the "every session" guards: git, secrets, store, <code>~/.orkestra</code>. There is <b>no</b> plan, approval, TDD, isolation, package or deploy control; code can change directly.</td><td>Hook test: the hook produced no output for the request message, a source file edit was allowed.</td></tr>
+    <tr><td>While a run is open, <b>a second Claude Code session in the same project</b></td><td><span class="chip c-warn">Partial</span></td><td>Run guards work only in the session bound to the run. The second session gets the note "there is an open run in this project; this session is not driving it, do not touch its files" at start, but it can change files. If a second session is bound to the same run, a warning is given.</td><td>Hook test: the edit by the unbound session was allowed.</td></tr>
+    <tr><td><b>Cursor Agent</b>, with <code>/orkestra-run</code>, <code>orkestra run --engine cursor</code> or <code>/run cursor</code></td><td><span class="chip c-ok">Full</span></td><td>The same 10-phase flow and the same guards; approval by writing <code>approve</code> in the chat. Since 1.5.0, needs <code>orkestra cursor install</code>.</td><td>Five XS runs with the real Cursor CLI (5 October): write-before-approval and unauthorized commit denied, subagent roles, approval record. The IDE window was not tried separately.</td></tr>
+    <tr><td><b>Cursor Agent</b>, a request typed without starting a run</td><td><span class="chip c-bad">None</span></td><td>Orkestra does not touch these chats (a deliberate default). Only the text rules of <code>AGENTS.md</code> and <code>.cursor/rules/</code> apply. If you want, <code>engine.cursor.global_guards: true</code> applies the git / secrets / store rules to all Cursor chats.</td><td>Hook test: allowed in an unbound chat without the orkestra module even being loaded.</td></tr>
+    <tr><td><b>Claude Code extension inside Cursor or VS Code</b></td><td><span class="chip c-unk">Unverified</span></td><td>It is a Claude Code session, so it is expected to behave like the Claude Code rows above.</td><td>I had no access to the Claude Code settings (<code>~/.claude</code>), so I could not prove it.</td></tr>
+    <tr><td><b>GitHub Copilot</b> (VS Code or Copilot CLI), with <code>/orkestra:run</code>, <code>orkestra run --engine copilot</code> or <code>/run copilot:</code>, with hooks enabled</td><td><span class="chip c-ok">Full</span></td><td>The same 10-phase flow and the same guards. <code>PreToolUse</code> fails closed (a hook crash denies the tool).</td><td><code>hooks/copilot_hook.py</code> and <code>orkestra copilot install</code> in the code; hook tests. Enabling the plugin in the host is manual; the IDE window was not tried separately by the maintainers.</td></tr>
+    <tr><td><b>A Copilot session without hooks</b></td><td><span class="chip c-bad">None</span></td><td>If the plugin and the hooks are not enabled, orkestra does not step in; a guarded run must not be started from such a session.</td><td><code>ONBOARDING.md</code> (Copilot host enable).</td></tr>
+    <tr><td><b>Codex, Gemini CLI, ChatGPT and the like</b></td><td><span class="chip c-bad">None</span></td><td>They have no connection to orkestra.</td><td>There is no integration for these tools in the orkestra code.</td></tr>
+    <tr><td><b>A Claude.ai chat and Cowork</b></td><td><span class="chip c-bad">None</span></td><td>They run in the cloud, the plugin is not loaded. Such a session could edit orkestra files without hitting any guard.</td><td>Direct observation (4 October).</td></tr>
+  </table>
+  </div>
+  <div class="note warn"><b>Important difference:</b> the model may pick the run skill by itself for a development request like "add X". That is not enforcement; it is a decision the model makes by looking at the skill description, and the README says plainly that a request typed without <code>/orkestra:run</code> gets only the every-session guards. If the model does not call the skill, the request is carried out without entering the flow. If you want every request to go through the flow, start it with <code>/orkestra:run</code>.</div>
+
+  <details>
+    <summary>How I tested: the 24-scenario hook test and its results (4 October, version 1.2.1)</summary>
+    <p class="sub" style="margin-top:10px">This table was run on 4 October. The only row that changed in 1.4.0 is "End the turn while a run is active": if a subagent runs in the background it is now allowed. In an isolated copy of that day's plugin code, with a temporary workspace and a temporary <code>~/.orkestra</code>, I sent real hook payloads to <code>dispatch.py</code>. Live runs and real settings were not touched. The then-current test suite also ran in the same copy: plugin 112/112, bridge 6/6.</p>
+    <div class="scroll"><table>
+      <tr><th>State</th><th>Scenario</th><th>Hook decision</th></tr>
+      <tr><td>No run</td><td>Request message: "add CSV export to the order list"</td><td>no output (not forced into the flow)</td></tr>
+      <tr><td>No run</td><td>Edit a source file</td><td><span class="chip c-warn">allow</span></td></tr>
+      <tr><td>No run</td><td>Write to another project</td><td><span class="chip c-warn">allow</span></td></tr>
+      <tr><td>No run</td><td><code>npm install left-pad</code></td><td><span class="chip c-warn">allow</span></td></tr>
+      <tr><td>No run</td><td><code>vercel deploy --prod</code></td><td><span class="chip c-warn">allow</span></td></tr>
+      <tr><td>No run</td><td><code>git commit</code></td><td><span class="chip c-ok">deny · git</span></td></tr>
+      <tr><td>No run</td><td><code>git push origin main</code></td><td><span class="chip c-ok">deny · git</span></td></tr>
+      <tr><td>No run</td><td><code>git commit</code> in the same message after saying "commit the changes"</td><td>allow (explicit request exists)</td></tr>
+      <tr><td>No run</td><td><code>git commit</code> again in the next message</td><td><span class="chip c-ok">deny · git</span> (permission does not carry over)</td></tr>
+      <tr><td>No run</td><td>Read <code>.env</code> (Read)</td><td><span class="chip c-ok">deny · secrets</span></td></tr>
+      <tr><td>No run</td><td><code>cat .env</code></td><td><span class="chip c-ok">deny · secrets</span></td></tr>
+      <tr><td>No run</td><td><code>eas submit -p ios</code></td><td><span class="chip c-ok">deny · store</span></td></tr>
+      <tr><td>No run</td><td>Write to <code>~/.orkestra/config.json</code></td><td><span class="chip c-ok">deny · home</span></td></tr>
+      <tr><td>No run</td><td>End the turn (Stop)</td><td>allow</td></tr>
+      <tr><td>Run open</td><td>Edit a source file before plan approval</td><td><span class="chip c-ok">deny · phase</span></td></tr>
+      <tr><td>Run open</td><td>Write to another project</td><td><span class="chip c-ok">deny · isolation</span></td></tr>
+      <tr><td>Run open</td><td><code>npm install left-pad</code></td><td><span class="chip c-ok">deny · deps</span></td></tr>
+      <tr><td>Run open</td><td><code>vercel deploy --prod</code></td><td><span class="chip c-ok">deny · deploy</span></td></tr>
+      <tr><td>Run open</td><td><code>git commit</code></td><td><span class="chip c-ok">deny · git</span></td></tr>
+      <tr><td>Run open</td><td>The scout agent writes to a source file</td><td><span class="chip c-ok">deny · roles</span></td></tr>
+      <tr><td>Run open</td><td>The model filled in the answer to the approval question itself</td><td><span class="chip c-ok">deny · internals</span></td></tr>
+      <tr><td>Run open</td><td>End the turn while a run is active (Stop)</td><td><span class="chip c-ok">blocked · continued</span></td></tr>
+      <tr><td>Run open</td><td>In the same project, another session not bound to the run edits a source file</td><td><span class="chip c-warn">allow</span></td></tr>
+      <tr><td>Run open</td><td>Another session starts (SessionStart)</td><td>warning: "there is an open run in this project"</td></tr>
+    </table></div>
+    <p class="sub" style="margin-top:10px">In the first attempt the "write to another project" scenario was allowed even with a run open, because I had set up the test area under <code>/tmp</code> (temporary folders are exempt from isolation). When I moved the area out of <code>/tmp</code> the expected denial came. The result in the table is from the second run.</p>
+  </details>
+</section>
+
+<section id="evidence">
+  <h2>Evidence layer and gates</h2>
+  <p class="sub">The sentence "I did it, I tested it" does not count as evidence. The CLI produces and stores the evidence; the model only runs the command.</p>
+  <div class="grid g2">
+    <div class="card">
+      <h3>Gates</h3>
+      <ul>
+        <li><code>orkestra init</code> finds the project's test, lint, type check and build commands and writes them to <code>.orkestra/config.json</code>.</li>
+        <li><b>baseline:</b> all of them run at the start of the run. Those that are already broken are recorded and not held against the run.</li>
+        <li><b>verify:</b> run again at the end. A gate that passed at the start and is broken at the end counts as a regression and the review phase cannot be entered.</li>
+        <li>If the project has no tests, this net does not exist either; the report writes that down as a risk.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Test-first (TDD) and integrity</h3>
+      <ul>
+        <li><code>orkestra tdd red</code> and <code>tdd green</code> run with the same command; if the test changes after red, green is refused (a justified <code>--why</code> goes into the report).</li>
+        <li>Deleted tests, added <code>skip/only/xfail</code>, <code>@ts-ignore</code>, <code>eslint-disable</code> are scanned; an exception is valid only if it is written in the approved plan.</li>
+        <li><code>verification.md</code> cannot cite a file or test name that does not exist.</li>
+        <li>The CLI writes the evidence section of the report; if it is edited by hand, the closing is refused.</li>
+        <li>A backup of every changed file from before the run is kept; <code>/orkestra:rollback</code> restores them without touching git.</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<section id="files">
+  <h2>File layout</h2>
+  <div class="grid g2">
+    <div class="card">
+      <h3>The Orkestra repository</h3>
+<pre>$ORKESTRA_ROOT/
+  plugins/orkestra/
+    skills/      run, status, resume, onboard, rollback, ship
+    skills/run/references/   phase playbooks + optional
+                 checklists (security, stack-web,
+                 stack-mobile, data, ui-flow)
+    agents/      8 agent definitions
+    hooks/       hooks.json, run_hook.sh, dispatch.py,
+                 cursor_hook.py, copilot_hook.py
+    lib/orkestra_core/   the CLI and its parser, guards,
+                 gates, evidence, state, tempo and next
+                 step, watchdog, monitoring, token usage,
+                 i18n.py + messages/ (EN/TR catalogs)
+    templates/   en/ and tr/: spec, plan, report, memory templates
+    vendor/      pinned references (never loaded automatically)
+    cursor/      Cursor skill and subagent files (GENERATED:
+                 orkestra cursor build)
+    tests/       the plugin test suite (+ real Cursor payloads: fixtures/)
+  bridge/        Telegram / n8n / OpenClaw bridge, local UI, its tests
+  integrations/  OpenClaw plugin and contract (CONTRACT.md, CONTRACT.tr.md)
+  docs/          this page (English) and orkestra-mimari.html (Turkish)
+  dist/          release packages and pre-change backups
+  install.sh · install.ps1 · install.py
+  README.md · README.tr.md · ONBOARDING.md · ORKESTRA.md · ORKESTRA.tr.md
+  CONTRIBUTING.md · SECURITY.md · THIRD_PARTY_NOTICES.md · CHANGELOG.md</pre>
+    </div>
+    <div class="card">
+      <h3>In every project</h3>
+<pre>&lt;project&gt;/.orkestra/
+  config.json          gate commands
+  current -&gt;           folder of the open run (shortcut)
+  features/NNN-slug/   request, context, spec, plan,
+                       ledger, tasks/, reviews/,
+                       verification, report
+  runs/NNN-slug/       state.json, activity.jsonl (when full,
+                       activity.1.jsonl), agents.json,
+                       evidence logs, backups
+                       (not committed to git)
+  memory/
+    PROJECT.md         stack, structure, commands
+    FEATURES.md        every delivered run, one line
+    specs/*.md         current behavior per capability
+    DECISIONS.md       architecture decisions
+    LEARNINGS.md       lessons not to repeat</pre>
+    </div>
+  </div>
+</section>
+
+<section id="monitoring">
+  <h2>Monitoring</h2>
+  <div class="card scroll">
+  <table>
+    <tr><th>From</th><th>Command or address</th><th>What it shows</th></tr>
+    <tr><td>Browser</td><td><code>python3 $ORKESTRA_ROOT/plugins/orkestra/bin/orkestra dashboard --open</code><br>http://127.0.0.1:47616/</td><td>All open runs: phase, current state, task and evidence progress, gates, token usage, latest tool calls. This machine only, read-only.</td></tr>
+    <tr><td>Terminal</td><td><code>… orkestra watch</code> (<code>--once</code>, <code>--all</code>, <code>-p project</code>)</td><td>The same view, refreshed every 2 seconds.</td></tr>
+    <tr><td>In chat</td><td><code>/orkestra:status</code></td><td>Phase, tasks, evidence gaps, whether anything is waiting for you.</td></tr>
+    <tr><td>Next step</td><td><code>… orkestra next -p project</code></td><td>The single job to do, at most 3 lines. The same state always gives the same answer.</td></tr>
+    <tr><td>Time breakdown</td><td><code>… orkestra tempo -p project [--run id]</code></td><td>Phase durations, time per task, review rejects, measured share of dead wait. Works on finished runs too.</td></tr>
+    <tr><td>Scan from outside</td><td><code>… orkestra watchdog</code> (<code>--dry-run</code>, <code>--quiet</code>, <code>--launchd</code>)</td><td>The stall class of every open run; one notification per new event. If the bridge is running it runs by itself every minute.</td></tr>
+    <tr><td>Subagent records</td><td><code>… orkestra agents -p project</code></td><td>Subagents running in the background and those that left no trace; <code>agents clear</code> deletes the records of those that are gone.</td></tr>
+    <tr><td>Telegram</td><td><code>/status</code> (<code>/durum</code>)</td><td>Jobs and the live state of open runs.</td></tr>
+    <tr><td>Raw records</td><td><code>&lt;project&gt;/.orkestra/current/ledger.md</code><br><code>&lt;project&gt;/.orkestra/runs/*/activity.jsonl</code></td><td>Phase transitions and evidence lines; tool calls, guard denials, questions.</td></tr>
+  </table>
+  </div>
+</section>
+
+<section id="runs">
+  <h2>Recent runs</h2>
+  <p class="sub">As of 5 October 2026, 15:00, there was no open run. The five runs below ran on 4-5 October with 1.2.1; the numbers are the <code>orkestra tempo</code> output. The share of dead wait was measured over the last stored part of the activity log (about 3-4.5 hours).</p>
+  <div class="card scroll">
+  <table>
+    <tr><th>Project</th><th>Run</th><th>Size</th><th>Total time</th><th>Tasks</th><th>Review rejects</th><th>Dead wait</th></tr>
+    <tr><td><b>game-app</b></td><td>Completing the remaining work</td><td>L</td><td class="n">12 h 37 min</td><td class="n">28</td><td class="n">17</td><td class="n">29%</td></tr>
+    <tr><td><b>deals-app</b></td><td>Deep analysis and bug fixes</td><td>L</td><td class="n">6 h 57 min</td><td class="n">57</td><td class="n">67</td><td class="n">19%</td></tr>
+    <tr><td><b>mobile-app</b></td><td>All the suggested improvements</td><td>L</td><td class="n">5 h 55 min</td><td class="n">27</td><td class="n">13</td><td class="n">34%</td></tr>
+    <tr><td><b>mobile-app</b></td><td>Platform fixes</td><td>M</td><td class="n">5 h 58 min</td><td class="n">28</td><td class="n">19</td><td class="n">26%</td></tr>
+    <tr><td><b>mobile-app</b></td><td>Text fixes</td><td>M</td><td class="n">11 h 2 min</td><td class="n">62</td><td class="n">0</td><td class="n">12%</td></tr>
+  </table>
+  </div>
+  <div class="note">Total time includes waiting for approval (in the last run the approval phase took 5 h 18 min). 35 of the 116 review rejects contained only minor notes; since 1.4.0 these do not reopen the task. The effect of these changes on duration has not been measured yet: after the first run on 1.4.0, <code>orkestra tempo</code> gives the same figures.</div>
+</section>
+
+<section id="issues">
+  <h2>Issues and their status</h2>
+  <p class="sub">Problems found in the run records of 4 October and what 1.4.0 did about them. The fixes were ported while no run was open; each is tested, but none has been observed yet on a real run.</p>
+  <div class="card scroll">
+  <table>
+    <tr><th>Issue (4 October)</th><th>Status</th><th>What changed in 1.4.0</th></tr>
+    <tr><td><b>A wrong "reject" record.</b> Agent return messages were counted as user messages; an "Approve" with a note was recorded as a rejection.</td><td><span class="chip c-ok">Fixed</span></td><td>Report messages do not count as the user. Only the answer to the approval question is evaluated; the other answers in the same call are passed on as context.</td></tr>
+    <tr><td><b>Dead wait.</b> The main session waited for the agent in a loop.</td><td><span class="chip c-ok">Fixed</span></td><td>The turn may end while an agent runs; waiting commands are denied (<code>wait</code>).</td></tr>
+    <tr><td><b>Parallel implementation.</b> Two tasks ran together in the same folder.</td><td><span class="chip c-ok">Fixed</span></td><td>Two tasks whose files overlap cannot be started together (the <code>--force</code> reason is written to the ledger). Tasks with disjoint files can stay parallel; the running task's test file is not counted as a deviation meanwhile.</td></tr>
+    <tr><td><b>The review agent hit the guard</b> (16 "read-only" denials).</td><td><span class="chip c-warn">Partly</span></td><td>The denial message names <code>/tmp/&lt;folder&gt;</code> for experiments; the false denials for <code>2&gt;&amp;1</code>, macOS <code>sed -i ''</code> and scripts that read the evidence record were removed. <code>[[ a &gt; b ]]</code> and <code>(( n &gt; 100 ))</code> are still taken for writes (the option <code>guards.test_syntax</code> ships off).</td></tr>
+    <tr><td><b>A system window on screen.</b> A keychain test opened a password window.</td><td><span class="chip c-ok">Fixed</span></td><td>The <code>dialogs</code> guard and the agent rules. <code>scripts/lib/keychain-unlock.sh</code> in mobile-app also needs a separate review.</td></tr>
+    <tr><td><b>A plan that is too big.</b> 49 tasks in a single run.</td><td><span class="chip c-warn">Partly</span></td><td>A plan with more than 20 tasks gets a note suggesting a split. There is no enforcement; the decision is yours.</td></tr>
+    <tr><td><b>The "waiting for you" state.</b> The run stayed "active" while a question was open.</td><td><span class="chip c-ok">Fixed</span></td><td>When a question opens the run becomes <code>awaiting_user</code>; it clears when the question closes. Background agent rows do not hide the question.</td></tr>
+    <tr><td><b>Token cost.</b> 76-546 million cache reads per run.</td><td><span class="chip c-unk">Open</span></td><td>Only the measurement improved: the token value of a finished run is written to state. Nothing was changed to reduce it.</td></tr>
+    <tr><td><b>Too many review rounds.</b> 35 of 116 rejects were only minor notes.</td><td><span class="chip c-ok">Fixed</span></td><td>A task that gets PASS is not reopened; the third FAIL goes to the user.</td></tr>
+  </table>
+  </div>
+  <div class="card" style="margin-top:14px">
+    <h3>What remains open</h3>
+    <ul>
+      <li><b>The Cursor IDE window was not tried.</b> The Cursor engine was tried end to end with the command line tool (<code>agent</code>); the IDE uses the same hook contract but was not looked at separately.</li>
+      <li><b>An old orkestra copy also answers in Cursor.</b> Cursor also loads the copy (1.0.0) in Claude Code's plugin registry; that copy answers in Cursor chats with the old rules. <code>orkestra cursor status</code> shows it; <code>claude plugin update orkestra@orkestra-local</code> refreshes it (its effect on Claude Code was not tried).</li>
+      <li><b>Self-approval.</b> Seen in a real run and closed with three layers; a script that cleans its environment, detaches from its parent processes and hides names can still get around it. On the Claude Code side the hook has no "an agent started me" check.</li>
+      <li><b>The scope gaps remain.</b> A request typed without starting a run is not forced into the flow; a session not bound to the run can change source files; tools other than Claude Code, Cursor and Copilot are out of scope.</li>
+      <li><b>The wait guard is a nudge, not a security boundary.</b> It does not catch indirect waits such as <code>S=120; sleep $S</code>.</li>
+      <li><b>Variable and expansion indirection.</b> Guards read the command without running it; they cannot see a command stored inside <code>$X</code>. This was already so in 1.3.0.</li>
+      <li><b>The watchdog does not run by itself.</b> If the bridge is running it runs it; if not, you have to set it up with <code>orkestra watchdog --launchd</code>.</li>
+      <li><b>Windows is less exercised.</b> It is supported natively, but the maintainers have no Windows machine; the watchdog only notifies there and the Windows paths are covered by simulation and CI.</li>
+    </ul>
+  </div>
+</section>
+
+</main>
+<footer>
+  Sources: <code>README.md</code>, <code>hooks/dispatch.py</code>, <code>hooks/cursor_hook.py</code>, <code>hooks/copilot_hook.py</code>, <code>lib/orkestra_core/</code> (guards, shellparse, cliparse, runs, state, paths, cli, tempo, watchdog, activity, monitor, engines, cursorkit, shellcwd), the <code>skills/run/</code> playbooks, <code>agents/</code>, <code>CHANGELOG.md</code>, <code>CONTRIBUTING.md</code>; the projects' <code>.orkestra/</code> records and <code>orkestra tempo</code> output; a scan of the ~/Projects configuration; the 24-scenario hook test (4 October); five runs with the real Cursor CLI and the recorded hook payloads (5 October).
+  This file is static and affects no flow; it has to be updated as the orkestra code changes.
+</footer>
+</body>
+</html>

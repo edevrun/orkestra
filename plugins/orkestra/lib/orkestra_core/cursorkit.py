@@ -19,6 +19,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import engines as EN
+from . import i18n
+from .util import hook_python, replace_file
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent
 ASSETS = PLUGIN_ROOT / "cursor"
@@ -92,14 +94,17 @@ def stale(root: Optional[Path] = None) -> List[str]:
     return bad
 
 
-def build(root: Optional[Path] = None) -> List[str]:
+def build(root: Optional[Path] = None, dry: bool = False) -> List[str]:
+    """Regenerate the committed tree; returns the files written (with dry=True: the files that would be)."""
     root = root or ASSETS
     written = []
     for rel, text in expected().items():
         p = root / rel
         if not p.exists() or p.read_text(encoding="utf-8") != text:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(text, encoding="utf-8")
+            if not dry:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                with open(p, "w", encoding="utf-8", newline="\n") as fh:      # LF on every OS: the generated tree is committed
+                    fh.write(text)
             written.append(rel)
     return written
 
@@ -107,12 +112,8 @@ def build(root: Optional[Path] = None) -> List[str]:
 # ---------------------------------------------------------------- hooks.json
 
 def _python() -> str:
-    """The interpreter the hook commands name. Not a virtualenv's (it disappears with the venv): its base."""
-    if getattr(sys, "base_prefix", sys.prefix) != sys.prefix:
-        base = Path(sys.base_prefix) / "bin" / "python3"
-        if base.exists():
-            return str(base)
-    return shutil.which("python3") or sys.executable or "python3"
+    """The interpreter the hook commands name (util.hook_python: not a virtualenv's, never the Windows Store stub)."""
+    return hook_python()
 
 
 def hook_command(event: str, python: Optional[str] = None) -> str:
@@ -128,13 +129,13 @@ def _check_shape(doc: Any, where: str = "hooks.json") -> None:
     if doc is None:
         return
     if not isinstance(doc, dict):
-        raise EN.EngineError(f"{where} is not a JSON object — fix it first (nothing was changed)")
+        raise EN.EngineError(i18n.t("cli.kit_not_object", where=where))
     hooks = doc.get("hooks")
     if hooks is not None and not isinstance(hooks, dict):
-        raise EN.EngineError(f"{where}: \"hooks\" is not an object — fix it first (nothing was changed)")
+        raise EN.EngineError(i18n.t("cli.kit_hooks_not_object", where=where))
     for event, entries in (hooks or {}).items():
         if not isinstance(entries, list):
-            raise EN.EngineError(f"{where}: hooks.{event} is not a list — fix it first (nothing was changed)")
+            raise EN.EngineError(i18n.t("cli.kit_event_not_list", where=where, event=event))
 
 
 def _kept_python(entries: List[Any], event: str) -> Optional[str]:
@@ -193,15 +194,16 @@ def _write_hooks(hp: Path, doc: Dict[str, Any], actions: List[str], dry: bool) -
         while backup.exists():
             n += 1
             backup = target.with_name(f"hooks.json.orkestra-backup-{stamp}-{n}")
-        actions.append(f"backup {target} → {backup.name}")
+        actions.append(i18n.t("cli.kit_backup", target=target, backup=backup.name))
         if not dry:
             shutil.copy2(target, backup)
     if dry:
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + f".{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    os.replace(tmp, target)
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(json.dumps(doc, indent=2, ensure_ascii=False) + "\n")
+    replace_file(tmp, target)
 
 
 def _same(src: Path, dst: Path) -> bool:
@@ -225,14 +227,19 @@ def _link(src: Path, dst: Path, copy: bool, actions: List[str], dry: bool) -> No
                 shutil.rmtree(dst)
             else:
                 dst.unlink()
-    actions.append(f"{'copy' if copy else 'link'} {dst} → {src}")
+    actions.append(i18n.t("cli.kit_copy" if copy else "cli.kit_link", dst=dst, src=src))
     if dry:
         return
     dst.parent.mkdir(parents=True, exist_ok=True)
     if copy:
         (shutil.copytree if src.is_dir() else shutil.copy2)(src, dst)
     else:
-        os.symlink(src, dst)
+        try:
+            os.symlink(src, dst)
+        except OSError:
+            # Windows without Developer Mode (and rare POSIX) — fall back to a real copy.
+            (shutil.copytree if src.is_dir() else shutil.copy2)(src, dst)
+            actions[-1] = i18n.t("cli.kit_copy_nolink", dst=dst, src=src)
 
 
 def _targets() -> List[Tuple[Path, Path]]:
@@ -242,27 +249,88 @@ def _targets() -> List[Tuple[Path, Path]]:
     return out
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _default_shim_dir() -> str:
+    """ORKESTRA_SHIM_DIR, else ~/.local/bin; on Windows the per-user WindowsApps folder (on PATH out of the box) when it
+    exists, because ~/.local/bin is not on PATH there and is rarely created."""
+    env = os.environ.get("ORKESTRA_SHIM_DIR")
+    if env:
+        return env
+    if _is_windows():
+        apps = Path(os.environ.get("LOCALAPPDATA") or "~/AppData/Local").expanduser() / "Microsoft" / "WindowsApps"
+        if apps.is_dir():
+            return str(apps)
+    return "~/.local/bin"
+
+
 def shim_path() -> Path:
-    return Path(os.environ.get("ORKESTRA_SHIM_DIR") or "~/.local/bin").expanduser() / "orkestra"
+    return Path(_default_shim_dir()).expanduser() / "orkestra"
+
+
+def _orkestra_on_path() -> bool:
+    return bool(shutil.which("orkestra") or shutil.which("orkestra.cmd"))
+
+
+def _windows_cmd_body() -> str:
+    """The cmd.exe wrapper: CRLF, the active Python and the plugin's bin/orkestra."""
+    return f'@echo off\r\n"{sys.executable}" "{BIN}" %*\r\n'
+
+
+def _write_windows_cmd_shim(cmd_path: Path, dry: bool) -> None:
+    """Write a cmd.exe wrapper that invokes the plugin bin with the active Python."""
+    if dry:
+        return
+    with open(cmd_path, "w", encoding="utf-8", newline="") as fh:       # Path.write_text(newline=) is 3.10+; body has CRLF
+        fh.write(_windows_cmd_body())
+
+
+def _read_small(path: Path) -> str:
+    """Text of a small regular file, line endings untouched ('' when missing, large or unreadable)."""
+    try:
+        if path.is_file() and path.stat().st_size < 4096:
+            with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+                return fh.read()
+    except OSError:
+        pass
+    return ""
 
 
 def ensure_path_shim(*, dry: bool = False) -> List[str]:
-    """Ensure `orkestra` is reachable on PATH via a shim symlink (idempotent).
+    """Ensure `orkestra` is reachable on PATH via a shim (idempotent).
 
     Uses `shim_path()` / `ORKESTRA_SHIM_DIR`. No-op when the parent directory is missing or
-    `orkestra` is already found on PATH (dangling shims are still renewed). Returns the same
+    `orkestra` is already found on PATH (dangling shims are still renewed). On Windows writes
+    `orkestra.cmd` (symlink may be unavailable without Developer Mode). Returns the same
     style of action strings as `install`.
     """
     actions: List[str] = []
     shim = shim_path()
-    if not shutil.which("orkestra") and shim.parent.is_dir():
-        dangling = shim.is_symlink() and not shim.exists()
-        if dangling or not os.path.lexists(shim):
-            actions.append(f"link {shim} → {BIN}  (Cursor's shell needs `orkestra` on PATH)")
-            if not dry:
-                if dangling:
-                    shim.unlink()
+    if _orkestra_on_path() or not shim.parent.is_dir():
+        return actions
+    if _is_windows():
+        cmd_path = shim.parent / "orkestra.cmd"
+        have = _read_small(cmd_path)
+        # missing, or our own wrapper left by another Python / checkout (renewed); a file of the user's is left alone
+        if not cmd_path.exists() or (have != _windows_cmd_body() and "orkestra" in have.lower() and "%*" in have):
+            actions.append(i18n.t("cli.kit_write_cmd_shim", path=cmd_path, target=BIN))
+            _write_windows_cmd_shim(cmd_path, dry)
+        return actions
+    dangling = shim.is_symlink() and not shim.exists()
+    if dangling or not os.path.lexists(shim):
+        actions.append(i18n.t("cli.kit_link_shim", path=shim, target=BIN))
+        if not dry:
+            if dangling:
+                shim.unlink()
+            try:
                 os.symlink(BIN, shim)
+            except OSError:
+                # Rare POSIX environments without symlink privilege — fall back to a tiny wrapper.
+                shim.write_text(f"#!/usr/bin/env bash\nexec '{sys.executable}' '{BIN}' \"$@\"\n", encoding="utf-8")
+                shim.chmod(0o755)
+                actions[-1] = i18n.t("cli.kit_write_shim_wrapper", path=shim, target=BIN)
     return actions
 
 
@@ -270,18 +338,18 @@ def install(copy: bool = False, dry: bool = False) -> List[str]:
     """Idempotent. Returns what was (or with dry=True: would be) done."""
     actions: List[str] = []
     if stale():
-        raise EN.EngineError("plugins/orkestra/cursor is stale — run `orkestra cursor build` first")
+        raise EN.EngineError(i18n.t("cli.kit_stale"))
     home = cursor_home()
     hp = home / "hooks.json"
     cur = _read_json(hp)
     if (hp.exists() or hp.is_symlink()) and not isinstance(cur, dict):       # checked before anything is changed
-        raise EN.EngineError(f"{hp} is not valid JSON — fix it first (nothing was changed)")
+        raise EN.EngineError(i18n.t("cli.kit_bad_json", path=hp))
     new = merge_hooks(cur)
     for src, dst in _targets():
         _link(src, dst, copy, actions, dry)
     if new != cur:
         _write_hooks(hp, new, actions, dry)
-        actions.append(f"hooks.json: orkestra entries for {', '.join(HOOK_EVENTS)}")
+        actions.append(i18n.t("cli.kit_hooks_added", events=", ".join(HOOK_EVENTS)))
     actions.extend(ensure_path_shim(dry=dry))
     return actions
 
@@ -290,10 +358,12 @@ def uninstall(dry: bool = False) -> List[str]:
     actions: List[str] = []
     hp = cursor_home() / "hooks.json"
     cur = _read_json(hp)
+    if (hp.exists() or hp.is_symlink()) and not isinstance(cur, dict):       # as in install(): before anything is removed
+        raise EN.EngineError(i18n.t("cli.kit_bad_json", path=hp))
     new = strip_hooks(cur) if isinstance(cur, dict) else None      # a shape we do not understand: stop before any change
     for src, dst in _targets():
         if dst.is_symlink() or dst.exists():
-            actions.append(f"remove {dst}")
+            actions.append(i18n.t("cli.kit_remove", path=dst))
             if not dry:
                 if dst.is_dir() and not dst.is_symlink():
                     shutil.rmtree(dst)
@@ -301,12 +371,20 @@ def uninstall(dry: bool = False) -> List[str]:
                     dst.unlink()
     if new is not None and new != cur:
         _write_hooks(hp, new, actions, dry)
-        actions.append("hooks.json: orkestra entries removed")
+        actions.append(i18n.t("cli.kit_hooks_removed"))
     shim = shim_path()
-    if shim.is_symlink() and os.path.realpath(shim) == os.path.realpath(BIN):
-        actions.append(f"remove {shim}")
+    wrapper = _read_small(shim) if not shim.is_symlink() else ""       # the shell wrapper written where symlinks failed
+    if (shim.is_symlink() and os.path.realpath(shim) == os.path.realpath(BIN)) or (wrapper and str(BIN) in wrapper):
+        actions.append(i18n.t("cli.kit_remove", path=shim))
         if not dry:
             shim.unlink()
+    cmd_path = shim.parent / "orkestra.cmd"                               # Windows PATH shim written by ensure_path_shim
+    have = _read_small(cmd_path)
+    # only a wrapper of THIS checkout: the stable checkout's shim must survive uninstalling a development copy
+    if have and "orkestra" in have.lower() and "%*" in have and str(BIN) in have:
+        actions.append(i18n.t("cli.kit_remove", path=cmd_path))
+        if not dry:
+            cmd_path.unlink()
     return actions
 
 
@@ -356,20 +434,22 @@ def status(cfg: Optional[Dict[str, Any]] = None) -> List[Tuple[Optional[bool], s
     """[(ok | None = information only, label, detail)] — read-only."""
     rows: List[Tuple[bool, str, str]] = []
     b = EN.binary("cursor", cfg)
-    rows.append((bool(b), "cursor CLI (agent)", b or "not found — https://cursor.com/cli"))
-    rows.append((not stale(), "generated assets current", "" if not stale() else "run `orkestra cursor build`"))
+    rows.append((bool(b), "cursor CLI (agent)", b or i18n.t("cli.kit_cursor_cli_missing")))
+    rows.append((not stale(), "generated assets current", "" if not stale() else i18n.t("cli.kit_run_build")))
     missing = [str(dst) for src, dst in _targets()
                if not (dst.exists() and (os.path.realpath(dst) == os.path.realpath(src) or not dst.is_symlink()))]
-    rows.append((not missing, "skills and subagents installed", f"{len(missing)} missing" if missing else str(cursor_home())))
+    rows.append((not missing, "skills and subagents installed",
+                 i18n.t("cli.kit_n_missing", count=len(missing)) if missing else str(cursor_home())))
     doc = _read_json(cursor_home() / "hooks.json")
     hooks = doc.get("hooks") if isinstance(doc, dict) and isinstance(doc.get("hooks"), dict) else {}
     have = [e for e in HOOK_EVENTS if isinstance(hooks.get(e), list) and
             any(_is_ours(x) and str(HOOK_SCRIPT) in str(x.get("command")) for x in hooks[e])]
-    rows.append((len(have) == len(HOOK_EVENTS), "hooks.json entries", f"{len(have)}/{len(HOOK_EVENTS)} events"))
-    rows.append((bool(shutil.which("orkestra")), "`orkestra` on PATH", shutil.which("orkestra") or "not found (Cursor's shell cannot call the CLI)"))
+    rows.append((len(have) == len(HOOK_EVENTS), "hooks.json entries",
+                 i18n.t("cli.kit_n_events", have=len(have), total=len(HOOK_EVENTS))))
+    rows.append((bool(shutil.which("orkestra")), "`orkestra` on PATH",
+                 shutil.which("orkestra") or i18n.t("cli.kit_not_on_path")))
     old = stale_claude_copy()
     if old:
         rows.append((None, "an older orkestra copy is also loaded by Cursor through Claude Code's plugin registry",
-                     f"{old} — its hooks answer in Cursor chats with old rules; refresh it with "
-                     f"`claude plugin update orkestra@orkestra-local` (see README: Cursor)"))
+                     i18n.t("cli.kit_older_copy", path=old)))
     return rows

@@ -31,10 +31,15 @@ from . import engines as EN
 from . import paths
 from . import state as ST
 from . import tempo as T
-from .util import file_lock, read_json, write_json_atomic
+from .i18n import t
+from .util import LockTimeout, file_lock, read_json, write_json_atomic
 
 NOTIFY_CLASSES = (2, 3, 4)
 BACKOFF_MINUTES = (5, 15, 45)
+MAX_NOTICES = 5                                  # notifications per incident: now, then 30 min, 2 h, 8 h, daily, then silence
+_RENOTIFY_STEPS = (1, 4, 16, 48)                 # multiples of watchdog.renotify_minutes between notices
+_IS_WINDOWS = os.name == "nt"                    # a module constant so tests can exercise the Windows branches
+_HEADS = {1: "watchdog.head_user", 2: "watchdog.head_dead_wait", 3: "watchdog.head_hung", 4: "watchdog.head_silent"}
 
 
 def _state_path() -> Path:
@@ -69,7 +74,8 @@ def scan(now: Optional[float] = None, cfg: Optional[Dict[str, Any]] = None) -> L
             mtime = (item["dir"] / "state.json").stat().st_mtime
         except OSError:
             mtime = 0.0
-        stall = T.classify(st, rows, pending, now=now, wd=wd, state_mtime=mtime)
+        stall = T.classify(st, rows, pending, now=now, wd=wd, state_mtime=mtime,
+                           reports_due=A.agents_reports_due(proj, rid, max_age=3600.0, now=now) or None)   # none: row-based
         try:
             nxt = T.next_lines(T.next_action(proj, st, deep=False, now=now))[0]
         except Exception:
@@ -81,8 +87,32 @@ def scan(now: Optional[float] = None, cfg: Optional[Dict[str, Any]] = None) -> L
     return views
 
 
+def renotify_due(count: int, last: float, now: float, base: float) -> bool:
+    """May an incident announce itself again? First notice at once, then after base, 4x, 16x and 48x base (with the
+    default 30 min: 30 min, 2 h, 8 h, a day) and never more than MAX_NOTICES in total (a forgotten run used to notify
+    every 30 minutes for ever)."""
+    if count <= 0:
+        return True
+    if count >= MAX_NOTICES:
+        return False
+    return now - last >= base * _RENOTIFY_STEPS[min(count - 1, len(_RENOTIFY_STEPS) - 1)]
+
+
+def fast_owns(v: Dict[str, Any]) -> bool:
+    """Dead waits and hung commands are announced by the fast watcher while it runs healthy; silence stays here."""
+    if v["stall"]["cls"] not in (2, 3):
+        return False
+    try:
+        from . import fastwatch
+        return fastwatch.owns_notifications()
+    except Exception:
+        return False
+
+
 def _wants_notice(v: Dict[str, Any], wd: Dict[str, Any]) -> bool:
     s = v["stall"]
+    if fast_owns(v):
+        return False
     if s["cls"] in NOTIFY_CLASSES:
         return True
     if s["cls"] == 1 and s["key"] in ("user", "turn_ended", "blocked"):
@@ -92,9 +122,9 @@ def _wants_notice(v: Dict[str, Any], wd: Dict[str, Any]) -> bool:
 
 def _message(v: Dict[str, Any]) -> str:
     s = v["stall"]
-    since = f" · {T.dur_tr(s['since'])}" if s.get("since") else ""
-    head = {1: "SENİ BEKLİYOR", 2: "ÖLÜ BEKLEME", 3: "ASILI KOMUT", 4: "SESSİZ OTURUM"}.get(s["cls"], "bilgi")
-    return f"[{v['project_name']}] {head}{since} — {s['text']} · faz {v['phase']}"
+    since = f" · {A.human_duration(s['since'])}" if s.get("since") else ""
+    return t("watchdog.message", project=v["project_name"], head=t(_HEADS.get(s["cls"], "watchdog.head_info")),
+             since=since, text=s["text"], phase=v["phase"])
 
 
 def _macos_notify(title: str, text: str) -> None:
@@ -106,6 +136,23 @@ def _macos_notify(title: str, text: str) -> None:
                        capture_output=True, timeout=10)
     except Exception:
         pass
+
+
+def _linux_notify(title: str, text: str) -> None:
+    """Desktop notification through libnotify's `notify-send` (absent on servers and containers: then nothing)."""
+    binary = shutil.which("notify-send") if sys.platform.startswith("linux") else None
+    if not binary:
+        return
+    try:
+        subprocess.run([binary, "--app-name=Orkestra", "--", title[:100], text[:230]], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _notify(title: str, text: str) -> None:
+    """The desktop notification of this platform. macOS and Linux have one; Windows is served by the webhook / bridge."""
+    _macos_notify(title, text)
+    _linux_notify(title, text)
 
 
 def _webhook(cfg: Dict[str, Any], payload: Dict[str, Any]) -> None:
@@ -146,6 +193,10 @@ def _pid_alive(pid: Any, session_ids: Any = ()) -> bool:
     child = _children.get(pid)
     if child is not None:
         return child.poll() is None
+    if _IS_WINDOWS:
+        # os.kill(pid, 0) TERMINATES the process on Windows and there is no `ps`: it cannot be verified, and "alive"
+        # is the answer that never risks a double execution (the watchdog then only notifies).
+        return True
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -155,7 +206,8 @@ def _pid_alive(pid: Any, session_ids: Any = ()) -> bool:
     except OSError:
         return False
     try:
-        cp = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=10)
+        cp = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, encoding="utf-8",
+                            errors="replace", timeout=10)
         return any(str(s) and EN.raw_session_id(str(s)) in cp.stdout for s in session_ids)
     except Exception:
         return True
@@ -170,12 +222,15 @@ def _process_alive(session_ids: Any, pid: Any = None) -> bool:
     ids = [session_ids] if isinstance(session_ids, str) else list(session_ids or [])
     if pid and _pid_alive(pid, ids):
         return True
+    if _IS_WINDOWS:
+        return True                                # no pgrep: cannot tell → assume alive (notification only)
     try:
         for sid in ids:
             if not sid:
                 continue
             # the engine's CLI carries ITS id on the command line (a Cursor chat id has no `cursor-` prefix there)
-            cp = subprocess.run(["pgrep", "-f", EN.raw_session_id(str(sid))], capture_output=True, text=True, timeout=10)
+            cp = subprocess.run(["pgrep", "-f", EN.raw_session_id(str(sid))], capture_output=True, encoding="utf-8",
+                                errors="replace", timeout=10)
             if [p for p in cp.stdout.split() if p.strip() and int(p) != os.getpid()]:
                 return True
         return False
@@ -211,6 +266,8 @@ def resume_decision(v: Dict[str, Any], cfg: Dict[str, Any], book: Dict[str, Any]
         return {"resume": False, "why": "not a silent session"}
     if mode == "off" or (mode == "headless" and v.get("mode") != "headless"):
         return {"resume": False, "why": f"auto_resume={mode} (run mode {v.get('mode')}) — notification only"}
+    if _IS_WINDOWS:
+        return {"resume": False, "why": "auto-resume needs pgrep/ps, which Windows lacks: notification only"}
     if not v.get("sessions"):
         return {"resume": False, "why": "no bound session to resume"}
     lease = float(wd.get("lease_seconds") or 120)
@@ -222,7 +279,8 @@ def resume_decision(v: Dict[str, Any], cfg: Dict[str, Any], book: Dict[str, Any]
     pause = BACKOFF_MINUTES[min(rec["count"] - 1, len(BACKOFF_MINUTES) - 1)] * 60 if rec["count"] else 0
     if now - float(rec.get("last") or 0) < pause:
         return {"resume": False, "why": f"waiting {int((pause - (now - rec['last'])) / 60) + 1} min before attempt {rec['count'] + 1}"}
-    return {"resume": True, "why": f"silent {T.dur_tr(v['stall'].get('since'))}; attempt {rec['count'] + 1}/{limit}",
+    silent = A.human_duration(v["stall"].get("since"))
+    return {"resume": True, "why": f"silent {silent}; attempt {rec['count'] + 1}/{limit}",
             "session": v["sessions"][0]["id"], "attempt": rec["count"] + 1, "needs_dead_process": cls == 3}
 
 
@@ -274,7 +332,8 @@ def _spawn_resume(v: Dict[str, Any], cfg: Dict[str, Any], session: str, attempt:
         if not binary:
             return "claude CLI not found"
         spec = EN.headless_command("claude", binary, session, EN.resume_prompt("claude", project.name), False,
-                                   {"permission_mode": h.get("permission_mode"), "max_turns": h.get("max_turns")})
+                                   {"permission_mode": h.get("permission_mode"), "max_turns": h.get("max_turns"),
+                                    "max_budget_usd": h.get("max_budget_usd")})
     else:
         return f"unsupported engine: {engine}"
     env = EN.child_env(engine)
@@ -282,7 +341,7 @@ def _spawn_resume(v: Dict[str, Any], cfg: Dict[str, Any], session: str, attempt:
     try:
         with open(log, "w", encoding="utf-8") as fh:        # the child keeps its own copy of the descriptor
             proc = subprocess.Popen(spec["argv"], cwd=str(project), env=env, stdin=subprocess.PIPE, stdout=fh,
-                                    stderr=subprocess.STDOUT, text=True, start_new_session=True)
+                                    stderr=subprocess.STDOUT, encoding="utf-8", start_new_session=True)
         assert proc.stdin is not None
         if spec["stdin"] is not None:
             proc.stdin.write(spec["stdin"])
@@ -303,7 +362,23 @@ def main(once: bool = True, as_json: bool = False, dry_run: bool = False, quiet:
     views = scan(now, cfg)
     sp = _state_path()
     sp.parent.mkdir(parents=True, exist_ok=True)
-    with file_lock(sp):
+    try:
+        with file_lock(sp, timeout=0):         # another pass is running: skip this one instead of queueing behind it
+            pass
+    except LockTimeout:
+        return 0
+    # Probes (pgrep / ps, up to 10 s each) run BEFORE the book lock is taken: a second pass, the bridge or launchd
+    # must not queue behind a process listing.
+    book0 = read_json(sp, default={}) or {}
+    alive_by_run: Dict[str, bool] = {}
+    for v in views:
+        if resume_decision(v, cfg, book0 if isinstance(book0, dict) else {}, now)["resume"]:
+            sids0 = [s["id"] for s in v.get("sessions") or []]
+            rkey0 = f"{v['project']}|{v['run_id']}"
+            last0 = ((book0.get("resumes") or {}).get(rkey0) or {}).get("pid") if isinstance(book0, dict) else None
+            alive_by_run[rkey0] = bool(_bridge_owns(sids0) or _process_alive(sids0, last0))
+    spawns: List[Any] = []
+    with file_lock(sp, timeout=5):
         book = read_json(sp, default={}) or {}
         if not isinstance(book, dict):
             book = {}
@@ -318,9 +393,10 @@ def main(once: bool = True, as_json: bool = False, dry_run: bool = False, quiet:
                 live_keys.add(key)
                 rec = inc.get(key) or {"first": now, "last_notified": 0, "count": 0}
                 again = float((cfg.get("watchdog") or {}).get("renotify_minutes") or 30) * 60
-                # waiting for the user is announced once; a stalled run is repeated every renotify_minutes
+                # waiting for the user is announced once; a stalled run decays (30 min, 2 h, 8 h, daily) and stops
                 if (v["stall"]["cls"] == 1 and not rec.get("count")) or \
-                        (v["stall"]["cls"] != 1 and now - float(rec.get("last_notified") or 0) >= again):
+                        (v["stall"]["cls"] != 1 and renotify_due(int(rec.get("count") or 0),
+                                                                 float(rec.get("last_notified") or 0), now, again)):
                     v["notify"] = True
                     if not dry_run:
                         rec["last_notified"], rec["count"] = now, int(rec.get("count") or 0) + 1
@@ -331,33 +407,49 @@ def main(once: bool = True, as_json: bool = False, dry_run: bool = False, quiet:
             rkey = f"{v['project']}|{v['run_id']}"
             last_pid = (book["resumes"].get(rkey) or {}).get("pid")
             if dec["resume"]:
-                alive = _process_alive(sids, last_pid)
-                if _bridge_owns(sids) or alive:     # any mode: a live agent with this session = a second driver
+                alive = alive_by_run.get(rkey)
+                if alive is None:                   # the book changed between the two reads: probe now (rare)
+                    alive = bool(_bridge_owns(sids) or _process_alive(sids, last_pid))
+                if alive:                           # any mode: a live agent with this session = a second driver
                     dec = {"resume": False, "why": f"its {EN.session_engine(str(dec.get('session') or ''))} process / "
                                                    f"bridge job is still alive — not resumed"}
             v["auto_resume"] = dec
             if dec["resume"] and not dry_run:
-                res = _spawn_resume(v, cfg, dec["session"], dec["attempt"])
-                if isinstance(res, str):
-                    v["auto_resume"] = {"resume": False, "why": res}
-                else:
-                    book["resumes"][rkey] = {"count": dec["attempt"], "last": now, "pid": res}
-                    v["message"] += f" → otomatik devam ettirildi (deneme {dec['attempt']})"
-                    v["notify"] = True
+                # reserve the attempt under the lock, start the process after it (a Cursor start can take a while)
+                spawns.append((v, rkey, dec, book["resumes"].get(rkey)))
+                book["resumes"][rkey] = {"count": dec["attempt"], "last": now, "pid": None}
             elif dec.get("limit"):
-                v["message"] += EN.adapt_text(" → otomatik devam sınırı aşıldı, senin devam ettirmen gerekiyor "
-                                              "(/orkestra:resume)", EN.session_engine(sids[0] if sids else ""))
+                v["message"] += EN.adapt_text(t("watchdog.auto_resume_limit"),
+                                              EN.session_engine(sids[0] if sids else ""))
         for k in [k for k in inc if k not in live_keys]:
             inc.pop(k, None)                       # incident over → the next one notifies again immediately
         for k in [k for k in book["resumes"] if k not in open_runs]:
             book["resumes"].pop(k, None)
         if not dry_run:
             write_json_atomic(sp, book)
+    for v, rkey, dec, prev in spawns:
+        res = _spawn_resume(v, cfg, dec["session"], dec["attempt"])
+        with file_lock(sp, timeout=5):
+            book = read_json(sp, default={}) or {}
+            resumes = book.setdefault("resumes", {})
+            if isinstance(res, str):               # not started: the attempt does not count
+                if prev:
+                    resumes[rkey] = prev
+                else:
+                    resumes.pop(rkey, None)
+            elif rkey in resumes:
+                resumes[rkey]["pid"] = res
+            write_json_atomic(sp, book)
+        if isinstance(res, str):
+            v["auto_resume"] = {"resume": False, "why": res}
+        else:
+            v["message"] += t("watchdog.auto_resumed", attempt=dec["attempt"])
+            v["notify"] = True
     if not dry_run:
         for v in views:
             if v["notify"]:
                 if (cfg.get("watchdog") or {}).get("macos_notify", True):
-                    _macos_notify("Orkestra", v["message"])
+                    _notify("Orkestra", v["message"])
                 _webhook(cfg, {"source": "orkestra-watchdog", "project": v["project_name"], "run_id": v["run_id"],
                                "class": v["stall"]["cls"], "key": v["stall"]["key"], "message": v["message"], "next": v["next"]})
     if as_json:
@@ -365,13 +457,13 @@ def main(once: bool = True, as_json: bool = False, dry_run: bool = False, quiet:
         return 0
     shown = [v for v in views if not quiet or v["notify"] or v["stall"]["cls"] in NOTIFY_CLASSES]
     if not views and not quiet:
-        sys.stdout.write("Açık orkestra çalışması yok.\n")
+        sys.stdout.write(t("watchdog.no_open_runs") + "\n")
     for v in shown:
         sys.stdout.write(v["message"] + "\n")
         if v["stall"].get("loops"):
-            sys.stdout.write("   döngü: " + " | ".join(v["stall"]["loops"][:2]) + "\n")
+            sys.stdout.write(t("watchdog.loop_line", loops=" | ".join(v["stall"]["loops"][:2])) + "\n")
         if v.get("next") and v["stall"]["cls"] != 0:
             sys.stdout.write("   " + v["next"] + "\n")
         if v["auto_resume"].get("why") and v["stall"]["cls"] in (3, 4):
-            sys.stdout.write("   otomatik devam: " + v["auto_resume"]["why"] + "\n")
+            sys.stdout.write(t("watchdog.resume_line", why=v["auto_resume"]["why"]) + "\n")
     return 0

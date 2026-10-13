@@ -153,6 +153,7 @@ class TestEngineUnits(unittest.TestCase):
 
 
 class TestBinaries(helpers.Sandbox):
+    @unittest.skipUnless(os.name != "nt", "#!/bin/sh make_exec fixture (FR-007)")
     def test_binary_lookup_and_new_session(self):
         fake = make_exec(self.tmp / "bin" / "agent", "#!/bin/sh\n[ \"$1\" = create-chat ] && echo "
                          "'Created chat: 0a1b2c3d-1111-4222-8333-444455556666'\n")
@@ -405,7 +406,8 @@ class TestCursorSession(CursorBase):
             + json.dumps({"role": "assistant", "message": {"content": [{"type": "text", "text": "ok"}]}}) + "\n"
             + json.dumps({"role": "user", "message": {"content": [
                 {"type": "text", "text":
-                 "<user_query>\nprepare orkestra for public github, scrub local paths\n</user_query>"}]}}) + "\n",
+                 # 2026-10-12: an ordinary message keeps the binding; this one says to let go of the run
+                 "<user_query>\nnever mind this run, prepare orkestra for public github, scrub local paths\n</user_query>"}]}}) + "\n",
             encoding="utf-8")
         out = self.chook("stop", gen="g-off", status="completed", loop_count=0, transcript_path=str(tp))
         self.assertEqual(out, {})
@@ -823,6 +825,7 @@ class TestCliEngines(CursorBase):
         self.assertIn("orkestra playbook headless", out)
         self.assertNotIn(EN.ASK_FOOTNOTE, self.cli("context", "-p", "demo").stdout)
 
+    @unittest.skipUnless(os.name != "nt", "#!/bin/sh make_exec fixture (FR-007)")
     def test_terminal_launcher(self):
         claude = make_exec(self.tmp / "bin" / "claude", "#!/bin/sh\nexit 0\n")
         agent = make_exec(self.tmp / "bin" / "agent", "#!/bin/sh\nexit 0\n")
@@ -856,6 +859,7 @@ class TestCliEngines(CursorBase):
         self.assertNotEqual(cp.returncode, 0)
         self.assertIn("cursor CLI not found", cp.stderr + cp.stdout)
 
+    @unittest.skipUnless(os.name != "nt", "#!/bin/sh make_exec fixture (FR-007)")
     def test_launcher_really_starts_the_engine_in_the_project(self):
         fake = make_exec(self.tmp / "bin" / "agent", "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$@\" > \"$PWD/launched.txt\"\n"
                                                       "command -v orkestra >> \"$PWD/launched.txt\"\n"
@@ -875,6 +879,12 @@ class TestCliEngines(CursorBase):
 class TestCursorKit(helpers.Sandbox):
     def setUp(self):
         super().setUp()
+        # the assertions below read the English wording of the kit's output (the suite itself is pinned to Turkish);
+        # test_output_follows_the_language checks the Turkish side
+        saved = os.environ.get("ORKESTRA_LANG")
+        os.environ["ORKESTRA_LANG"] = "en"
+        self.addCleanup(lambda: os.environ.__setitem__("ORKESTRA_LANG", saved) if saved is not None
+                        else os.environ.pop("ORKESTRA_LANG", None))
         self.chome = Path(os.environ["ORKESTRA_CURSOR_HOME"])
         self.shim = Path(os.environ["ORKESTRA_SHIM_DIR"])
         self.shim.mkdir()
@@ -882,8 +892,76 @@ class TestCursorKit(helpers.Sandbox):
         self.env = {"PATH": os.pathsep.join([str(self.shim), "/usr/bin", "/bin", str(Path(sys.executable).parent)]),
                     "ORKESTRA_CURSOR_BIN": str(make_exec(self.tmp / "bin" / "agent", "#!/bin/sh\nexit 0\n"))}
 
-    def kit(self, *args, check=True):
-        return self.cli("cursor", *args, check=check, env=self.env)
+    def kit(self, *args, check=True, lang=None):
+        return self.cli("cursor", *args, check=check, env=dict(self.env, **({"ORKESTRA_LANG": lang} if lang else {})))
+
+    def test_output_follows_the_language_but_the_row_names_do_not(self):
+        """r2-12: the action lines, the summary and the details were English in a Turkish session."""
+        english = self.kit("install", "--dry-run", lang="en").stdout
+        turkish = self.kit("install", "--dry-run", lang="tr").stdout
+        self.assertIn("would link ", english)
+        self.assertIn("would update hooks.json: orkestra entries for", english)
+        self.assertIn("cursor: dry run, nothing written", english)
+        self.assertIn("şunu yapardı: bağla ", turkish)
+        self.assertIn("şunu yapardı: hooks.json güncelle: ", turkish)
+        self.assertIn("cursor: deneme modu, hiçbir şey yazılmadı", turkish)
+        for word in ("link ", "update hooks.json", "dry run", "would "):
+            self.assertNotIn(word, turkish, word)
+        self.assertFalse(self.chome.exists(), "a dry run creates nothing")
+        self.kit("install")
+        for lang, word in (("en", "installed"), ("tr", "kuruldu")):
+            status = self.kit("status", lang=lang, check=False).stdout
+            for label in ("[OK] hooks.json entries", "[OK] skills and subagents installed", "[OK] `orkestra` on PATH",
+                          "[OK] generated assets current"):
+                self.assertIn(label, status, f"{lang}: the row name is a stable identifier")
+        self.assertIn("8/8 events", self.kit("status", lang="en", check=False).stdout)
+        self.assertIn("8/8 olay", self.kit("status", lang="tr", check=False).stdout)
+        again = self.kit("install", lang="tr").stdout
+        self.assertIn("değiştirilecek bir şey yok", again)
+        gone = self.kit("uninstall", lang="tr").stdout
+        self.assertIn("kaldır ", gone)
+        self.assertIn("cursor: kaldırıldı", gone)
+
+    def test_build_is_allowed_from_an_agent_shell_but_install_is_not(self):
+        """`cursor build` writes only the checkout's generated tree, so contributors' agents may run it (AGENTS.md);
+        everything that touches the user's Cursor configuration stays terminal-only."""
+        import argparse
+        from unittest import mock
+        from orkestra_core import cli as CLI
+        from orkestra_core import cursorkit as CK
+        out = self.tmp / "assets"
+        with mock.patch.object(CLI, "_ASKER", "claude"), mock.patch.object(CK, "ASSETS", out):
+            self.assertEqual(CLI.cmd_cursor(argparse.Namespace(action="build")), 0)
+            self.assertTrue(any(out.rglob("*.md")))
+            for action in ("install", "uninstall", "status"):
+                with self.assertRaises(CLI.OrkestraError):
+                    CLI.cmd_cursor(argparse.Namespace(action=action, copy=False, dry_run=True))
+
+    def test_build_dry_run_reports_the_files_and_writes_nothing(self):
+        """`--dry-run` on `cursor build` is honoured: an agent that believes it only looks must not rewrite the tree."""
+        import argparse
+        import io
+        from contextlib import redirect_stdout
+        from unittest import mock
+        from orkestra_core import cli as CLI
+        from orkestra_core import cursorkit as CK
+        out = self.tmp / "assets"
+        with mock.patch.object(CLI, "_ASKER", "claude"), mock.patch.object(CK, "ASSETS", out):
+            for lang in ("en", "tr"):
+                with mock.patch.dict(os.environ, {"ORKESTRA_LANG": lang}), redirect_stdout(io.StringIO()) as buf:
+                    self.assertEqual(CLI.cmd_cursor(argparse.Namespace(action="build", dry_run=True)), 0)
+                self.assertFalse(out.exists() and any(out.rglob("*")), "a dry run must not create the tree")
+                self.assertIn(str(len(CK.expected())), buf.getvalue())
+                self.assertIn("dry run" if lang == "en" else "deneme modu", buf.getvalue())
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(CLI.cmd_cursor(argparse.Namespace(action="build", dry_run=False)), 0)
+            self.assertEqual(CK.stale(out), [])
+            victim = next(out.rglob("*.md"))
+            victim.unlink()
+            with mock.patch.dict(os.environ, {"ORKESTRA_LANG": "en"}), redirect_stdout(io.StringIO()) as buf:
+                CLI.cmd_cursor(argparse.Namespace(action="build", dry_run=True))
+            self.assertFalse(victim.exists(), "the missing file was recreated by a dry run")
+            self.assertIn(victim.relative_to(out).as_posix(), buf.getvalue())
 
     def test_generated_assets_are_current(self):
         from orkestra_core import cursorkit as CK
@@ -906,60 +984,98 @@ class TestCursorKit(helpers.Sandbox):
         self.assertIn("name: orkestra-onboard", onboard.split("---")[1])
         self.assertRegex(onboard, r"\bsetup\b")
         self.assertIn("copilot install", onboard)
-        # FR-008: ORKESTRA.md Kapsam — Copilot engine in scope (bridge-Copilot may stay out)
-        kaps = (helpers.PLUGIN.parent.parent / "ORKESTRA.md").read_text()
-        section = kaps.split("## Kapsam", 1)[1].split("## ", 1)[0]
-        self.assertNotIn("Copilot, claude.ai", section)  # old bundled "out of scope" list
-        self.assertRegex(section, r"\bsetup\b")
-        self.assertIn("copilot install", section)
+        # FR-008: ORKESTRA.md Scope / ORKESTRA.tr.md Kapsam: Copilot engine in scope (bridge-Copilot may stay out)
+        for name, heading in (("ORKESTRA.md", "## Scope"), ("ORKESTRA.tr.md", "## Kapsam")):
+            doc = (helpers.PLUGIN.parent.parent / name).read_text(encoding="utf-8")
+            section = doc.split(heading, 1)[1].split("## ", 1)[0]
+            self.assertNotIn("Copilot, claude.ai", section)  # old bundled "out of scope" list
+            self.assertRegex(section, r"\bsetup\b")
+            self.assertIn("copilot install", section)
 
+    @unittest.skipUnless(os.name != "nt", "POSIX symlink shim assertions; Win .cmd covered separately (FR-007)")
     def test_ensure_path_shim_creates_fixes_dangling_and_noops(self):
         """FR-001 / E1–E3 / SC-001: ensure_path_shim is the single PATH shim API; install uses it."""
         from orkestra_core import cursorkit as CK
         import inspect
+        prev_path = os.environ.get("PATH")
         path_no_orkestra = os.pathsep.join([str(self.shim), "/usr/bin", "/bin", str(Path(sys.executable).parent)])
-        os.environ["PATH"] = path_no_orkestra
-        self.assertIsNone(shutil.which("orkestra"))
+        try:
+            os.environ["PATH"] = path_no_orkestra
+            self.assertIsNone(shutil.which("orkestra"))
 
-        # SC-001 / happy: shim dir on PATH, no orkestra → symlink to BIN
-        done = CK.ensure_path_shim()
-        self.assertTrue((self.shim / "orkestra").is_symlink())
-        self.assertEqual(os.path.realpath(self.shim / "orkestra"), os.path.realpath(helpers.BIN))
-        self.assertTrue(any("link" in a and str(helpers.BIN) in a for a in done))
-        # second call is harmless (idempotent)
-        self.assertEqual(CK.ensure_path_shim(), [])
+            # SC-001 / happy: shim dir on PATH, no orkestra → symlink to BIN
+            done = CK.ensure_path_shim()
+            self.assertTrue((self.shim / "orkestra").is_symlink())
+            self.assertEqual(os.path.realpath(self.shim / "orkestra"), os.path.realpath(helpers.BIN))
+            self.assertTrue(any("link" in a and str(helpers.BIN) in a for a in done))
+            # second call is harmless (idempotent)
+            self.assertEqual(CK.ensure_path_shim(), [])
 
-        # E2: dangling symlink is renewed
-        (self.shim / "orkestra").unlink()
-        os.symlink(self.tmp / "gone" / "orkestra", self.shim / "orkestra")
-        self.assertTrue((self.shim / "orkestra").is_symlink())
-        self.assertFalse((self.shim / "orkestra").exists())
-        fixed = CK.ensure_path_shim()
-        self.assertEqual(os.path.realpath(self.shim / "orkestra"), os.path.realpath(helpers.BIN))
-        self.assertTrue(any("link" in a for a in fixed))
+            # E2: dangling symlink is renewed
+            (self.shim / "orkestra").unlink()
+            os.symlink(self.tmp / "gone" / "orkestra", self.shim / "orkestra")
+            self.assertTrue((self.shim / "orkestra").is_symlink())
+            self.assertFalse((self.shim / "orkestra").exists())
+            fixed = CK.ensure_path_shim()
+            self.assertEqual(os.path.realpath(self.shim / "orkestra"), os.path.realpath(helpers.BIN))
+            self.assertTrue(any("link" in a for a in fixed))
 
-        # E1: parent missing → no-op, no crash
-        missing_parent = self.tmp / "no-parent-dir" / "bin"
-        os.environ["ORKESTRA_SHIM_DIR"] = str(missing_parent)
-        self.assertFalse(missing_parent.exists())
-        self.assertEqual(CK.ensure_path_shim(), [])
-        self.assertFalse((missing_parent / "orkestra").exists())
-        os.environ["ORKESTRA_SHIM_DIR"] = str(self.shim)
+            # E1: parent missing → no-op, no crash
+            missing_parent = self.tmp / "no-parent-dir" / "bin"
+            os.environ["ORKESTRA_SHIM_DIR"] = str(missing_parent)
+            self.assertFalse(missing_parent.exists())
+            self.assertEqual(CK.ensure_path_shim(), [])
+            self.assertFalse((missing_parent / "orkestra").exists())
+            os.environ["ORKESTRA_SHIM_DIR"] = str(self.shim)
 
-        # E3: orkestra already on PATH → new link not required
-        other = self.tmp / "other-bin"
-        other.mkdir()
-        target = other / "orkestra"
-        os.symlink(helpers.BIN, target)
-        os.environ["PATH"] = os.pathsep.join([str(other), path_no_orkestra])
-        (self.shim / "orkestra").unlink(missing_ok=True)
-        self.assertIsNotNone(shutil.which("orkestra"))
-        self.assertEqual(CK.ensure_path_shim(), [])
-        self.assertFalse(os.path.lexists(self.shim / "orkestra"))
+            # E3: orkestra already on PATH → new link not required
+            other = self.tmp / "other-bin"
+            other.mkdir()
+            target = other / "orkestra"
+            os.symlink(helpers.BIN, target)
+            os.environ["PATH"] = os.pathsep.join([str(other), path_no_orkestra])
+            (self.shim / "orkestra").unlink(missing_ok=True)
+            self.assertIsNotNone(shutil.which("orkestra"))
+            self.assertEqual(CK.ensure_path_shim(), [])
+            self.assertFalse(os.path.lexists(self.shim / "orkestra"))
 
-        # install uses the same API
-        self.assertIn("ensure_path_shim", inspect.getsource(CK.install))
+            # install uses the same API
+            self.assertIn("ensure_path_shim", inspect.getsource(CK.install))
+        finally:
+            if prev_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = prev_path
 
+    def test_ensure_path_shim_windows_writes_cmd(self):
+        """FR-002 / E4–E5 / SC-002: on Windows write orkestra.cmd instead of requiring symlink."""
+        from orkestra_core import cursorkit as CK
+        from unittest import mock
+
+        prev_path = os.environ.get("PATH")
+        path_no_orkestra = os.pathsep.join([str(self.shim), str(Path(sys.executable).parent)])
+        try:
+            os.environ["PATH"] = path_no_orkestra
+            (self.shim / "orkestra").unlink(missing_ok=True)
+            (self.shim / "orkestra.cmd").unlink(missing_ok=True)
+
+            with mock.patch.object(CK, "_is_windows", return_value=True):
+                done = CK.ensure_path_shim()
+            cmd = self.shim / "orkestra.cmd"
+            self.assertTrue(cmd.is_file(), "Windows shim must be orkestra.cmd")
+            text = cmd.read_text(encoding="utf-8")
+            self.assertIn(str(helpers.BIN), text)
+            self.assertIn(sys.executable, text)
+            self.assertTrue(any("write" in a and "orkestra.cmd" in a for a in done))
+            with mock.patch.object(CK, "_is_windows", return_value=True):
+                self.assertEqual(CK.ensure_path_shim(), [])  # idempotent
+        finally:
+            if prev_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = prev_path
+
+    @unittest.skipUnless(os.name != "nt", "POSIX symlink PATH shim assertions (FR-007)")
     def test_install_keeps_the_users_own_hooks_and_is_idempotent(self):
         mine = {"version": 1, "hooks": {
             "beforeSubmitPrompt": [{"command": "./hooks/safety-gate.py", "failClosed": True}],
@@ -1253,6 +1369,25 @@ class TestWatchdogCursor(CursorBase):
         self.assertTrue(self.W._bridge_owns([self.conv]))
         v = self.scan(in_future=1200)[0]
         self.assertNotIn("still alive", v["auto_resume"]["why"])                    # that claude job is another session
+
+
+class TestWinForkFreeParity(unittest.TestCase):
+    """FR-004 / E7: Windows spawn paths must not use os.fork; use detached process group flags."""
+
+    def _assert_nt_fork_free(self, path: Path, *needles: str):
+        src = path.read_text(encoding="utf-8")
+        self.assertIn('os.name == "nt"', src, path.name)
+        self.assertIn("CREATE_NEW_PROCESS_GROUP", src, path.name)
+        self.assertIn("DETACHED_PROCESS", src, path.name)
+        for n in needles:
+            self.assertIn(n, src, f"{path.name} missing {n}")
+
+    def test_engines_helpers_fake_agent_engines2_nt_branches(self):
+        root = helpers.PLUGIN.parent.parent
+        self._assert_nt_fork_free(Path(EN.__file__), "driver_prompt")
+        self._assert_nt_fork_free(Path(helpers.__file__).resolve())
+        self._assert_nt_fork_free(root / "bridge" / "tests" / "fake_agent.py")
+        self._assert_nt_fork_free(Path(__file__).resolve().parent / "test_engines2.py", "CREATE_NEW_PROCESS_GROUP")
 
 
 if __name__ == "__main__":

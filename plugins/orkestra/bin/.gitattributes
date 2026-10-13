@@ -1,0 +1,4 @@
+# The launcher is read by a POSIX shell first: a CR at the end of a line is a syntax error for sh, and Git for Windows
+# checks files out with CRLF by default (core.autocrlf=true). Batch files are the opposite: cmd.exe needs CRLF.
+orkestra text eol=lf
+orkestra.cmd text eol=crlf

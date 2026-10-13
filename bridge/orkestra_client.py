@@ -11,6 +11,8 @@
 
 Reads the bearer token from ~/.orkestra/bridge.secret.json (same machine). Prints JSON (or the message for `wait`).
 Exit codes: 0 ok · 1 bridge/HTTP error · 2 usage.
+Text meant for a person (usage, "bridge not reachable") follows orkestra_core.i18n: English by default, Turkish when
+ORKESTRA_LANG / ~/.orkestra/config.json / the OS locale say so. The JSON the bridge returns is language-neutral.
 """
 from __future__ import annotations
 
@@ -24,6 +26,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "plugins" / "orkestra" / "lib"))
+from orkestra_core.i18n import t  # noqa: E402
 HOME = Path(os.environ.get("ORKESTRA_HOME") or "~/.orkestra").expanduser()
 
 
@@ -31,7 +36,7 @@ def _cfg() -> Dict[str, Any]:
     try:
         return json.loads((HOME / "bridge.secret.json").read_text(encoding="utf-8"))
     except FileNotFoundError:
-        sys.exit(f"bridge not configured — run: python3 {Path(__file__).resolve().parent / 'orkestra_bridge.py'} init")
+        sys.exit(t("bridge.client.not_configured", script=HERE / "orkestra_bridge.py"))
 
 
 def _call(method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Tuple[int, Any]:
@@ -45,7 +50,7 @@ def _call(method: str, path: str, body: Optional[Dict[str, Any]] = None) -> Tupl
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
     except urllib.error.URLError as e:
-        return 0, {"error": f"bridge not reachable ({e.reason}) — start it: python3 {Path(__file__).resolve().parent / 'orkestra_bridge.py'} serve"}
+        return 0, {"error": t("bridge.client.unreachable", reason=e.reason, script=HERE / "orkestra_bridge.py")}
 
 
 def _opt(args: List[str], name: str, default: Optional[str] = None) -> Tuple[Optional[str], List[str]]:
@@ -56,9 +61,20 @@ def _opt(args: List[str], name: str, default: Optional[str] = None) -> Tuple[Opt
     return default, args
 
 
+def _safe_stdio() -> None:
+    """Same guard as orkestra_bridge.safe_stdio (kept local: this client stays importable on its own): a character the
+    console cannot encode becomes a replacement instead of a UnicodeEncodeError."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")      # type: ignore[union-attr]
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: List[str]) -> int:
+    _safe_stdio()
     if not argv or argv[0] in ("-h", "--help"):
-        print(__doc__)
+        print(t("bridge.client.help"))
         return 2
     cmd, args = argv[0], argv[1:]
     engine, args = _opt(args, "--engine")
@@ -67,7 +83,7 @@ def main(argv: List[str]) -> int:
     timeout, args = _opt(args, "--timeout", "1800")
     if cmd == "start":
         if len(args) < 2:
-            print(__doc__)
+            print(t("bridge.client.help"))
             return 2
         request = {"project": args[0], "request": " ".join(args[1:]), "chat_id": chat, "source": source}
         if engine:
@@ -79,7 +95,7 @@ def main(argv: List[str]) -> int:
         elif len(args) >= 2:
             code, body = _call("POST", f"/jobs/{args[0]}/reply", {"text": " ".join(args[1:])})
         else:
-            print(__doc__)
+            print(t("bridge.client.help"))
             return 2
     elif cmd == "status":
         if args:
@@ -89,18 +105,20 @@ def main(argv: List[str]) -> int:
     elif cmd == "runs":
         code, body = _call("GET", "/runs")
         if code == 200 and "--json" not in args:
-            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            sys.path.insert(0, str(HERE))
             from orkestra_bridge import live_text
             print(live_text(body.get("runs") or [], limit=100_000))
             return 0
     elif cmd == "cancel":
         if not chat:
-            print(__doc__)
+            print(t("bridge.client.help"))
             return 2
+        # "/iptal" and "/cancel" are the same command; the older spelling also works against a bridge started before
+        # the English aliases existed, so a client and a long-running bridge of different ages still agree.
         code, body = _call("POST", "/telegram", {"chat_id": chat, "text": "/iptal"})
     elif cmd == "wait":
         if not args:
-            print(__doc__)
+            print(t("bridge.client.help"))
             return 2
         deadline = time.time() + float(timeout or 1800)
         while True:
@@ -112,7 +130,7 @@ def main(argv: List[str]) -> int:
             print(f"[{body.get('project')}] {body.get('status')} · {body.get('phase') or ''}\n\n{body.get('last_message') or ''}")
             return 0
     else:
-        print(__doc__)
+        print(t("bridge.client.help"))
         return 2
     print(json.dumps(body, ensure_ascii=False, indent=2))
     return 0 if 200 <= code < 300 else 1

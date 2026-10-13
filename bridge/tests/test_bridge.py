@@ -15,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+os.environ["ORKESTRA_NO_DAEMON"] = "1"      # no test starts the detached fast watcher (fastwatch.ensure_running)
 BRIDGE = HERE.parent / "orkestra_bridge.py"
 FAKE = HERE / "fake_claude.py"
 
@@ -73,7 +74,9 @@ class BridgeTest(unittest.TestCase):
             "allowed_projects": ["demo", "demo2", "demo3", "demo4", "demo5"],
             "watchdog_interval": 0, "auto_resume_delays": [0, 0, 0],
             "telegram": {"bot_token": "", "allowed_chat_ids": ["42"]}}))
-        env = dict(os.environ, ORKESTRA_HOME=str(cls.home), ORKESTRA_WORKSPACE=str(cls.ws))
+        # The assertions below predate the English default and read Turkish bridge text: pinned like plugins/orkestra/tests
+        # (helpers.py). English is covered in test_bridge_i18n.py.
+        env = dict(os.environ, ORKESTRA_HOME=str(cls.home), ORKESTRA_WORKSPACE=str(cls.ws), ORKESTRA_LANG="tr")
         for k in ("CLAUDECODE", "CURSOR_AGENT", "CURSOR_CONVERSATION_ID", "ORKESTRA_HEADLESS"):
             env.pop(k, None)
         cls.proc = subprocess.Popen([sys.executable, str(BRIDGE), "serve"], env=env, stdout=subprocess.PIPE,
@@ -234,7 +237,7 @@ class BridgeTest(unittest.TestCase):
 
     def test_6_client_cli(self):
         client = HERE.parent / "orkestra_client.py"
-        env = dict(os.environ, ORKESTRA_HOME=str(self.home))
+        env = dict(os.environ, ORKESTRA_HOME=str(self.home), ORKESTRA_LANG="tr")
         def run(*a):
             return subprocess.run([sys.executable, str(client), *a], capture_output=True, text=True, env=env)
         cp = run("start", "demo3", "bir", "şey", "yap", "ben", "karar", "verici", "olayım",
@@ -311,6 +314,45 @@ class BridgeTest(unittest.TestCase):
                             env=dict(os.environ, ORKESTRA_HOME=str(home), ORKESTRA_WORKSPACE=str(self.ws)))
         self.assertEqual(cp.returncode, 0, cp.stderr)
         self.assertEqual(json.loads(cp.stdout.strip().splitlines()[-1]), [False, "cancelled", True, "awaiting_user"])
+
+    def test_10_a_narrow_locale_does_not_break_a_request_with_turkish_letters(self):
+        """The agent is fed and read as UTF-8 whatever the locale (Windows ANSI code pages, LC_ALL=C): the prompt used to
+        raise UnicodeEncodeError in the wait thread, which died before updating the job, so it stayed "running" for ever
+        and blocked its project."""
+        script = self.tmp / "utf8_claude.py"
+        script.write_text("import json, sys\n"
+                          "text = sys.stdin.buffer.read().decode('utf-8')\n"
+                          "print(json.dumps({'type': 'result', 'result': 'echo:' + text, 'session_id': 'sess-10'}))\n",
+                          encoding="utf-8")
+        if os.name == "nt":                 # CreateProcess cannot start a .py file: a .cmd wrapper stands in for the CLI
+            fake = self.tmp / "utf8_claude.cmd"
+            fake.write_text(f'@"{sys.executable}" "{script}" %*\r\n', encoding="ascii")
+        else:
+            script.write_text("#!" + sys.executable + "\n" + script.read_text(encoding="utf-8"), encoding="utf-8")
+            script.chmod(0o755)
+            fake = script
+        code = ("import json, sys, time; sys.path.insert(0, sys.argv[1]); import orkestra_bridge as B\n"
+                "cfg = {'claude_bin': sys.argv[3], 'permission_mode': 'auto', 'max_turns': 3, 'extra_args': []}\n"
+                "job = {'id': 'dddd11112222', 'status': 'new', 'turns': [], 'project': 'demo', 'project_path': sys.argv[2],\n"
+                "       'session_id': 'sess-10', 'engine': 'claude'}\n"
+                "B.run_turn(cfg, job, 'istek: T\\u00fcrk\\u00e7e \\u015f\\u011f\\u0130\\u0131 \\u2713', new=True)\n"
+                "for _ in range(150):\n"
+                "    cur = B.load_job('dddd11112222')\n"
+                "    if cur['status'] != 'running':\n"
+                "        break\n"
+                "    time.sleep(0.1)\n"
+                "print(json.dumps([cur['status'], cur.get('last_message')]))\n")
+        home = self.tmp / "home-narrow"
+        home.mkdir(exist_ok=True)
+        env = dict(os.environ, ORKESTRA_HOME=str(home), ORKESTRA_WORKSPACE=str(self.ws), LC_ALL="C",
+                   PYTHONCOERCECLOCALE="0", PYTHONUTF8="0", PYTHONIOENCODING="utf-8")
+        env.pop("ORKESTRA_HEADLESS", None)
+        cp = subprocess.run([sys.executable, "-c", code, str(BRIDGE.parent), str(self.ws / "demo2"), str(fake)],
+                            capture_output=True, env=env, timeout=120)
+        self.assertEqual(cp.returncode, 0, cp.stderr.decode("utf-8", "replace"))
+        status, message = json.loads(cp.stdout.decode("utf-8").strip().splitlines()[-1])
+        self.assertEqual(status, "done", f"{message}\n{cp.stderr.decode('utf-8', 'replace')}")
+        self.assertEqual(message, "echo:istek: Türkçe şğİı ✓")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,10 @@
+# Keeps the GitHub Actions in .github/workflows up to date. Orkestra itself is Python standard library only and
+# the OpenClaw plugin has no npm dependencies, so there is deliberately no pip or npm ecosystem here.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "monthly"
+    commit-message:
+      prefix: "ci"

@@ -1,15 +1,15 @@
 """Run state (machine-owned JSON), session bindings, grants and the human ledger."""
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from . import paths
-from .util import (file_lock, now_iso, read_json, read_text, slugify, write_json_atomic,
-                   write_text_atomic)
+from . import i18n, paths
+from .util import (LockTimeout, append_record, file_lock, now_iso, read_json, slugify, write_json_atomic)
 
 PHASES = ["intake", "discover", "clarify", "plan", "approve",
           "implement", "verify", "review", "deliver", "done"]
@@ -42,10 +42,27 @@ def state_path(project: Path, run_id: str) -> Path:
 
 
 def load_state(project: Path, run_id: str) -> Dict[str, Any]:
-    st = read_json(state_path(project, run_id))
-    if not isinstance(st, dict):
+    path = state_path(project, run_id)
+    st = read_json(path)
+    if not isinstance(st, dict) and not path.exists():
         raise OrkestraError(f"run '{run_id}' not found in {project}")
+    reason = _state_damage(st)
+    if reason:                                  # the file is there but unusable: say so (it is not "missing")
+        raise OrkestraError(i18n.t("cli.state_damaged", run_id=run_id, path=path, reason=reason,
+                                   rdir=paths.run_dir(project, run_id), fdir=paths.feature_dir(project, run_id)))
     return st
+
+
+def _state_damage(st: Any) -> str:
+    """Why a parsed state.json cannot drive a run ('' when it can): the CLI reads these keys without a default."""
+    if not isinstance(st, dict):
+        return i18n.t("cli.damage_json" if st is None else "cli.damage_object")
+    missing = [k for k in ("run_id", "phase", "status") if not st.get(k)]
+    if missing:
+        return i18n.t("cli.damage_keys", keys=", ".join(missing))
+    if st["phase"] not in PHASES:
+        return i18n.t("cli.damage_phase", phase=st["phase"])
+    return ""
 
 
 def save_state(project: Path, st: Dict[str, Any]) -> None:
@@ -54,27 +71,41 @@ def save_state(project: Path, st: Dict[str, Any]) -> None:
 
 
 class StateTxn:
-    """`with StateTxn(project, run_id) as st:` — locked read-modify-write."""
+    """`with StateTxn(project, run_id) as st:` — locked read-modify-write. The lock is given back on every path out
+    (a failed load, any exception in the body, a failed save). A busy lock is an OrkestraError after the lock budget
+    (hook 2 s, CLI 10 s), never an unlocked write and never an endless wait."""
 
     def __init__(self, project: Path, run_id: str):
         self.project = Path(project)
         self.run_id = run_id
-        self._lock = None
+        self._stack: Optional[contextlib.ExitStack] = None
         self.st: Dict[str, Any] = {}
 
     def __enter__(self) -> Dict[str, Any]:
-        self._lock = file_lock(state_path(self.project, self.run_id))
-        self._lock.__enter__()
-        self.st = load_state(self.project, self.run_id)
+        path = state_path(self.project, self.run_id)
+        if not path.exists():                   # taking the lock would mkdir the run folder of a run that is gone
+            raise OrkestraError(f"run '{self.run_id}' not found in {self.project}")
+        stack = contextlib.ExitStack()
+        try:
+            try:
+                stack.enter_context(file_lock(path, on_timeout="raise"))
+            except LockTimeout as exc:
+                raise OrkestraError(str(exc)) from None
+            self.st = load_state(self.project, self.run_id)
+        except BaseException:
+            stack.close()                       # a failed __enter__ never reaches __exit__
+            raise
+        self._stack = stack
         return self.st
 
     def __exit__(self, exc_type, exc, tb) -> None:
+        stack, self._stack = self._stack, None
         try:
             if exc_type is None:
                 save_state(self.project, self.st)
         finally:
-            assert self._lock is not None
-            self._lock.__exit__(exc_type, exc, tb)
+            if stack is not None:
+                stack.close()
 
 
 def new_state(project: Path, run_id: str, title: str, size: str, mode: str, engine: str = "claude",
@@ -176,9 +207,35 @@ def _clear_children_for_parent(parent_session: str, only_other_project: Optional
     return removed
 
 
-def bind_session(session_id: str, project: Path, run_id: str, engine: str = "") -> None:
-    if not session_id:
-        return
+DRIVEN_STATUSES = ("active", "awaiting_user", "blocked")   # a chat can be driving these; paused and closed runs hold no chat
+
+
+def _is_abs(path: Any) -> bool:
+    """Absolute on POSIX or Windows (tests simulate Windows paths on POSIX)."""
+    from pathlib import PureWindowsPath
+    text = str(path or "")
+    return bool(text) and (Path(text).is_absolute() or PureWindowsPath(text).is_absolute())
+
+
+def bind_problem(project: Path, run_id: str) -> str:
+    """Why this (project, run) can never be bound ('' when it can): a relative path, an unknown run, a closed run."""
+    if not run_id or not re.fullmatch(r"[A-Za-z0-9][\w.-]*", run_id) or ".." in run_id:
+        return "no usable run id"                  # an id names a folder under .orkestra/runs: no separators, no ..
+    if not _is_abs(project):
+        return "the project path is not absolute"
+    st = read_json(state_path(Path(project), run_id))
+    if not isinstance(st, dict):
+        return f"run '{run_id}' does not exist in {project}"
+    if st.get("status") in TERMINAL_STATUSES:
+        return f"run '{run_id}' is {st.get('status')}"
+    return ""
+
+
+def bind_session(session_id: str, project: Path, run_id: str, engine: str = "") -> bool:
+    """Bind a chat to a run. Validates first (a bogus binding would govern the chat with a run that cannot exist);
+    False = nothing was written. Use `try_bind` where a live binding of the chat must not be replaced."""
+    if not session_id or bind_problem(project, run_id):
+        return False
     path = paths.sessions_dir() / f"{_safe(session_id)}.json"
     prev = read_json(path)
     # One Cursor chat must not drive two projects: drop foreign child roles when rebinding.
@@ -191,6 +248,84 @@ def bind_session(session_id: str, project: Path, run_id: str, engine: str = "") 
         data["engine"] = engine                     # which agent drives from this session (claude when absent)
     write_json_atomic(path, data)
     _prune(paths.sessions_dir(), days=21)
+    return True
+
+
+def _same_run(binding: Dict[str, Any], project: Path, run_id: str) -> bool:
+    if binding.get("run_id") != run_id:
+        return False
+    a, b = str(binding.get("project") or ""), str(project)
+    return a == b or os.path.realpath(a) == os.path.realpath(b)
+
+
+def binding_record(session_id: str) -> Optional[Dict[str, Any]]:
+    """The binding file as written (also when its run is closed: `session_binding` hides that case)."""
+    data = read_json(paths.sessions_dir() / f"{_safe(session_id)}.json") if session_id else None
+    return data if isinstance(data, dict) else None
+
+
+def binding_age(session_id: str) -> Optional[float]:
+    """Seconds since this chat last produced a hook event (the binding file's mtime); None without a binding."""
+    try:
+        return max(0.0, time.time() - (paths.sessions_dir() / f"{_safe(session_id)}.json").stat().st_mtime)
+    except OSError:
+        return None
+
+
+def try_bind(session_id: str, project: Path, run_id: str, engine: str = "", lease: float = 120.0) -> Dict[str, Any]:
+    """Bind a chat to a run unless it is still driving ANOTHER one. One rule for every engine (the Claude Code and
+    Copilot hooks, the CLI in a Cursor shell). Returns {"result": ..., ...}:
+
+      bound    written (or the same run again)
+      kept     the chat's binding is to a different run that is still driven (open, not paused) and the chat was heard
+               from less than `lease` seconds ago: nothing changed. "prev" = that binding, "age" = seconds since the
+               last event, "duplicate" = this very refusal was already reported (report it once, not per marker)
+      refused  the pair cannot be bound at all ("why")"""
+    why = "no session id" if not session_id else bind_problem(project, run_id)
+    if why:
+        return {"result": "refused", "why": why}
+    cur = session_binding(session_id)
+    if cur and not _same_run(cur, project, run_id) and (cur.get("state") or {}).get("status") in DRIVEN_STATUSES:
+        age = binding_age(session_id)
+        if age is not None and age < lease:
+            seen = cur.get("refused") if isinstance(cur.get("refused"), dict) else {}
+            duplicate = (seen.get("run") == run_id and seen.get("project") == str(project)
+                         and time.time() - float(seen.get("ts") or 0) < 300)
+            if not duplicate:
+                note = {k: v for k, v in cur.items() if k != "state"}
+                note["refused"] = {"run": run_id, "project": str(project), "ts": time.time()}
+                write_json_atomic(paths.sessions_dir() / f"{_safe(session_id)}.json", note)
+            return {"result": "kept", "prev": cur, "age": int(age), "duplicate": duplicate}
+    if not bind_session(session_id, project, run_id, engine=engine):
+        return {"result": "refused", "why": "could not bind"}
+    return {"result": "bound"}
+
+
+def heal_binding(session_id: str) -> str:
+    """Drop a binding that can never be right again (called when a hook sees the chat). Returns why, '' = untouched.
+
+    Dropped: a malformed or relative project path, a project folder that is gone, a run that does not exist and a run
+    that is closed (the last one leaves the `known` stub, as at the end of a run). A paused run keeps its binding: the
+    Stop hook releases it at the end of the turn. A damaged state.json is not 'missing': it is left for `doctor`."""
+    if not session_id:
+        return ""
+    data = read_json(paths.sessions_dir() / f"{_safe(session_id)}.json")
+    if not isinstance(data, dict):
+        return ""
+    project, rid = str(data.get("project") or ""), str(data.get("run_id") or "")
+    if not rid or not _is_abs(project):
+        why = "the binding has no absolute project path or run id"
+    elif not Path(project).is_dir():
+        why = f"project folder {project} is gone"
+    elif not state_path(Path(project), rid).exists():
+        why = f"run '{rid}' does not exist in {project}"
+    else:
+        st = read_json(state_path(Path(project), rid))
+        if not (isinstance(st, dict) and st.get("status") in TERMINAL_STATUSES):
+            return ""
+        why = f"run '{rid}' is {st.get('status')}"
+    unbind_session(session_id)
+    return why
 
 
 # ---------------------------------------------------------------- child conversations (Cursor subagents)
@@ -258,6 +393,8 @@ def session_binding(session_id: str) -> Optional[Dict[str, Any]]:
     data = read_json(paths.sessions_dir() / f"{_safe(session_id)}.json")
     if not isinstance(data, dict):
         return None
+    if not _is_abs(data.get("project")):
+        return None                     # a relative path means "wherever this hook happens to run": never a binding
     project = Path(data.get("project", ""))
     rid = data.get("run_id", "")
     st = read_json(state_path(project, rid)) if rid else None
@@ -293,6 +430,38 @@ def run_sessions(project: Path, run_id: str) -> List[Dict[str, Any]]:
                 continue
             out.append({"id": f.stem, "bound_at": data.get("bound_at", ""), "heartbeat": hb, "age": int(now - hb)})
     return sorted(out, key=lambda x: -x["heartbeat"])
+
+
+# ---------------------------------------------------------------- who asked for a status change
+# The CLI cannot see which chat typed `orkestra pause`: only the PreToolUse hook can. The hook leaves a short-lived
+# note per run; `runs.set_status` takes it and names the chat in the activity row.
+
+def _actor_path(project: Path, run_id: str) -> Path:
+    import hashlib
+    key = hashlib.sha1(str(project).encode("utf-8")).hexdigest()[:10]
+    return paths.orkestra_home() / "actors" / f"{key}-{_safe(run_id)}.json"
+
+
+def note_actor(project: Path, run_id: str, session_id: str, agent_type: str = "", agent_id: str = "") -> None:
+    try:
+        write_json_atomic(_actor_path(project, run_id), {"session_id": session_id, "agent_type": agent_type,
+                                                        "agent_id": agent_id, "ts": time.time()})
+        _prune(paths.orkestra_home() / "actors", days=1)
+    except OSError:
+        pass
+
+
+def take_actor(project: Path, run_id: str, max_age: float = 120.0) -> Dict[str, Any]:
+    """The chat that announced a status change of this run a moment ago ({} when nobody did). Read once."""
+    path = _actor_path(project, run_id)
+    data = read_json(path)
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    if isinstance(data, dict) and time.time() - float(data.get("ts") or 0) <= max_age:
+        return data
+    return {}
 
 
 # ---------------------------------------------------------------- grants (git intent per prompt)
@@ -344,20 +513,19 @@ def _prune(directory: Path, days: int) -> None:
 
 def ledger(project: Path, run_id: str, line: str) -> None:
     path = paths.feature_dir(project, run_id) / "ledger.md"
-    existing = read_text(path)
-    if not existing:
-        existing = f"# Ledger — {run_id}\n\nAppend-only event log written by the orkestra CLI.\n\n"
+    header = f"# Ledger — {run_id}\n\nAppend-only event log written by the orkestra CLI.\n\n"
     stamp = now_iso().replace("T", " ")[:16]
-    write_text_atomic(path, existing + f"- {stamp} {line}\n")
+    append_record(path, f"- {stamp} {line}\n".encode("utf-8"), header.encode("utf-8"))      # one O_APPEND write
 
 
 def bind_marker(project: Path, run_id: str) -> str:
-    """Machine-readable line parsed by the PostToolUse hook to bind the session to a run."""
-    return f"[orkestra:bind] project={project} run={run_id}"
+    """Machine-readable line parsed by the PostToolUse hook to bind the session to a run. `home` names the
+    ORKESTRA_HOME of the CLI that printed it: the hook of another home (a sandbox run) ignores the line."""
+    return f"[orkestra:bind] project={project} run={run_id} home={paths.orkestra_home()}"
 
 
 def unbind_marker(project: Path, run_id: str) -> str:
-    return f"[orkestra:unbind] project={project} run={run_id}"
+    return f"[orkestra:unbind] project={project} run={run_id} home={paths.orkestra_home()}"
 
 
 def cwd_project_from_env() -> Optional[Path]:

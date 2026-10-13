@@ -11,9 +11,9 @@ description: "Build or refresh Orkestra's verified project memory (PROJECT.md, g
 - AskUserQuestion does not exist. Wherever the text says to ask with it: write the question(s) in the chat, run
   `orkestra await "<one-line summary>"`, then end your turn (`orkestra playbook headless` has the wording — the user
   reads your message right here in the chat). The user's next message is the answer; a hook marks the run active
-  again. Plan approval is any clear approve intent the hook recognizes ("onay", "onaylıyorum",
-  "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "onay". Never approve yourself; after
-  their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
+  again. Plan approval is any clear approve intent the hook recognizes ("approve", "I approve", "go ahead", "lgtm",
+  "onay", "onaylıyorum", "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "approve". Never
+  approve yourself; after their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
   never skipped ("don't ask questions" in the request does not waive it) and never recorded by you in any way.
 - There is no SendMessage: to send findings back to a subagent, launch the same subagent type again with the
   findings and the path of its previous report.
@@ -26,4 +26,4 @@ Onboard the project for orkestra. Project hint: (what the user wrote with this c
 
 If no engine is ready yet (`orkestra doctor`), tell the user to run `orkestra setup` (or `orkestra setup --yes`), or per-engine `orkestra cursor install` / `orkestra copilot install` — do not run those installs from this skill.
 
-Run `orkestra context` (with `-p <project>`), then follow `orkestra playbook onboard` exactly. Do not modify source code. Report in Turkish in ≤ 6 lines.
+Run `orkestra context` (with `-p <project>`), then follow `orkestra playbook onboard` exactly. Do not modify source code. Report in the user's language (English by default, Turkish when they write Turkish) in ≤ 6 lines.

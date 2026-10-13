@@ -12,6 +12,7 @@ from .util import read_json, write_json_atomic
 
 DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
     "workspace_root": "~/Projects",
+    "lang": "auto",         # language of human-facing text: auto (OS locale, else English) | en | tr — see i18n.py
     "guards": {
         "git": True,        # block git/gh writes unless the user's current prompt asks for them
         "secrets": True,    # block reading/writing secret files (.env, *.p8, SA keys ...)
@@ -24,7 +25,7 @@ DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
         "dialogs": True,    # during a run: no command that opens a macOS system dialog on the user's screen
         "test_syntax": False,   # opt-in: read `[[ a > b ]]` / `(( n > 100 ))` as comparisons, not redirects (shellparse)
     },
-    "tempo": {"stop_while_agents": True, "task_review_required": True},   # M/L: `task done` needs a PASS review;   # the main turn may end while background subagents are still running
+    "tempo": {"stop_while_agents": True, "task_review_required": True, "max_dispatches": 3},   # M/L: `task done` needs a PASS review;   # the main turn may end while background subagents are still running
     # which agent drives a run started without an explicit choice (bridge, `orkestra run`): claude | cursor.
     # cursor.global_guards: outside a run, apply the every-session guards (git, secrets, store) to Cursor chats too.
     "engine": {"default": "claude", "claude": {"bin": "", "interactive_args": []},
@@ -36,11 +37,20 @@ DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
     # stall detection (`orkestra watch`, `orkestra watchdog`); auto_resume: off | headless | all
     "watchdog": {"dead_wait_seconds": 90, "hung_command_seconds": 900, "gate_command_seconds": 1800,
                  "silent_seconds": 600, "user_wait_notify_seconds": 300, "loop_repeats": 3, "agent_max_minutes": 60,
+                 "agent_silent_seconds": 150,   # a registered subagent with no sign of life this long is lost (hooks, next)
                  "lease_seconds": 120, "auto_resume": "headless", "max_auto_resumes": 3, "renotify_minutes": 30,
-                 "macos_notify": True},
+                 "macos_notify": True,
+                 "autostart": True,           # SessionStart may start the fast watcher (fastwatch.ensure_running); POSIX only
+                 "daemon_idle_minutes": 30},  # the detached fast watcher exits after this long with no open run and no live session
     "secrets": {"extra_patterns": [], "allow": []},
+    "gates_parallel": 1,    # >1: typecheck/lint/test gates run concurrently (<= min(N, cpus/2)); a project config.json value wins
+    "gates_rerun_failed_baseline": False,   # True: `gate verify` re-runs gates that failed/timed out at baseline (same as --all)
     "notify": {"webhook_url": "", "token": ""},
-    "headless": {"permission_mode": "auto", "max_turns": 400},
+    "headless": {"permission_mode": "auto", "max_turns": 400,
+                 "max_budget_usd": 0},   # >0: passed to `claude -p --max-budget-usd` (0 = off, no spend ceiling)
+    # bridge turns (bridge/orkestra_bridge.py): wall-clock budget of one headless turn, and how long a turn may produce
+    # no run activity (no activity row, no state change, no running Bash row) before it is interrupted and resumed
+    "bridge": {"turn_timeout_seconds": 7200, "turn_idle_seconds": 1800},
 }
 
 MARKERS = (
@@ -54,9 +64,28 @@ def orkestra_home() -> Path:
     return Path(os.environ.get("ORKESTRA_HOME") or "~/.orkestra").expanduser()
 
 
+def watchdog_pid_path() -> Path:
+    """The singleton lock file of the fast watcher (fastwatch holds an exclusive flock on it while it runs)."""
+    return orkestra_home() / "watchdog.pid"
+
+
+def _same_kind(default: Any, value: Any) -> bool:
+    """Is `value` usable where the default config holds `default`? (`engine: "x"` instead of an object, `"yes"` for a
+    flag, ... fall back to the default instead of crashing a hook later. None and unknown keys are always accepted.)"""
+    if default is None:
+        return True
+    if isinstance(default, bool):
+        return isinstance(value, bool)
+    if isinstance(default, (int, float)):
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return isinstance(value, type(default))
+
+
 def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
     out = copy.deepcopy(base)
     for k, v in (override or {}).items():
+        if k in out and not _same_kind(out[k], v):
+            continue
         if isinstance(v, dict) and isinstance(out.get(k), dict):
             out[k] = _deep_merge(out[k], v)
         else:
@@ -84,6 +113,19 @@ def workspace_root() -> Path:
 
 # ---------------------------------------------------------------- projects
 
+def _same_path(a: Path, b: Path) -> bool:
+    """Equal paths, also on a case-insensitive file system (macOS default, Windows) where `Projects` and `projects`
+    name one directory. Names that differ by more than case are never compared on disk (no stat in the common case)."""
+    if a == b:
+        return True
+    if str(a).casefold() != str(b).casefold():
+        return False
+    try:
+        return os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def find_project_root(start: Optional[os.PathLike] = None) -> Optional[Path]:
     """Nearest ancestor that is a project.
 
@@ -99,9 +141,9 @@ def find_project_root(start: Optional[os.PathLike] = None) -> Optional[Path]:
         start_path = start_path.parent
     ws = workspace_root()
     chain = [start_path] + list(start_path.parents)
-    chain = [p for p in chain if p != ws and p != Path(p.anchor)]
+    chain = [p for p in chain if not _same_path(p, ws) and p != Path(p.anchor)]
     home = Path.home().resolve(strict=False)
-    chain = [p for p in chain if p != home]
+    chain = [p for p in chain if not _same_path(p, home)]
 
     for p in chain:
         if (p / ".orkestra").is_dir():

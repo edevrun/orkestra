@@ -12,9 +12,9 @@ disable-model-invocation: true
 - AskUserQuestion does not exist. Wherever the text says to ask with it: write the question(s) in the chat, run
   `orkestra await "<one-line summary>"`, then end your turn (`orkestra playbook headless` has the wording — the user
   reads your message right here in the chat). The user's next message is the answer; a hook marks the run active
-  again. Plan approval is any clear approve intent the hook recognizes ("onay", "onaylıyorum",
-  "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "onay". Never approve yourself; after
-  their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
+  again. Plan approval is any clear approve intent the hook recognizes ("approve", "I approve", "go ahead", "lgtm",
+  "onay", "onaylıyorum", "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "approve". Never
+  approve yourself; after their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
   never skipped ("don't ask questions" in the request does not waive it) and never recorded by you in any way.
 - There is no SendMessage: to send findings back to a subagent, launch the same subagent type again with the
   findings and the path of its previous report.
@@ -27,6 +27,6 @@ The user explicitly asked to commit and push. Hint: (what the user wrote with th
 
 1. Resolve the project (`orkestra context`). Show `git status --short` and `git diff --stat`.
 2. Stage only the files that belong to the finished work (use `orkestra changes --run <last run>` when relevant; never stage secrets, `.env*`, keys, build output). `.orkestra/` memory and feature docs are fine to include; `.orkestra/runs/` is git-ignored.
-3. Commit with the message from the hint, or the "Commit önerisi" in the latest `report.md`, or a conventional commit you write. Never `--no-verify`; if a pre-commit hook fails, fix the cause or report it.
+3. Commit with the message from the hint, or the "Commit suggestion" section (Turkish report: "Commit önerisi") in the latest `report.md`, or a conventional commit you write. Never `--no-verify`; if a pre-commit hook fails, fix the cause or report it.
 4. Push the current branch to its upstream (`git push`); if there is no upstream, ask before setting one. Never force-push.
-5. Report the commit hash, branch and push result in Turkish.
+5. Report the commit hash, branch and push result in the user's language (English by default, Turkish when they write Turkish).

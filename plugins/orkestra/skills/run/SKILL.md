@@ -1,14 +1,17 @@
 ---
 name: run
 description: Orkestra end-to-end delivery pipeline for software work in the user's projects (~/Projects/*). Autopilot is the default; use manual approval only when the user explicitly wants to decide. Discovery → spec + reviewed plan → TDD implementation → no-regression gates → adversarial review → delivery report and project memory. Use for build, change, fix, refactor, migrate or ship work; not for pure explanations or code reading.
-argument-hint: "[proje] <istek>"
+argument-hint: "[project] <request>"
 ---
 
-# Orkestra — şef sensin, ben orkestrayı yönetiyorum
+# Orkestra: you are the conductor, I run the orchestra
 
-The user is the conductor (şef). You are the **orchestrator**: you never improvise the process, you run it.
+The user is the conductor. You are the **orchestrator**: you never improvise the process, you run it.
 The process is enforced by the `orkestra` CLI (state machine, gates, evidence) and hooks (guards). Your memory is
-not the source of truth — files are. Talk to the user in **Turkish**, briefly and with evidence.
+not the source of truth — files are. Talk to the user briefly and with evidence, in **the language they write in**
+(English by default; Turkish when they write Turkish). Write the run artifacts you author (`spec.md`, `plan.md`,
+`report.md`) in that language too, and keep the section headings exactly as `orkestra template <name>` prints them:
+every parser accepts both the English and the Turkish heading, so a run can continue in the other language.
 
 User request: $ARGUMENTS
 
@@ -57,6 +60,9 @@ Subagents run in the **background**: the Agent call returns at once (`async_laun
 arrives later as a message (`<agent-message …>` — a report, never the user; it approves nothing). So after
 dispatching, **end your turn**. The hand-back resumes you and carries the next step. Never `sleep`, loop, or re-read
 files to wait for an agent — a waiting Bash call only delays the report (the `wait` guard blocks it).
+Headless (`mode: headless`) is the one exception: the process exits with your turn and takes the agents with it, so wait
+with ONE call `orkestra wait` (Bash timeout 600000): it blocks inside the process, costs no tokens and prints the next
+step when the agents are done. Never `sleep 30; orkestra next` polling.
 Read-only agents that belong together go out in ONE message. Implementers run one at a time (one working tree); a
 second one is allowed only for a task whose file list does not overlap any task in progress (the CLI refuses
 otherwise), at most 3 at once.
@@ -66,11 +72,15 @@ otherwise), at most 3 at once.
 - `task done` and `phase next` print a `tempo:` line. If it ends with `FLAGS:`, resolve the flag first — it says how.
 - Review **PASS** (with or without minors) → `orkestra task done`. Minors never reopen a task:
   `orkestra task note <TID> "minor: <what>"`; you triage them in the final review. Reopen only on **FAIL**.
-- The third FAIL on one task belongs to the user (the CLI refuses that reopen without `--force "<their ruling>"`).
+- The third FAIL on one task: **manual** mode puts the trade-off to the user (the CLI refuses that reopen without `--force
+  "<their ruling>"` and only accepts it when a user answer is recorded after the last reopen). **Autopilot** has no user:
+  the task is blocked with the question recorded and `--force` cannot lift the cap; run `orkestra task defer <TID> "<why>"`
+  (the final review triages it) or `orkestra block "<why>"`. A step dispatched 3× without new evidence ends the same way:
+  `orkestra next` then says `task block` / defer instead of dispatching again.
 - Manual approval is ONE `AskUserQuestion` containing only the approval question. In autopilot, a validated current plan advances automatically; never fabricate a user's answer.
 - Never open a system dialog on the user's screen (keychain prompts, `osascript` dialogs, GUI installers) — ask first.
-- A subagent that reports **BLOCKED** needs a decision, not the same brief again: decide from spec/context or ask the
-  user, record it (`orkestra task note <TID> "decision: …"`), then dispatch.
+- A subagent that reports **BLOCKED** needs a decision, not the same brief again: decide from spec/context (manual mode
+  may ask the user; autopilot never does, its exits are `task defer` / `orkestra block`), record it (`orkestra task note <TID> "decision: …"`), then dispatch.
 - Write `orkestra` options in full (`--note`, never `--no`): abbreviations are refused.
 
 ## Token discipline (the user pays for every token)
@@ -84,7 +94,7 @@ otherwise), at most 3 at once.
 ## When things go wrong
 
 - Gate regression → back to implement with the failing tail as the brief; fix the cause, never the test.
-- Same task fails review 3× → try an alternate safe implementation; if a material user decision is genuinely required, block with the concrete reason (manual mode may ask).
+- Same task fails review 3× → autopilot: `orkestra task defer <TID> "<why>"` or `orkestra block "<why>"` (no user to ask, `--force` cannot lift the cap); manual: put the trade-off to the user.
 - Truly blocked → `orkestra block "<reason>"` and tell the user exactly what you need.
-- The user changes topic mid-run → `orkestra pause`, help them, then offer `/orkestra:resume`.
+- The user changes topic mid-run → `orkestra pause` (only when this chat drives the run; otherwise do nothing), help them, then offer `/orkestra:resume`.
 - Headless (`orkestra context` says `mode: headless`) → follow `orkestra playbook headless`; the run's approval mode still controls whether a human decision is allowed.

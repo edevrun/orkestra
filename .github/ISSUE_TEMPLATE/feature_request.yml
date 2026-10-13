@@ -1,0 +1,73 @@
+name: Feature request / Özellik isteği
+description: Suggest an improvement to Orkestra. English or Turkish is fine.
+title: "[feat] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Write in English or Turkish (Türkçe de olur).
+
+        Orkestra is Python standard library only and keeps its rules in code and hooks, not in prompts. A proposal that fits
+        that is easiest to accept. A new language is a feature request too: say which one and whether you can review it.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What gap or friction does this address? Who runs into it, and when?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What should Orkestra do instead? Commands, flags or messages as you would like to see them.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Pick all that apply.
+      multiple: true
+      options:
+        - Guards or the phase machine
+        - Engine adapter (Claude Code, Cursor, Copilot)
+        - CLI or output
+        - Bridge or local web UI
+        - Installer or platform support (macOS, Linux, Windows)
+        - Localization (text, or a new language)
+        - Documentation
+    validations:
+      required: true
+  - type: dropdown
+    id: dependency
+    attributes:
+      label: Would it need a new dependency?
+      options:
+        - "No"
+        - "Yes (please explain below)"
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Orkestra version
+      description: Output of `orkestra --version`.
+      placeholder: orkestra 1.6.0
+    validations:
+      required: false
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Does it change a guard, the phase machine or an engine adapter? Would you like to work on it yourself?
+    validations:
+      required: false

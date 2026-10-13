@@ -1,13 +1,31 @@
 name: tests
-on: [push, pull_request]
+
+on:
+  push:
+  pull_request:
+
+# A newer push to the same branch or pull request cancels the run it supersedes.
+concurrency:
+  group: tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
+  # The whole Python suite (plugin + bridge) on every OS and on the oldest, two middle and the newest supported Python.
   unit:
+    name: unit (${{ matrix.os }}, python ${{ matrix.python }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.13", "3.14"]
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.11", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -19,13 +37,89 @@ jobs:
         run: cd plugins/orkestra/tests && python -m unittest discover -s . -q
       - name: bridge tests
         run: cd bridge/tests && python -m unittest discover -s . -q
+        # OpenClaw stays on ubuntu/macos only (see openclaw job below).
+
+  # Cheap static gates, run once: every file compiles, no Python newer than 3.9 syntax, the i18n lint holds, the shell
+  # scripts parse. Failing here is faster and clearer than failing inside a 12-way matrix.
+  static:
+    name: static checks (python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.14"]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: compileall
+        run: python -m compileall -q plugins/orkestra/lib plugins/orkestra/hooks plugins/orkestra/tests bridge install.py
+      - name: Python 3.9 syntax check
+        run: |
+          python - <<'PY'
+          import ast, pathlib, sys
+          bad = []
+          files = [p for p in pathlib.Path(".").rglob("*.py")
+                   if not {"node_modules", ".git", "dist", "internal", "vendor"} & set(p.parts)]
+          files.append(pathlib.Path("plugins/orkestra/bin/orkestra"))
+          for path in files:
+              try:
+                  ast.parse(path.read_text(encoding="utf-8"), filename=str(path), feature_version=(3, 9))
+              except SyntaxError as exc:
+                  bad.append(f"{path}: {exc}")
+          print(f"{len(files)} files checked")
+          sys.exit("\n".join(bad) if bad else 0)
+          PY
+      - name: i18n catalog parity and the no-stray-Turkish lint
+        run: cd plugins/orkestra/tests && python -m unittest test_i18n -q
+      - name: shell scripts parse
+        run: |
+          bash -n install.sh
+          sh -n plugins/orkestra/hooks/run_hook.sh
+
+  # The installer must plan, not touch anything, on all three OSes (HOME points at an empty directory).
+  installer:
+    name: installer dry run (${{ matrix.os }}, python ${{ matrix.python }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.13"]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install.py --dry-run
+        run: |
+          python install.py --dry-run --yes --skip-tests
+          python install.py --uninstall --dry-run
+      - name: install.py in Turkish
+        run: ORKESTRA_LANG=tr python install.py --dry-run --yes --skip-tests
+      - name: install.sh --dry-run
+        if: runner.os != 'Windows'
+        run: bash install.sh --dry-run --yes --skip-tests
+      - name: install.ps1 --dry-run
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./install.ps1 --dry-run --yes --skip-tests
+
   # Logic-only OpenClaw suite (no Homebrew openclaw). Full plugin e2e stays local-only.
   openclaw:
+    name: openclaw (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

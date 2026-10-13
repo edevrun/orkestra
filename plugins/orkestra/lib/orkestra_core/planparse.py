@@ -1,25 +1,27 @@
 """Parsers for spec.md / plan.md / verification.md / triage.md.
 
-The formats are defined by templates/ (Turkish headings, English synonyms accepted).
+The formats are defined by templates/<lang>/ (English and Turkish). EVERY reader accepts both spellings of every
+heading and task label (`messages/protocol.py`), compared without regard to case, diacritics or punctuation, so a run
+started in one language continues in the other and runs written by older versions keep parsing.
 Parsers are deliberately tolerant about whitespace and strict about structure.
 """
 from __future__ import annotations
 
+import functools
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
+
+from . import i18n
+from .messages import protocol as P
 
 ID_RE = re.compile(r"\b((?:FR|SC)-\d{3})\b")
 TASK_HEAD_RE = re.compile(r"^###\s+(T\d{3})\s*(?:[—–:\-]+\s*)?(.*?)\s*$", re.M)
 
-FIELD_ALIASES = {
-    "files": ("dosyalar", "files", "dosya"),
-    "acceptance": ("kabul", "acceptance", "kabul kriteri", "kabul kriterleri"),
-    "test": ("test", "tests", "testler", "doğrulama"),
-    "tdd": ("tdd",),
-    "depends": ("bağımlı", "bagimli", "depends", "bağımlılık", "dependencies"),
-}
+# folded task-field spelling → field key (all languages; see messages/protocol.TASK_FIELD_ALIASES)
+FIELD_ALIASES = {key: tuple(P.fold(a) for a in names) for key, names in P.TASK_FIELD_ALIASES.items()}
+_NEW_MARKER_RE = re.compile(r"\(\s*(?:" + "|".join(re.escape(P.ascii_fold(m)) for m in P.NEW_FILE_MARKERS) + r")")
+_DONE_WORDS = frozenset(P.fold(w) for w in P.TRIAGE_DONE_WORDS)
 
 
 def parse_frontmatter(text: str) -> Tuple[Dict[str, object], str]:
@@ -106,21 +108,68 @@ def spec_ids(spec_text: str) -> List[str]:
     return seen
 
 
+_H23_RE = re.compile(r"^#{2,3}[ \t]+(.+)$", re.M)          # titles are compared folded, so trailing blanks need no regex
+_H2_RE = re.compile(r"^##[ \t]+(.*)$", re.M)
+
+
+def _title_starts_with(title: str, name: str, whole_word: bool) -> bool:
+    t, n = P.fold(title), P.fold(name)
+    if not n or not t.startswith(n):
+        return False
+    return not whole_word or len(t) == len(n) or t[len(n)] == " "
+
+
+@functools.lru_cache(maxsize=None)
+def _longer_siblings(section_id: str) -> Tuple[str, ...]:
+    """Folded headings of OTHER sections that extend a heading of this one (`Kapsam` / `Kapsam ici`): a title that
+    starts with one of them belongs to that other section."""
+    mine = [P.fold(h) for h in P.SECTIONS[section_id]]
+    return tuple(P.fold(h) for sid, pair in P.SECTIONS.items() if sid != section_id for h in pair
+                 if any(P.fold(h).startswith(m + " ") for m in mine))
+
+
+def _is_heading_of(title: str, section_id: str, whole_word: bool) -> bool:
+    t = P.fold(title)
+    if any(t.startswith(x) for x in _longer_siblings(section_id)):
+        return False
+    return any(_title_starts_with(title, alias, whole_word) for alias in i18n.heading_aliases(section_id))
+
+
 def has_section(text: str, *names: str) -> bool:
-    for name in names:
-        if re.search(r"^#{2,3}\s+" + re.escape(name) + r"\b", text, re.M | re.I):
-            return True
-    return False
+    """A level-2/3 heading that starts with one of `names` (case, diacritics and punctuation do not matter)."""
+    titles = [m.group(1) for m in _H23_RE.finditer(text)]
+    return any(_title_starts_with(t, name, True) for name in names for t in titles)
+
+
+def has_heading(text: str, section_id: str) -> bool:
+    """`has_section` for a protocol section id (messages/protocol.SECTIONS): the heading of EITHER language counts."""
+    return any(_is_heading_of(m.group(1), section_id, True) for m in _H23_RE.finditer(text))
+
+
+def heading_body(text: str, section_id: str) -> Optional[str]:
+    """`section` for a protocol section id: the body under the heading of either language."""
+    return _section_where(text, [lambda title: _is_heading_of(title, section_id, False)])
 
 
 # ---------------------------------------------------------------- plan tasks
 
-@dataclass
 class Task:
-    id: str
-    title: str
-    body: str
-    fields: Dict[str, str] = field(default_factory=dict)
+    """One plan task. A plain class with dataclass semantics (init, eq, repr): `dataclasses` costs a hook 5 ms."""
+    __hash__ = None  # type: ignore[assignment]
+
+    def __init__(self, id: str, title: str, body: str, fields: Optional[Dict[str, str]] = None):
+        self.id = id
+        self.title = title
+        self.body = body
+        self.fields = {} if fields is None else fields
+
+    def __eq__(self, other: object) -> bool:
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        return (self.id, self.title, self.body, self.fields) == (other.id, other.title, other.body, other.fields)
+
+    def __repr__(self) -> str:
+        return f"Task(id={self.id!r}, title={self.title!r}, body={self.body!r}, fields={self.fields!r})"
 
     @property
     def files(self) -> List[str]:
@@ -132,12 +181,12 @@ class Task:
 
     @property
     def file_entries(self) -> List[Tuple[str, bool]]:
-        """[(path, is_new)] — a file is new when followed by (yeni)/(new)/(oluşturulacak)/(create)."""
+        """[(path, is_new)] — a file is new when followed by (new)/(create…) or the Turkish (yeni)/(olustur...)."""
         raw = self.fields.get("files", "")
         out: List[Tuple[str, bool]] = []
         for m in re.finditer(r"`([^`]+)`([^`,;]*)", raw):
-            path, tail = m.group(1).strip(), m.group(2).lower()
-            out.append((path, bool(re.search(r"\((yeni|new|oluştur\w*|create\w*)", tail))))
+            path, tail = m.group(1).strip(), P.ascii_fold(m.group(2))
+            out.append((path, bool(_NEW_MARKER_RE.search(tail))))
         return out
 
     @property
@@ -151,7 +200,7 @@ class Task:
 
 
 def _field_key(label: str) -> Optional[str]:
-    label = label.strip().strip("*").strip().lower()
+    label = P.fold(label.strip().strip("*"))
     for key, aliases in FIELD_ALIASES.items():
         if label in aliases:
             return key
@@ -192,18 +241,33 @@ def task_section(plan_text: str, task_id: str) -> Optional[str]:
     return None
 
 
-def section(text: str, *names: str) -> Optional[str]:
-    """Return the body of the first level-2 section whose title starts with one of names."""
-    for name in names:
-        m = re.search(r"^##\s+" + re.escape(name) + r"[^\n]*\n", text, re.M | re.I)
-        if m:
-            rest = text[m.end():]
-            nxt = re.search(r"^##\s+", rest, re.M)
-            return rest[: nxt.start()] if nxt else rest
+def _section_where(text: str, matchers: List[Callable[[str], bool]]) -> Optional[str]:
+    heads = list(_H2_RE.finditer(text))
+    for match in matchers:                                  # matchers are tried in order, headings in document order
+        for m in heads:
+            if match(m.group(1)):
+                end = text.find("\n", m.end())
+                rest = text[end + 1:] if end >= 0 else ""
+                nxt = re.search(r"^##\s+", rest, re.M)
+                return rest[: nxt.start()] if nxt else rest
     return None
 
 
+def section(text: str, *names: str) -> Optional[str]:
+    """Return the body of the first level-2 section whose title starts with one of names (names are tried in order)."""
+    return _section_where(text, [lambda title, n=n: _title_starts_with(title, n, False) for n in names])
+
+
 # ---------------------------------------------------------------- checks
+
+def _lang_pair(en: str, tr: str) -> str:
+    return tr if i18n.lang() == "tr" else en
+
+
+def _field_label(key: str) -> str:
+    """The task-line label the current language's plan template uses (`Files` / `Dosyalar`)."""
+    return _lang_pair(*P.TASK_FIELDS[key])
+
 
 def check_plan(spec_text: str, plan_text: str, project: Optional[Path] = None) -> List[str]:
     """Structural lint (+ file existence when `project` is given). Returns problems (empty == OK)."""
@@ -226,8 +290,7 @@ def check_plan(spec_text: str, plan_text: str, project: Optional[Path] = None) -
     for t in tasks:
         for req in ("files", "acceptance", "test"):
             if not t.fields.get(req, "").strip():
-                label = {"files": "Dosyalar", "acceptance": "Kabul", "test": "Test"}[req]
-                problems.append(f"{t.id}: missing `- {label}:` line")
+                problems.append(f"{t.id}: missing `- {_field_label(req)}:` line")
         if t.tdd == "n/a" and "(" not in t.fields.get("tdd", "") and len(t.fields.get("tdd", "")) < 8:
             problems.append(f"{t.id}: `TDD: n/a` needs a reason, e.g. `TDD: n/a (docs only)`")
         for dep in t.depends:
@@ -239,13 +302,14 @@ def check_plan(spec_text: str, plan_text: str, project: Optional[Path] = None) -
                     continue
                 if not is_new and not (project / path).exists():
                     problems.append(f"{t.id}: `{path}` does not exist in the project — fix the path, or mark it "
-                                    f"`(yeni)` if the task creates it")
+                                    f"`({_lang_pair(*P.NEW_FILE_LABEL)})` if the task creates it")
     # requirement coverage: every FR must be referenced by at least one task
     fr_ids = [i for i in spec_ids(spec_text) if i.startswith("FR-")]
     task_text = "\n".join(t.body for t in tasks)
     for fr in fr_ids:
         if fr not in task_text:
-            problems.append(f"{fr} is not covered by any task (reference it in a task's `Kabul:` line)")
+            problems.append(f"{fr} is not covered by any task (reference it in a task's "
+                            f"`{_field_label('acceptance')}:` line)")
     sc_ids = [i for i in spec_ids(spec_text) if i.startswith("SC-")]
     for sc in sc_ids:
         if sc not in plan_text:
@@ -290,7 +354,7 @@ def open_triage_items(triage_text: str) -> List[str]:
         cells = [c.strip().lower() for c in line.strip().strip("|").split("|")]
         if not cells or not re.match(r"^r-\d{3}$", cells[0]):
             continue
-        if "fix" in cells and not any(c in ("done", "fixed", "tamam", "yapıldı") for c in cells):
+        if "fix" in cells and not any(P.fold(c) in _DONE_WORDS for c in cells):
             open_items.append(cells[0].upper())
         if any(c in ("pending", "untriaged", "?") for c in cells):
             open_items.append(cells[0].upper() + " (untriaged)")

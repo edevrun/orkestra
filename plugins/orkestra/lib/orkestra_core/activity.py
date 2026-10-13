@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import paths
+from .i18n import t
 from .util import file_lock, read_json, write_json_atomic
 
 MAX_BYTES = 512 * 1024
@@ -22,8 +23,10 @@ ARCHIVE_MAX_BYTES = 16 * 1024 * 1024       # activity.1.jsonl (older rows, kept 
 # user: a HUMAN prompt · handback: a subagent report / task notification delivered as a prompt (not the user)
 # idle: the main turn ended (the session waits for the user) · wait_agents: the main turn ended while subagents
 # are still running (their hand-back resumes it) · nudge: Stop hook kept the run going · bind: session bound
+# perm_wait: the host shows a permission prompt · api_error: the turn died on a model/API error · loop: the deny
+# circuit breaker blocked the run (these three are asides: never progress, never an open question)
 HIDDEN_KINDS = ("end",)
-ASIDE_KINDS = ("end", "nudge", "handback", "agent_done")    # never hide an open question / never count as progress
+ASIDE_KINDS = ("end", "nudge", "handback", "agent_done", "status", "perm_wait", "api_error", "loop")    # never hide an open question / never count as progress
 KEEP_LINES = 1200
 SYNTHETIC_PROMPT_PREFIXES = ("<agent-message", "<task-notification", "[Subagent hand-back]")
 _MASK = re.compile(r"(?i)((?:token|secret|password|passwd|api[_-]?key|authorization)\s*[=:]\s*(?:bearer\s+)?"
@@ -41,6 +44,12 @@ def _rel(project: Path, p: str) -> str:
         return p
 
 
+def ask_heads(ev: Dict[str, Any]) -> str:
+    """What an AskUserQuestion call asks about: the question headers (else the questions), comma separated."""
+    qs = (ev.get("tool_input") or {}).get("questions") or []
+    return ", ".join(str(q.get("header") or q.get("question") or "")[:30] for q in qs if isinstance(q, dict))
+
+
 def summarize(ev: Dict[str, Any], project: Path) -> str:
     tool = ev.get("tool_name") or ""
     ti = ev.get("tool_input") or {}
@@ -53,9 +62,7 @@ def summarize(ev: Dict[str, Any], project: Path) -> str:
     if tool == "SendMessage":
         return f"→ {ti.get('to') or ti.get('recipient') or '?'}: {ti.get('summary') or ''}"[:160]
     if tool == "AskUserQuestion":
-        qs = ti.get("questions") or []
-        heads = ", ".join(str(q.get("header") or q.get("question") or "")[:30] for q in qs if isinstance(q, dict))
-        return f"soru: {heads}"[:160]
+        return t("activity.ask_summary", heads=ask_heads(ev))[:160]
     if tool in ("Grep", "Glob"):
         return f"{ti.get('pattern') or ''} {ti.get('path') or ti.get('glob') or ''}".strip()[:160]
     if tool in ("WebFetch", "WebSearch"):
@@ -66,7 +73,7 @@ def summarize(ev: Dict[str, Any], project: Path) -> str:
     return ""
 
 
-def record(project: Path, run_id: str, ev: Dict[str, Any], kind: str, extra: str = "") -> None:
+def record(project: Path, run_id: str, ev: Dict[str, Any], kind: str, extra: str = "", key: str = "") -> None:
     try:
         path = paths.run_dir(project, run_id) / "activity.jsonl"
         if not path.parent.is_dir():
@@ -81,13 +88,18 @@ def record(project: Path, run_id: str, ev: Dict[str, Any], kind: str, extra: str
             "tool": ev.get("tool_name") or "",
             "what": _mask(what),
         }
+        if key:
+            row["key"] = key[:16]                           # deny rows: short id of the refused call (loop post-mortems)
         sid = str(ev.get("session_id") or "")
         if sid:
             row["sid"] = re.sub(r"[^A-Za-z0-9_.-]", "_", sid)[:120]
         if ev.get("agent_type") and ev.get("agent_id"):
             row["aid"] = str(ev["agent_id"])[:64]           # which instance (two implementers share one type)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        # the append shares _rotate's lock: a rotation rewrites the file from a snapshot and would drop a row appended
+        # meanwhile (end/deny rows feed the stall classifiers). Short wait, then append unlocked: never hold a hook up.
+        with file_lock(path, timeout=1.0, on_timeout="proceed"):
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         if path.stat().st_size > MAX_BYTES:
             _rotate(path)
     except Exception:
@@ -245,7 +257,7 @@ def pending_question(rows: List[Dict[str, Any]]) -> Optional[str]:
         if k in ASIDE_KINDS or (r.get("agent") or "main") != "main":
             continue
         if k == "tool" and r.get("tool") == "AskUserQuestion":
-            return r.get("what") or "soru"
+            return r.get("what") or t("activity.question")
         return None
     return None
 
@@ -336,6 +348,17 @@ def launch_info(ev: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "tasks": sorted(set(AGENT_TASK_RE.findall(blob)))[:8]}
 
 
+def agent_tasks(project: Path, run_id: str, agent_id: str) -> Optional[List[str]]:
+    """The task ids registered for one running subagent (from its Task prompt); None when no entry names that id."""
+    try:
+        entry = (_agents_load(_agents_path(project, run_id)).get("pending") or {}).get(agent_id)
+    except Exception:
+        return None
+    if not agent_id or not isinstance(entry, dict):
+        return None
+    return [str(x) for x in entry.get("tasks") or []]
+
+
 def agent_launched(project: Path, run_id: str, info: Dict[str, Any], now: Optional[float] = None,
                    session: str = "") -> None:
     """`session` = the session that launched it: only that session's process can ever receive the hand-back."""
@@ -352,9 +375,48 @@ def agent_launched(project: Path, run_id: str, info: Dict[str, Any], now: Option
             seen[key] = {"type": info.get("type"), "name": info.get("name") or ""}
             if len(seen) > 300:
                 data["seen"] = dict(list(seen.items())[-200:])
+            _ring_add(data, info.get("type"), info.get("tasks"), now)
             write_json_atomic(path, data)
     except Exception:
         pass
+
+
+# Every launch (background or foreground, Claude or Cursor) goes into a bounded ring: `orkestra next` counts identical
+# dispatches without progress from it (tempo.dispatch_escalation) instead of repeating the same instruction forever.
+LAUNCH_RING = 200
+
+
+def _ring_add(data: Dict[str, Any], agent_type: Any, tasks: Any, now: float) -> None:
+    ring = [x for x in (data.get("launches") or []) if isinstance(x, dict)]
+    ring.append({"type": str(agent_type or "agent"), "tasks": sorted({str(x) for x in (tasks or [])})[:8], "at": now})
+    data["launches"] = ring[-LAUNCH_RING:]
+
+
+def launch_from_event(ev: Dict[str, Any]) -> Dict[str, Any]:
+    """{type, tasks} of any Agent/Task call, foreground ones included (launch_info only describes background ones)."""
+    ti = ev.get("tool_input") or {}
+    blob = f"{ti.get('description') or ''} {ti.get('prompt') or ''}"
+    return {"type": str(ti.get("subagent_type") or "agent"), "tasks": sorted(set(AGENT_TASK_RE.findall(blob)))[:8]}
+
+
+def record_launch(project: Path, run_id: str, info: Dict[str, Any], now: Optional[float] = None) -> None:
+    """Add one launch to the ring (hooks call it for foreground launches; agent_launched does it for background ones)."""
+    try:
+        path = _agents_path(project, run_id)
+        if not path.parent.is_dir():
+            return
+        with file_lock(path):
+            data = _agents_load(path)
+            _ring_add(data, info.get("type"), info.get("tasks"), time.time() if now is None else now)
+            write_json_atomic(path, data)
+    except Exception:
+        pass
+
+
+def launches(project: Path, run_id: str) -> List[Dict[str, Any]]:
+    """The launch ring, oldest first: [{type, tasks, at}]."""
+    ring = _agents_load(_agents_path(project, run_id)).get("launches")
+    return [x for x in ring if isinstance(x, dict)] if isinstance(ring, list) else []
 
 
 def agent_messaged(project: Path, run_id: str, to: str, summary: str = "", now: Optional[float] = None,
@@ -376,7 +438,7 @@ def agent_messaged(project: Path, run_id: str, to: str, summary: str = "", now: 
                 return                              # not one of this run's subagents (a teammate, another session)
             meta = data["seen"][key]
             data["pending"][key] = {"id": key, "type": meta.get("type") or "agent", "name": meta.get("name") or "",
-                                    "desc": " ".join(str(summary or "devam mesajı").split())[:80],
+                                    "desc": " ".join(str(summary or t("activity.follow_up")).split())[:80],
                                     "tasks": sorted(set(AGENT_TASK_RE.findall(summary or "")))[:8], "at": now,
                                     "sid": session or ""}
             write_json_atomic(path, data)
@@ -452,6 +514,15 @@ def agents_reports_due(project: Path, run_id: str, max_age: float = 90.0,
         return []
     now = time.time() if now is None else now
     return [dict(v, id=k) for k, v in due.items() if 0 <= now - float(v.get("at") or 0) < max_age]
+
+
+def last_handback_at(project: Path, run_id: str) -> float:
+    """When the newest subagent hand-back reached the main session (0.0 = none recorded)."""
+    hb = _agents_load(_agents_path(project, run_id)).get("last_handback")
+    try:
+        return float(hb.get("at") or 0) if isinstance(hb, dict) else 0.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def agents_purge(project: Path, run_id: str, session: Optional[str] = None,
@@ -545,6 +616,7 @@ def cursor_launch(project: Path, run_id: str, session: str, launch_id: str, agen
             launches.append({"id": launch_id or f"?{int(now * 1000)}", "type": agent_type, "sid": session,
                              "prompt": " ".join((prompt or "").split())[:600], "tdir": transcripts_dir, "at": now, "child": ""})
             data["cursor_launches"] = launches[-CURSOR_LAUNCH_KEEP:]
+            _ring_add(data, agent_type, AGENT_TASK_RE.findall(prompt or ""), now)
             write_json_atomic(path, data)
     except Exception:
         pass
@@ -637,41 +709,36 @@ def agents_last_done(project: Path, run_id: str) -> Optional[Dict[str, Any]]:
 
 def short_agent(agent: str) -> str:
     a = agent or "main"
-    return "ana" if a == "main" else a.split(":", 1)[-1]
+    return t("activity.main_agent") if a == "main" else a.split(":", 1)[-1]
 
 
 def liveness(st: Dict[str, Any], rows: List[Dict[str, Any]], now: Optional[float] = None,
              state_mtime: Optional[float] = None, pending: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
-    """`_liveness` in the words of the run's engine (a Cursor run has no "Claude window" and other skill names)."""
-    out = _liveness(st, rows, now, state_mtime, pending)
-    if (st or {}).get("engine") == "cursor":
-        out = dict(out, text=str(out.get("text") or "").replace("Claude penceresinde", "Cursor sohbetinde")
-                   .replace("/orkestra:", "/orkestra-"))
-    return out
-
-
-def _liveness(st: Dict[str, Any], rows: List[Dict[str, Any]], now: Optional[float] = None,
-              state_mtime: Optional[float] = None, pending: Optional[List[Dict[str, Any]]] = None) -> Dict[str, str]:
-    """What the pipeline is doing right now, in one line + a level for colouring.
+    """What the pipeline is doing right now, in one line + a level for colouring (the line is in the user's language
+    and in the words of the run's engine: a Cursor run has no "Claude window" and other skill names).
 
     level: run | wait | quiet | stale | blocked | paused | done
     """
     now = time.time() if now is None else now
+    cursor = (st or {}).get("engine") == "cursor"
+    where = t("activity.where_cursor" if cursor else "activity.where_claude")
+    resume = "/orkestra-resume" if cursor else "/orkestra:resume"
     status = st.get("status")
     if status == "done":
-        return {"level": "done", "text": "bitti ✓"}
+        return {"level": "done", "text": t("activity.live_done")}
     if status == "aborted":
-        return {"level": "done", "text": "iptal edildi"}
+        return {"level": "done", "text": t("activity.live_aborted")}
     if status == "awaiting_user":
         q = (st.get("awaiting") or {}).get("question") or ""
-        return {"level": "wait", "text": f"SENİ BEKLİYOR — soru: {q}"[:220]}
+        return {"level": "wait", "text": t("activity.live_wait_question", q=q)[:220]}
     if status == "blocked":
-        return {"level": "blocked", "text": f"BLOKE — {(st.get('blocked') or {}).get('reason') or ''}"[:220]}
+        reason = (st.get("blocked") or {}).get("reason") or ""
+        return {"level": "blocked", "text": t("activity.live_blocked", reason=reason)[:220]}
     if status == "paused":
-        return {"level": "paused", "text": "duraklatıldı — devam için o projede /orkestra:resume"}
+        return {"level": "paused", "text": t("activity.live_paused", resume=resume)}
     q = pending_question(rows)
     if q:
-        return {"level": "wait", "text": f"SENİ BEKLİYOR — Claude penceresinde soru açık ({q})"[:220]}
+        return {"level": "wait", "text": t("activity.live_wait_open_question", where=where, q=q)[:220]}
     last = None
     for r in reversed(rows):
         if r.get("kind") != "nudge":
@@ -686,47 +753,56 @@ def _liveness(st: Dict[str, Any], rows: List[Dict[str, Any]], now: Optional[floa
                         + (f" {'/'.join(a.get('tasks') or [])}" if a.get("tasks") else "")
                         + f" {_dur(int(now - float(a.get('at') or now)))}" for a in pending[:4])
         main_waits = any(r.get("kind") == "wait_agents" for r in rows[-3:])
-        return {"level": "run", "text": f"alt-ajan çalışıyor: {who}"
-                                        + (" · ana oturum raporu bekliyor" if main_waits else "")}
+        return {"level": "run", "text": t("activity.live_agents_running", who=who)
+                                        + (" · " + t("activity.live_main_waits") if main_waits else "")}
     if last and last.get("kind") == "idle":
         if state_ts <= event_ts:
-            return {"level": "wait", "text": f"SENİ BEKLİYOR — Claude turu bitirdi ({_ago(age)}); o pencereye cevap yaz"}
+            return {"level": "wait", "text": t("activity.live_wait_turn_ended", ago=_ago(age))}
     talk_phase = st.get("phase") in ("clarify", "approve")
     if talk_phase and (age is None or age >= 90) and not (last and last.get("kind") == "tool"
                                                           and last.get("tool") == "Bash" and (age or 0) < 1800):
-        return {"level": "wait", "text": f"muhtemelen SENİ BEKLİYOR — {st.get('phase')} fazında"
-                                         f"{'' if age is None else ' ' + _dur(age) + ' hareket yok'}; "
-                                         f"o projenin Claude penceresinde soru/onay açık olabilir"}
+        idle = "" if age is None else t("activity.live_idle_for", dur=_dur(age))
+        return {"level": "wait", "text": t("activity.live_maybe_waiting", phase=st.get("phase"), idle=idle, where=where)}
     if status == "active" and state_ts > event_ts:
         state_age = max(0, int(now - state_ts))
         event_age = max(0, int(now - event_ts)) if event_ts else None
         level = "run" if state_age < 90 else "quiet"
-        hook_activity = f"son hook aktivitesi {_ago(event_age)}" if event_age is not None else "henüz hook aktivitesi yok"
-        return {"level": level, "text": f"{st.get('phase') or 'aktif'} fazı açık — run durumu {_ago(state_age)} güncellendi; {hook_activity}"}
+        hook_activity = t("activity.live_hook_last", ago=_ago(event_age)) if event_age is not None \
+            else t("activity.live_hook_none")
+        return {"level": level, "text": t("activity.live_phase_open",
+                                          phase=st.get("phase") or t("activity.live_phase_fallback"),
+                                          state_ago=_ago(state_age), hook=hook_activity)}
     if age is None:
-        return {"level": "quiet", "text": "henüz aktivite kaydı yok"}
+        return {"level": "quiet", "text": t("activity.live_no_record")}
     agents = running_agents(rows)
-    who = f" · çalışan alt-ajan: {', '.join(short_agent(a) for a in agents)}" if agents else ""
+    who = " · " + t("activity.live_running_agents", names=", ".join(short_agent(a) for a in agents)) if agents else ""
     if last and last.get("kind") == "tool" and last.get("tool") == "Bash" and age >= 60:
         return {"level": "run" if age < 1800 else "stale",
-                "text": f"komut çalışıyor · {_dur(age)}: {str(last.get('what') or '')[:90]}{who}"}
+                "text": t("activity.live_command", dur=_dur(age), what=str(last.get("what") or "")[:90], who=who)}
     if age < 90:
-        return {"level": "run", "text": f"çalışıyor — {short_agent(str(last.get('agent') or 'main'))}{who}" if last
-                else "çalışıyor"}
+        return {"level": "run", "text": t("activity.live_working_agent", who=who,
+                                          agent=short_agent(str(last.get("agent") or "main"))) if last
+                else t("activity.live_working")}
     if age < 900:
-        return {"level": "quiet", "text": f"sessiz · {_dur(age)} — model düşünüyor ya da uzun bir adım sürüyor{who}"}
-    return {"level": "stale", "text": f"{_dur(age)} hareket yok — oturum kapanmış olabilir; o projede /orkestra:resume"}
+        return {"level": "quiet", "text": t("activity.live_quiet", dur=_dur(age), who=who)}
+    return {"level": "stale", "text": t("activity.live_stale", dur=_dur(age), resume=resume)}
 
 
-def _dur(seconds: Optional[int]) -> str:
+def _dur(seconds: Optional[int], seconds_below: int = 60) -> str:
+    """`45s` / `3m` / `1h 5m` (`45 sn` / `3 dk` / `1 sa 5 dk`); under `seconds_below` the count stays in seconds."""
     if seconds is None:
         return "?"
-    if seconds < 60:
-        return f"{seconds} sn"
+    if seconds < seconds_below:
+        return t("activity.dur_s", n=seconds)
     if seconds < 3600:
-        return f"{seconds // 60} dk"
-    return f"{seconds // 3600} sa {seconds % 3600 // 60} dk"
+        return t("activity.dur_m", n=seconds // 60)
+    return t("activity.dur_h", h=seconds // 3600, m=seconds % 3600 // 60)
+
+
+def human_duration(seconds: Optional[float]) -> str:
+    """A span for an incident headline (the watchdog): seconds up to 90, then minutes, then hours."""
+    return "?" if seconds is None else _dur(int(max(0, seconds)), 90)
 
 
 def _ago(seconds: Optional[int]) -> str:
-    return "?" if seconds is None else f"{_dur(seconds)} önce"
+    return "?" if seconds is None else t("common.ago", dur=_dur(seconds))

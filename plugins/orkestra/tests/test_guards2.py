@@ -1,7 +1,9 @@
 """Guard fixes and the two tempo guards (wait, dialogs) — every case below comes from a real run on 2026-10-04."""
 import copy
+import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import helpers  # noqa: F401  (sys.path)
 from orkestra_core import guards
@@ -62,6 +64,54 @@ class TestParserFixes(unittest.TestCase):
         self.assertFalse(decide(bash("rm -rf /private/tmp/m14/*", agent="orkestra:implementer"), binding()).denied)
         self.assertFalse(decide(bash("rm -rf /tmp/rev-T043/*", agent="orkestra:reviewer"), binding()).denied)
         self.assertTrue(decide(bash("rm -rf /w/other/*"), binding()).denied)
+
+    def test_windows_temp_paths_are_temp(self):
+        """FR-006 / E9: TEMP, TMP, LOCALAPPDATA\\Temp are temp roots (E10 /tmp still covered above)."""
+        env = {
+            "TEMP": r"C:\Users\ci\AppData\Local\Temp",
+            "TMP": r"C:\Users\ci\AppData\Local\Temp",
+            "LOCALAPPDATA": r"C:\Users\ci\AppData\Local",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            self.assertTrue(guards._is_temp(r"C:\Users\ci\AppData\Local\Temp\orkestra-x\a"))
+            self.assertTrue(guards._is_temp(r"C:\Users\ci\AppData\Local\Temp\probe"))
+            self.assertTrue(guards._is_temp_subdir(r"C:\Users\ci\AppData\Local\Temp\scratch"))
+            # E10 regression: POSIX roots untouched
+            self.assertTrue(guards._is_temp("/tmp/x"))
+            self.assertTrue(guards._is_temp("/private/tmp/y"))
+
+    @unittest.skipIf(os.name == "nt", "a backslash is a path separator on Windows")
+    def test_a_backslash_in_a_posix_file_name_does_not_make_it_temp(self):
+        """On POSIX `/tmp\\evil` is a file called `tmp\\evil` directly under `/`, not a file inside /tmp."""
+        for p in ("/tmp\\evil", "/private/tmp\\x", "/var/folders\\x", "/tmp\\evil/sub"):
+            with self.subTest(path=p):
+                self.assertFalse(guards._is_temp(p))
+                self.assertFalse(guards._is_temp_subdir(p))
+        for tool, ti in (("Write", {"file_path": "/tmp\\evil", "content": "x"}),
+                         ("Bash", {"command": "rm -rf '/tmp\\evil'/*"}),
+                         ("Write", {"file_path": "/var/folders\\evil", "content": "x"})):
+            with self.subTest(tool=tool, input=ti):
+                d = guards.pre_tool_decision({"tool_name": tool, "tool_input": ti, "cwd": "/w/proj"}, CFG, binding(), ())
+                self.assertTrue(d.denied, ti)
+        with mock.patch.dict(os.environ, {"TEMP": "C:\\Users\\ci\\AppData\\Local\\Temp"}, clear=False):
+            self.assertTrue(guards._is_temp("C:\\Users\\ci\\AppData\\Local\\Temp\\a"))     # drive paths still normalise
+
+    def test_windows_orkestra_path_markers(self):
+        """FR-009 / E11: backslash `.orkestra` paths match the same class as POSIX."""
+        from orkestra_core import hints
+        win_cwd = r"C:\proj\.orkestra\runs\001-x"
+        self.assertIn("/.orkestra/", guards._norm_path_markers(win_cwd))
+        self.assertTrue("/.orkestra/runs" in (guards._norm_path_markers(win_cwd).casefold() + "/"))
+        # hints drops run-artifact paths using sep-normalized membership
+        got = hints.playbooks_for(
+            [r"C:\proj\.orkestra\runs\001-x\evidence\log.txt", r"C:\proj\src\auth.ts"],
+            Path("/w/proj"),
+        )
+        self.assertIn("security", got)
+        self.assertEqual(
+            hints.playbooks_for([r"C:\proj\.orkestra\runs\001-x\evidence\log.txt"], Path("/w/proj")),
+            [],
+        )
 
     def test_recursive_project_deletion_is_blocked_but_plan_commands_stay_allowed(self):
         for cmd in ("rm -rf src", "rm -r -f src", "rm --recursive --force src", "command rm -rf src",

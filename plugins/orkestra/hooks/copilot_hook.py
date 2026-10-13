@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import io
 import json
 import os
 import re
 import sys
 import time
-import traceback
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -18,8 +16,13 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent / "lib"))
 
 import dispatch  # noqa: E402
-from orkestra_core import engines as EN, paths, state as ST  # noqa: E402
+from orkestra_core import i18n, paths, state as ST  # noqa: E402
+from orkestra_core.lazy import LazyModule  # noqa: E402
 from orkestra_core.util import file_lock, write_json_atomic  # noqa: E402
+
+# imported when first used (engines pulls in subprocess, shutil, tempfile and uuid; this script starts for every event)
+EN = LazyModule("engines", "orkestra_core")
+hashlib = LazyModule("hashlib")
 
 EVENTS = {
     "SessionStart": "SessionStart",
@@ -49,7 +52,7 @@ TOOL_NAMES = {
 }
 AGENT_ROLES = ("scout", "researcher", "architect", "plan-critic", "implementer", "reviewer", "adversary", "verifier")
 RESUME_COMMAND = re.compile(r"^\s*/orkestra(?::|-)resume\b", re.I)
-RUN_MARKER = re.compile(r"(?m)^\[orkestra:(?:bind|unbind)\] project=(.+?) run=(\S+)\s*$")
+RUN_MARKER = re.compile(r"(?m)^\[orkestra:(?:bind|unbind)\] project=(.+?) run=(\S+)(?: home=.+?)?\s*$")
 
 
 def _copilot_session_id(value: Any) -> str:
@@ -223,8 +226,9 @@ def _bind_explicit_resume(event: Dict[str, Any]) -> Optional[str]:
               if row["id"] != ST._safe(session_id) and row["age"] < lease]
     if others:
         return "[orkestra] Another live session is already driving this run. Do not resume here until it is closed."
-    ST.bind_session(session_id, project, run_id, engine="copilot")
-    dispatch.activity.record(project, run_id, event, "bind", "explicit Copilot /orkestra:resume")
+    if not ST.bind_session(session_id, project, run_id, engine="copilot"):      # validated: a closed run is no run
+        return f"[orkestra] Run {run_id} in {project} cannot be bound ({ST.bind_problem(project, run_id)}); no run state was changed."
+    dispatch.activity.record(project, run_id, event, "bind", i18n.t("dispatch.copilot_bound"))
     return f"[orkestra] Copilot session bound to {run_id} in {project}. Continue only after the CLI resume command succeeds."
 
 
@@ -277,6 +281,11 @@ def normalize_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
         tool_name = str(event.get("tool_name") or event.get("toolName") or "")
         normalized["tool_name"] = TOOL_NAMES.get(tool_name.casefold(), tool_name)
         tool_input = event.get("tool_input", event.get("toolArgs"))
+        if isinstance(tool_input, str):             # `toolArgs` arrives as a JSON string: the command must stay readable
+            try:                                    # (a bind marker counts only in the output of `orkestra start|resume`)
+                tool_input = json.loads(tool_input)
+            except ValueError:
+                tool_input = {}
         if not isinstance(tool_input, dict):
             tool_input = {}
         else:
@@ -342,8 +351,9 @@ def handle_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
             return {"permissionDecision": "deny", "permissionDecisionReason":
                     "[orkestra:roles] Copilot subagent has no active run binding; tool call blocked."}
         captured = io.StringIO()
+        dispatch._ANSWER.update(closed=False, emitted=False)   # this path skips dispatch.main(), which re-opens the answer
         with contextlib.redirect_stdout(captured):
-            handler(normalized)
+            dispatch.run_with_hook_deadline(lambda: handler(normalized))
         raw = captured.getvalue().strip()
         if not raw:
             return {"additionalContext": resume_context} if resume_context else {}
@@ -359,7 +369,14 @@ def handle_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
         if event_name == "SubagentStop" and translated.get("decision") == "block":
             finish_subagent = False
         return translated
+    except dispatch._Deadline as exc:
+        dispatch.log("DEADLINE (" + exc.kind + ") in Copilot " + event_name)
+        if event_name == "PreToolUse":     # a hook that times out lets the call through unchecked: refuse it
+            d = dispatch.deadline_denial(exc)
+            return {"permissionDecision": "deny", "permissionDecisionReason": "[orkestra:" + d.guard + "] " + d.reason}
+        return {}
     except Exception as exc:
+        import traceback                    # only an error needs it (importing it costs 9 ms)
         dispatch.log("ERROR in Copilot " + event_name + ": " + str(exc) + "\n" + traceback.format_exc())
         if event_name == "PreToolUse":
             return {"permissionDecision": "deny", "permissionDecisionReason": "[orkestra:complex] Orkestra hook failure; tool call blocked."}
@@ -371,6 +388,7 @@ def handle_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
 
 def main() -> int:
     event_name = sys.argv[1] if len(sys.argv) > 1 else ""
+    dispatch.utf8_stdio()
     try:
         raw = sys.stdin.read()
         event = json.loads(raw) if raw.strip() else {}

@@ -18,6 +18,11 @@ DISPATCH = PLUGIN / "hooks" / "dispatch.py"
 CURSOR_HOOK = PLUGIN / "hooks" / "cursor_hook.py"
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
+# Human-facing text is localized (i18n.py). The suite must not depend on the developer's locale or config: it is pinned
+# to Turkish, the language its legacy assertions were written in; tests of the English side set ORKESTRA_LANG=en.
+os.environ["ORKESTRA_LANG"] = "tr"
+# The suite never spawns the detached fast watcher (SessionStart calls fastwatch.ensure_running; this switch makes it a no-op).
+os.environ["ORKESTRA_NO_DAEMON"] = "1"
 
 
 REF_NOMINAL = 0.03      # CPU seconds the reference loop takes on an idle, current machine
@@ -64,6 +69,35 @@ def run_cursor_hook(event: str, payload_json: str, timeout: float = 60.0,
     env = {k: v for k, v in os.environ.items() if keep_agent_env or k not in _AGENT_ENV}
     out_path = Path(tempfile.mkdtemp(prefix="orkestra-chook-")) / "out.json"
     try:
+        if os.name == "nt":
+            spawn = (
+                "flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)\n"
+                "cp = subprocess.run([sys.executable, hook, event], input=payload,\n"
+                "                    capture_output=True, text=True, env=env, creationflags=flags)\n"
+                "body = (cp.stdout if cp.returncode == 0 and cp.stdout.strip() else "
+                "('__ERR__\\n' + str(cp.returncode) + '\\n' + (cp.stderr or '') + '\\n' + (cp.stdout or '')))\n"
+                "tmp = out + '.tmp'\n"
+                "with open(tmp, 'w', encoding='utf-8') as fh:\n"
+                "    fh.write(body); fh.flush(); os.fsync(fh.fileno())\n"
+                "os.replace(tmp, out)\n"
+            )
+        else:
+            spawn = (
+                "if os.fork() == 0:\n"
+                "    os.setsid()\n"
+                "    if os.fork() == 0:\n"
+                "        cp = subprocess.run([sys.executable, hook, event], input=payload,\n"
+                "                            capture_output=True, text=True, env=env)\n"
+                "        body = (cp.stdout if cp.returncode == 0 and cp.stdout.strip() else "
+                "('__ERR__\\n' + str(cp.returncode) + '\\n' + (cp.stderr or '') + '\\n' + (cp.stdout or '')))\n"
+                "        tmp = out + '.tmp'\n"
+                "        with open(tmp, 'w', encoding='utf-8') as fh:\n"
+                "            fh.write(body); fh.flush(); os.fsync(fh.fileno())\n"
+                "        os.replace(tmp, out)\n"
+                "        os._exit(0)\n"
+                "    os._exit(0)\n"
+                "os.wait()\n"
+            )
         script = (
             "import os, sys, subprocess\n"
             f"out = {str(out_path)!r}\n"
@@ -71,20 +105,7 @@ def run_cursor_hook(event: str, payload_json: str, timeout: float = 60.0,
             f"hook = {str(CURSOR_HOOK)!r}\n"
             f"payload = {payload_json!r}\n"
             "env = dict(os.environ)\n"
-            "if os.fork() == 0:\n"
-            "    os.setsid()\n"
-            "    if os.fork() == 0:\n"
-            "        cp = subprocess.run([sys.executable, hook, event], input=payload,\n"
-            "                            capture_output=True, text=True, env=env)\n"
-            "        body = (cp.stdout if cp.returncode == 0 and cp.stdout.strip() else "
-            "('__ERR__\\n' + str(cp.returncode) + '\\n' + (cp.stderr or '') + '\\n' + (cp.stdout or '')))\n"
-            "        tmp = out + '.tmp'\n"
-            "        with open(tmp, 'w', encoding='utf-8') as fh:\n"
-            "            fh.write(body); fh.flush(); os.fsync(fh.fileno())\n"
-            "        os.replace(tmp, out)\n"
-            "        os._exit(0)\n"
-            "    os._exit(0)\n"
-            "os.wait()\n"
+            + spawn
         )
         subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=timeout)
         deadline = time.time() + timeout
@@ -117,19 +138,31 @@ def driver_prompt(engine: str, session_id: str, prompt: str, cwd: str):
     env = {k: v for k, v in os.environ.items() if k not in _AGENT_ENV}
     out_path = Path(tempfile.mkdtemp(prefix="orkestra-drv-")) / "out.txt"
     try:
+        if os.name == "nt":
+            spawn = (
+                "import subprocess\n"
+                "flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'DETACHED_PROCESS', 0)\n"
+                "from orkestra_core import engines\n"
+                f"r = engines.driver_prompt({engine!r}, {session_id!r}, {prompt!r}, {cwd!r})\n"
+                "open(out, 'w', encoding='utf-8').write('' if r is None else ('\\0' + r))\n"
+            )
+        else:
+            spawn = (
+                "if os.fork() == 0:\n"
+                "    os.setsid()\n"
+                "    if os.fork() == 0:\n"
+                "        from orkestra_core import engines\n"
+                f"        r = engines.driver_prompt({engine!r}, {session_id!r}, {prompt!r}, {cwd!r})\n"
+                "        open(out, 'w', encoding='utf-8').write('' if r is None else ('\\0' + r))\n"
+                "        os._exit(0)\n"
+                "    os._exit(0)\n"
+                "os.wait()\n"
+            )
         script = (
             "import os, sys\n"
             f"sys.path.insert(0, {str(LIB)!r})\n"
             f"out = {str(out_path)!r}\n"
-            "if os.fork() == 0:\n"
-            "    os.setsid()\n"
-            "    if os.fork() == 0:\n"
-            "        from orkestra_core import engines\n"
-            f"        r = engines.driver_prompt({engine!r}, {session_id!r}, {prompt!r}, {cwd!r})\n"
-            "        open(out, 'w', encoding='utf-8').write('' if r is None else ('\\0' + r))\n"
-            "        os._exit(0)\n"
-            "    os._exit(0)\n"
-            "os.wait()\n"
+            + spawn
         )
         subprocess.run([sys.executable, "-c", script], env=env, check=True, timeout=60)
         deadline = time.time() + 60

@@ -11,9 +11,9 @@ description: "Show where Orkestra runs stand — phase, tasks, evidence, approva
 - AskUserQuestion does not exist. Wherever the text says to ask with it: write the question(s) in the chat, run
   `orkestra await "<one-line summary>"`, then end your turn (`orkestra playbook headless` has the wording — the user
   reads your message right here in the chat). The user's next message is the answer; a hook marks the run active
-  again. Plan approval is any clear approve intent the hook recognizes ("onay", "onaylıyorum",
-  "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "onay". Never approve yourself; after
-  their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
+  again. Plan approval is any clear approve intent the hook recognizes ("approve", "I approve", "go ahead", "lgtm",
+  "onay", "onaylıyorum", "onay verdim", "bu planı onaylıyorum yap …") — not only the bare word "approve". Never
+  approve yourself; after their message run `orkestra phase next`, which tells you whether the approval was recorded. The approval is
   never skipped ("don't ask questions" in the request does not waive it) and never recorded by you in any way.
 - There is no SendMessage: to send findings back to a subagent, launch the same subagent type again with the
   findings and the path of its previous report.
@@ -26,5 +26,5 @@ Report orkestra status (read-only). Project hint: (what the user wrote with this
 
 If no project is given, run `orkestra watch --once` (every open run in the workspace: phase, what it is doing now,
 whether it waits for the user). With a project: `orkestra context -p <project>` and, if there is an active run,
-`orkestra status -p <project>` plus `orkestra watch --once -p <project>`. Answer in Turkish in ≤ 10 lines: project, run, phase, tasks progress, evidence gaps, what happens next, and whether anything waits for the user. Mention that live tracking is available with `orkestra watch` (terminal) or
+`orkestra status -p <project>` plus `orkestra watch --once -p <project>`. Answer in the user's language (English by default, Turkish when they write Turkish) in ≤ 10 lines: project, run, phase, tasks progress, evidence gaps, what happens next, and whether anything waits for the user. Mention that live tracking is available with `orkestra watch` (terminal) or
 `orkestra dashboard --open` (browser, http://127.0.0.1:47616/). Do not continue the run unless the user asks.

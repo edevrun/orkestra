@@ -11,56 +11,79 @@ from __future__ import annotations
 import re
 from typing import List, Optional, Set
 
+from .messages import protocol as _protocol
 from .util import norm_lower
+
+
+class _LazyRe:
+    """`re.compile(...)` done on first use. The vocabulary below is ~40 large IGNORECASE patterns (8 ms to compile):
+    a hook compiles only the few its event needs, not all of them at start-up."""
+    __slots__ = ("_args", "_rx")
+
+    def __init__(self, *args):
+        self._args = args
+        self._rx = None
+
+    def __getattr__(self, name):
+        rx = self._rx
+        if rx is None:
+            rx = self._rx = re.compile(*self._args)
+        return getattr(rx, name)
+
 
 _NOUNISH = (r"(?!\s*(mesaj|message|msg|hash|id\b|geçmiş|history|log|sayısı|count|listesi|list|bildirim|notification|"
             r"servis|service|server|sunucu|token|izni|permission|'?(i|ı|u|ü)n\b|'?te\b|'?de\b|'?ler))")
-_QUESTION_TAIL = re.compile(r"\b(commit|komit|push)\w*\s+(mı|mi|mu|mü)\b|\b(commit|komit|push)'?l(e|a)(n)?d(ı|i)(n|niz)?\s*m(ı|i)", re.I)
-_PLURAL = re.compile(r"\b(commit|komit)'?ler\w*|\bpush'?lar\b", re.I)
+_QUESTION_TAIL = _LazyRe(r"\b(commit|komit|push)\w*\s+(mı|mi|mu|mü)\b|\b(commit|komit|push)'?l(e|a)(n)?d(ı|i)(n|niz)?\s*m(ı|i)", re.I)
+_PLURAL = _LazyRe(r"\b(commit|komit)'?ler\w*|\bpush'?lar\b", re.I)
 _LEAD = r"(^|[.!?,;:]\s*|\b(please|and|then|now|also|just|only|ve|sonra|lütfen|şimdi|hemen|sadece|yalnızca|bir\s+de|da|de)\s+)"
 
-_COMMIT_POS = re.compile(
+_COMMIT_POS = _LazyRe(
     r"\b(commit|komit)'?ler\s*m[ıi]s[ıi]n\w*"
     r"|\b(commit|komit)'?le(?!n?m[ae]|r\b|ri\b|rin|re\b|rde|rden|ri\w)\w*"   # commitle, commitleyip (not commitler/-leri)
     r"|\b(commit|komit)\s+(at|et|yap|oluştur|create)(?!m[ae])\b"  # commit at / commit et
     r"|\bcommit\s+(it|this|that|these|them|all|everything|the\s+changes|changes|my\s+changes|your\s+changes|the\s+fix|the\s+work)\b"
     r"|" + _LEAD + r"commit\b" + _NOUNISH +
     r"|\bgit\s+commit\b", re.I)
-_COMMIT_NEG = re.compile(r"\b(commit|komit)'?(le)?n?m[ae]\w*|\b(commit|komit)\s+(atma|etme|yapma)\w*", re.I)
+_COMMIT_NEG = _LazyRe(r"\b(commit|komit)'?(le)?n?m[ae]\w*|\b(commit|komit)\s+(atma|etme|yapma)\w*", re.I)
 
-_PUSH_POS = re.compile(
+_PUSH_POS = _LazyRe(
     r"\bpush'?lar\s*m[ıi]s[ıi]n\w*|\bpush'?la(?!n?m[ae]|r\b|rı|rın)\w*"
     r"|\bpush\s+(et|yap|at)(?!m[ae])\b"
     r"|\bpush\s+(it|this|that|them|the\s+changes|changes|everything|to\s+\w+|origin|upstream)\b"
     r"|" + _LEAD + r"push\b" + _NOUNISH +
     r"|\bgit\s+push\b", re.I)
-_PUSH_NEG = re.compile(r"\bpush'?(la)?n?m[ae]\w*|\bpush\s+(etme|yapma|atma)\w*", re.I)
+_PUSH_NEG = _LazyRe(r"\bpush'?(la)?n?m[ae]\w*|\bpush\s+(etme|yapma|atma)\w*", re.I)
 
-_NEG_EN = re.compile(r"\b(don'?t|do\s+not|never|no|without|avoid|dont)\s+(\w+\s+){0,3}?(commit|push)\w*", re.I)
+_NEG_EN = _LazyRe(r"\b(don'?t|do\s+not|never|no|without|avoid|dont)\s+(\w+\s+){0,3}?(commit|push)\w*", re.I)
 
-_FORCE = re.compile(r"\b(force[\s-]*push|push\s+--force|--force-with-lease|zorla\s*push|force\s+ile)(?!\s*(yapma|etme|atma|kullanma)|\w*\s+yapma)", re.I)
-_AMEND = re.compile(r"(--amend|\bamend\w*)\b", re.I)
-_BRANCH = re.compile(
+_FORCE = _LazyRe(r"\b(force[\s-]*push|push\s+--force|--force-with-lease|zorla\s*push|force\s+ile)(?!\s*(yapma|etme|atma|kullanma)|\w*\s+yapma)", re.I)
+_AMEND = _LazyRe(r"(--amend|\bamend\w*)\b", re.I)
+_BRANCH = _LazyRe(
     r"\b(branch|dal)\w*\s+(aç|oluştur|yarat|create|değiştir|switch)(?!m[ae])"
     r"|\b\S+'?(e|a|ye|ya)\s+(geç|switch)\b(?!m[ae])"
     r"|\b(switch|checkout)\s+(to\s+)?\S+"
     r"|\b(yeni|new|create|switch\s+to|checkout)\s+(a\s+)?(branch|dal)\b"
     r"|checkout\s+-b|switch\s+-c|\bbranch'?(e|a)\s+geç", re.I)
-_PR = re.compile(r"\b(pr|pull\s*request|merge\s*request)\b\s*(aç|oluştur|create|open|gönder)(?!m[ae])"
+_PR = _LazyRe(r"\b(pr|pull\s*request|merge\s*request)\b\s*(aç|oluştur|create|open|gönder)(?!m[ae])"
                  r"|\b(open|create)\s+(a\s+)?(pr|pull\s*request)\b", re.I)
-_GH_WRITE = re.compile(r"\b(issue|release|label|gist)\w*\s+(aç|oluştur|kapat|yaz|ekle|create|close|open|publish|yayınla)(?!m[ae])"
+_GH_WRITE = _LazyRe(r"\b(issue|release|label|gist)\w*\s+(aç|oluştur|kapat|yaz|ekle|create|close|open|publish|yayınla)(?!m[ae])"
                        r"|\b(pr|issue)\w*\s+(yorum|comment)\w*\s+(yaz|ekle|bırak|post|add)", re.I)
-_SYNC = re.compile(r"\b(merge|rebase|pull|cherry-pick|revert)\w*\s+(et|yap|çek|it|this|that|from|origin|main|master|develop|the)(?!m[ae])"
+_SYNC = _LazyRe(r"\b(merge|rebase|pull|cherry-pick|revert)\w*\s+(et|yap|çek|it|this|that|from|origin|main|master|develop|the)(?!m[ae])"
                    r"|\b(son\s+)?değişiklikleri\s+çek(?!m[ae])"
                    r"|\bgit\s+(merge|rebase|pull|cherry-pick|revert)\b|\b(pull|çek)\s+(the\s+)?(latest|son\s+değişiklikleri)", re.I)
-_TAG = re.compile(r"\b(tag|etiket)\w*\s+(oluştur|at|ekle|create|bas)(?!m[ae])|\bcreate\s+(a\s+)?tag\b|\bgit\s+tag\s+\S|\btag'?l[ae]\w*", re.I)
-_STASH = re.compile(r"\bstash\w*\s*(le|yap|et|it|this|changes|pop|apply)?(?!m[ae])|\bgit\s+stash\b", re.I)
-_HARD_RESET = re.compile(r"reset\s+--hard|hard\s+reset|git\s+clean|untracked\s+(dosyaları|files)\s*(sil|temizle|remove|delete)", re.I)
-_DISCARD = re.compile(r"\b(değişiklikleri\s+(at|sil|geri\s*al)(?!m[ae])|discard\s+(the\s+)?changes|reset\s+--hard)\b", re.I)
+_TAG = _LazyRe(r"\b(tag|etiket)\w*\s+(oluştur|at|ekle|create|bas)(?!m[ae])|\bcreate\s+(a\s+)?tag\b|\bgit\s+tag\s+\S|\btag'?l[ae]\w*", re.I)
+_STASH = _LazyRe(r"\bstash\w*\s*(le|yap|et|it|this|changes|pop|apply)?(?!m[ae])|\bgit\s+stash\b", re.I)
+_HARD_RESET = _LazyRe(r"reset\s+--hard|hard\s+reset|git\s+clean|untracked\s+(dosyaları|files)\s*(sil|temizle|remove|delete)", re.I)
+_DISCARD = _LazyRe(r"\b(değişiklikleri\s+(at|sil|geri\s*al)(?!m[ae])|discard\s+(the\s+)?changes|reset\s+--hard)\b", re.I)
+
+
+def _lower(text: str) -> str:
+    """Lower-cased user text with typographic apostrophes (iOS/macOS smart punctuation) read as the ASCII one."""
+    return norm_lower(text or "").replace("’", "'").replace("‘", "'")
 
 
 def git_grants(prompt: str) -> List[str]:
-    text = norm_lower(prompt or "")
+    text = _lower(prompt)
     cats: Set[str] = set()
     if text.strip().startswith(("/orkestra:ship", "/orkestra-ship")):         # Claude Code / Cursor skill names
         cats |= {"commit", "push"}
@@ -114,17 +137,80 @@ def git_grants(prompt: str) -> List[str]:
     return sorted(cats)
 
 
-_APPROVE_EXACT = re.compile(
+# --- control words: what the USER says to let a chat that does not drive a run change it (guards.ownership_guard)
+# and to let go of the run the chat is bound to. A mention is not a request: "add a pause button to the player" and
+# "the abort handler is broken" say nothing about the run, so the verb must have the run (or "it", "this") for its
+# object and end its clause: "pause the run", "pause this and fix X", "duraklat", "bu işi durdur".
+_CTL_START = r"(?:^|[.!?;:,\n]\s*|\b(?:please|pls|and|then|now|just|ok|okay|hey|lütfen|şimdi|hemen|ve|sonra)\s+)"
+_CTL_OBJ_EN = (r"(?:(?:the|this|that|my|our|current|these|all)\s+)?"
+               r"(?:runs?|orkestra|tasks?|jobs?|work|workflow|pipeline|everything|session|chat|it|this|that|here|now)")
+_CTL_END_EN = r"(?=\s*(?:$|[.!?;:,\n]|\b(?:please|pls|now|and|then|thanks|for\s+now)\b))"
+_CTL_OBJ_TR = (r"(?:(?:bu|şu|o|tüm|bütün)\s+)?"
+               r"(?:run|orkestra|iş|görev|çalışma|süreç|oturum|sohbet|her\s*şey|hepsi|bun|şun|on)[a-zçğıöşü]{0,5}(?:'[a-zçğıöşü]+)?")
+_CTL_END_TR = r"(?=\s*(?:$|[.!?;:,\n]|\b(?:lütfen|şimdi|hemen|ve|sonra|çünkü)\b))"
+_PAUSE_WORD = _LazyRe(
+    _CTL_START + r"(?:pause|stop|halt|hold\s+off)\s+" + _CTL_OBJ_EN + _CTL_END_EN
+    + r"|^\s*(?:please\s+|pls\s+)?(?:pause|halt)\b[\s.!]*$"
+    + r"|" + _CTL_START + r"(?:" + _CTL_OBJ_TR + r"\s+)?(?:duraklat|durdur|askıya\s+al|beklet)[a-zçğıöşü]*" + _CTL_END_TR,
+    re.I)
+_ABORT_WORD = _LazyRe(
+    _CTL_START + r"(?:abort|cancel|kill|terminate|end)\s+" + _CTL_OBJ_EN + _CTL_END_EN
+    + r"|^\s*(?:please\s+|pls\s+)?abort\b[\s.!]*$"
+    + r"|" + _CTL_START + r"(?:" + _CTL_OBJ_TR + r"\s+)?(?:iptal\s+et|iptal\s+edelim|vazgeç(?:tim|tik|iyorum)|sonlandır)"
+    + r"[a-zçğıöşü]*" + _CTL_END_TR,
+    re.I)
+_RESUME_WORD = _LazyRe(
+    r"\b(?:resume|continue|go\s+on|carry\s+on|keep\s+going|proceed|unblock\w*|resolved)\b|\bdevam\b|\bçözüldü\b|"
+    r"kald[ıi][gğ][ıi]n\s+yerden|/orkestra[-:]resume\b|"
+    # the bare yes to "shall I continue the run?"
+    r"^\s*(?:yes|yeah|yep|sure|ok|okay|go\s+ahead|please\s+do|evet|tamam|olur|başla)[\s.!]*$", re.I)
+# the user switches topic without naming the other project
+_SWITCH_WORD = _LazyRe(
+    r"\b(?:forget|drop|leave|ditch|abandon)\s+(?:about\s+)?(?:this|that|it|the\s+(?:run|task|job|work|feature))\b|"
+    r"\bnever\s*mind\b|\b(?:new|different|another|unrelated)\s+(?:topic|subject)\b|\bunrelated\s+(?:question|request|task)\b|"
+    r"\b(?:change|switch)\s+(?:of\s+)?(?:topic|subject)\b|\blet'?s\s+(?:do|talk\s+about)\s+something\s+else\b|"
+    r"\bbun[ua]\s+(?:bırak|unut|boşver)\w*|\bkonu\s+değiş\w*|\bbaşka\s+(?:bir\s+)?(?:konu|proje)\w*|"
+    r"\bfarklı\s+bir\s+(?:konu|proje)\w*|\bboşver\b", re.I)
+
+
+def control_grants(prompt: str) -> List[str]:
+    """Which run-control commands this prompt asks for: pause, abort, resume (`resume` also covers unblock, and the
+    plain words that tell a chat to carry on). A hand-back or notification is not the user and never reaches this."""
+    text = _lower(prompt)
+    cats: Set[str] = set()
+    if _PAUSE_WORD.search(text):
+        cats.add("pause")
+    if _ABORT_WORD.search(text):
+        cats.add("abort")
+    if _RESUME_WORD.search(text):
+        cats.add("resume")
+    return sorted(cats)
+
+
+def prompt_grants(prompt: str) -> List[str]:
+    """Everything the user's message permits: the git grants and the run-control grants (stored together per prompt)."""
+    return sorted(set(git_grants(prompt)) | set(control_grants(prompt)))
+
+
+_APPROVE_EXACT = _LazyRe(
     r"^(onay|onayla|onaylıyorum|onayladım|onaylandı|onay\s+verdim|onay\s+veriyorum|evet|evet onay|evet onaylıyorum|"
     r"evet başla|tamam başla|tamam onay|başla|devam|devam et|uygula|kabul|kabul ediyorum|lgtm|approve|approved|"
-    r"i approve|go ahead|yes|ok başla|okey başla)"
+    r"i approve|go ahead|yes|ok başla|okey başla|"
+    # English forms of the same short answers
+    r"ok|okay|ok(?:ay)?,?\s+(?:start|go|go\s+ahead|proceed)|yes,?\s+(?:please|go\s+ahead|proceed|start|continue|approve)|"
+    r"proceed|continue|start|begin|accept|accepted|do\s+it|go\s+for\s+it|looks\s+good|looks\s+good\s+to\s+me|"
+    r"sounds\s+good|ship\s+it|approve\s+it|approve\s+the\s+plan)"
     r"[\s.!👍✅]*$", re.I)
-_NEG_HINT = re.compile(r"(\?|\bmı\b|\bmi\b|\bmu\b|\bmü\b|değil|yok\b|bekle|vermiyorum|etmiyorum|\w+m[ıi]yorum\b|"
+# English verbs that turn a sentence into a change request (also read on the free text after an option label).
+_EN_VERB = (r"(?:change|add|remove|drop|skip|rename|replace|swap|delete|exclude|include|modify|revise|rework|rewrite|"
+            r"redo|split|reorder|tweak|adjust|edit|simplify|reduce|limit|restrict|extend|expand)")
+_NEG_HINT = _LazyRe(r"(\?|\bmı\b|\bmi\b|\bmu\b|\bmü\b|değil|yok\b|bekle|vermiyorum|etmiyorum|\w+m[ıi]yorum\b|"
                        r"\bama\b|\bfakat\b|\bancak\b|\bbut\b|\bnot\b|\bno\b|\bwait\b|hayır|iptal|vazgeç|değiştir|"
-                       r"revize|düzelt|ekle|çıkar|reject|cancel|change|later|sonra|yarın)", re.I)
+                       r"revize|düzelt|ekle|çıkar|reject|cancel|change|later|sonra|yarın|"
+                       r"\b" + _EN_VERB + r"\b|\b(?:except|without|instead|only|first|also|however|although)\b|n't)", re.I)
 
 # Sentence-level approval: user affirms the plan and may add execution fluff ("yap", "en uzman…").
-_APPROVE_PHRASE = re.compile(
+_APPROVE_PHRASE = _LazyRe(
     r"(?:^|[\s,;:.!])("
     r"onay\s*(?:lıyorum|ladım|landı|lıyoruz)|"
     r"onay\s+ver(?:dim|iyorum|iyoruz|ildi)|"
@@ -134,41 +220,122 @@ _APPROVE_PHRASE = re.compile(
     r")(?:\b|$)",
     re.I,
 )
+# The bare imperative ("approve it and go") counts only as the opening words of the message: anywhere else "approve it"
+# is a question, a third person ("only the lead can approve this") or another object ("approve this pull request").
+_APPROVE_IMPERATIVE = _LazyRe(
+    r"^approve\s+(?:it|this|that|the\s+plan|the\s+spec)(?=\s*(?:$|[.!,;:]|\b(?:and|then|now|please|pls|thanks|thank|"
+    r"go|start|begin|implement|proceed|continue|already)\b))",
+    re.I,
+)
 # Change/condition requests that void an otherwise-approving sentence.
-_APPROVE_CHANGE = re.compile(
+_APPROVE_CHANGE = _LazyRe(
     r"(?:\bama\b|\bfakat\b|\bancak\b|\bbut\b).{0,60}?(?:değiştir|çıkar|ekle|revize|düzelt|T0\d{2}|task)|"
+    # English: a contrast followed by a change cue, an exception or substitution, an imperative change verb
+    # ("approve it, skip T002"), or a change verb used as a request ("please change ...", "can you add ...")
+    r"\b(?:but|however|although|though|yet)\b.{0,80}?(?:\b" + _EN_VERB + r"\b|\b(?:instead|first|only|also|not|no|wait|hold)\b|"
+    r"n't|\bT0\d{2}\b|\btasks?\b)|"
+    r"\b(?:except|unless|instead|apart\s+from|other\s+than|aside\s+from)\b|"
+    # a condition, a limit or a retraction anywhere in the message ("I approve, provided ...", "for T001 only",
+    # "the first two tasks", "I approve without T003", "actually, wait", "do not implement T003")
+    r"\b(?:provided|providing|assuming|as\s+long\s+as|so\s+long\s+as|pending|subject\s+to|contingent|conditional(?:ly)?|"
+    r"on\s+(?:the\s+)?condition|with\s+the\s+condition|given\s+that|once|until|only)\b|"
+    r"\b(?:first|last)\s+(?:one|two|three|four|five|six|seven|eight|nine|ten|\d+)\b|"
+    r"\b(?:without|excluding|minus|skipping|besides)\s+(?:the\s+)?(?:task\s+)?T0\d{2}\b|\bT0\d{2}\b|"
+    r"\b(?:actually|not\s+yet|second\s+thoughts?|never\s*mind|scratch\s+that|hold\s+(?:on|off))\b|"
+    r"(?:^|[.;!?]\s*)(?:wait|hold|stop)\b|"
+    r"(?:^|[.;!?:,]\s*)(?:(?:and|also|please|pls)\s+)*(?:do\s*n'?t|do\s+not|never)\s+"
+    r"(?:implement|touch|change|build|include|deploy|ship|start|run|commit|push|modify|edit|remove|delete|add|use|skip|"
+    r"do|write|create|begin|proceed)\b|"
+    r"(?:^|[.;!?:,]\s*)(?:(?:and|also|please|pls)\s+)*" + _EN_VERB + r"\b|"
+    r"\b(?:please|pls|also|plus|then|first|let'?s|(?:can|could|would|will)\s+you|"
+    r"(?:i|we)\s+(?:want|need|would\s+like)(?:\s+you)?\s+to|you\s+(?:should|must|need\s+to))\s+(?:also\s+)?"
+    + _EN_VERB + r"\b|"
+    # a negation right in front of the verb voids the approval; a negation elsewhere ("don't worry, I approve") does not
+    r"\b(?:not|never|don'?t|cannot|can'?t|won'?t|wouldn'?t|shouldn'?t|couldn'?t|isn'?t|aren'?t|haven'?t|hasn'?t|"
+    r"didn'?t|doesn'?t)\s+(?:\w+\s+){0,3}?approv|"
+    r"\b(?:to|let\s+me|should|shall|could|would|might|may|if|unless|until|before|when)\s+(?:i\s+|we\s+|you\s+)?approv|"
+    # a promise or a condition instead of a decision ("I'll approve it tomorrow", "approve it once the tests pass")
+    r"\b(?:i'?ll|i\s+will|we'?ll|we\s+will|i'?m\s+going\s+to|i\s+am\s+going\s+to|gonna|will)\s+(?:\w+\s+)?approv|"
+    r"\bapprov\w*\s+(?:(?:it|this|that|them|the\s+plan|the\s+spec|plan|spec)\s+)?"
+    r"(?:tomorrow|tonight|later|soon|after|once|when|if|until|before|as\s+soon|conditionally|provided|assuming)\b|"
     r"onay\s*vermiyorum|onaylamıyorum|reddet\w*|"
+    # Turkish: a negated, modal, future or conditional form of "approve", a contrast, an exception or a limit
+    r"\bonayl(?:am|anm|ayab|ayac|ayay|ars|asa|ayınca|adıys|ayana|adıkt)\w*|"
+    r"\b(?:ama|fakat|ancak|lakin)\b|\b(?:hariç|haricinde|dışında|yalnızca|yalnız|sadece|şartıyla|koşuluyla)\b|"
+    r"\b(?:başlama|yapma|etme)(?:yın)?\b|"
     r"\b(?:değiştir|revize|iptal|vazgeç|reject|cancel)\w*",
     re.I,
 )
-_APPROVE_QUESTION = re.compile(
+# "start with T001" names where to begin; any other task reference in an approving message limits what is approved.
+_START_WITH_TASK = _LazyRe(
+    r"\b(?:start|begin|starting|beginning|go|proceed|continue)\s+(?:with|from|at|on|by)\s+T0\d{2}\b|"
+    r"\bT0\d{2}(?:'?(?:den|dan|ten|tan))?(?:\s+ile)?\s+(?:başla|başlayın|başlayalım|devam)\w*", re.I)
+
+
+def _change_requested(text: str) -> bool:
+    return bool(_APPROVE_CHANGE.search(_START_WITH_TASK.sub(" ", text)))
+
+
+_APPROVE_QUESTION = _LazyRe(
     r"\bonay\w*\s+(?:mı|mi|mu|mü)\b|\bonaylıyor\s+musun|\bonaylar\s+mısın|\?\s*$",
     re.I,
 )
 
-_EXPLICIT_REJECT = re.compile(r"(onaylamıyorum|onay\s+vermiyorum|reddet\w*|\bhayır\b|\biptal\b|vazgeç\w*|değiştir\w*|"
-                              r"revize|düzelt\w*|\bçıkar\w*|\bekle(?!me)\w*\s|\breject\w*|\bcancel\w*|\bchange\w*|\bama\b|\bbut\b)", re.I)
-_MANUAL_APPROVAL_REQUEST = re.compile(
+_EXPLICIT_REJECT = _LazyRe(r"(onaylamıyorum|onay\s+vermiyorum|reddet\w*|\bhayır\b|\biptal\b|vazgeç\w*|değiştir\w*|"
+                              r"revize|düzelt\w*|\bçıkar\w*|\bekle(?!me)\w*\s|\breject\w*|\bcancel\w*|\bchange\w*|\bama\b|\bbut\b|"
+                              r"\bexcept\b|\binstead\b|onaylamad[ıi][mk]|onaylanmad[ıi]|onaylamak\s+istemiyorum)", re.I)
+_APPROVAL_NOUN = r"(?:approval|sign[- ]?off|ok|okay|confirmation|go[- ]ahead|consent)"
+# Where an imperative to the agent may start: the message, a clause, or after "please" / "you must" / "I want you to".
+_CLAUSE_START = (r"(?:^|[.!?;:,\n]\s*|\b(?:please|pls|and|then|also|just|always|first|"
+                 r"you\s+(?:must|should|need\s+to|have\s+to|will)|(?:i|we)\s+(?:want|need)\s+you\s+to|"
+                 r"make\s+sure(?:\s+you)?|be\s+sure\s+to)\s+)")
+# ... and where it ends: "review the plan first" is a request, "see the plan for the migration" is a sentence about the work.
+_CLAUSE_END = r"(?=\s*(?:$|[.!?;:,\n]|\b(?:first|before|prior|beforehand|until)\b))"
+_MANUAL_APPROVAL_REQUEST = _LazyRe(
     r"\b(?:ben\s+karar\s+verici(?:\s+ol(?:ayım|malıyım|mak\s+istiyorum))?|"
     r"karar(?:ı|ları)\s+ben\s+ver(?:eyim|meliyim|mek\s+istiyorum)|"
     r"(?:onayı|onayları|onay)\s+bana\s+sor\w*|bana\s+onay\s+sor\w*|benden\s+onay\s+al\w*|"
     r"i\s+want\s+to\s+(?:decide|approve|be\s+the\s+decision\s+maker)|"
-    r"let\s+me\s+(?:decide|approve)|ask\s+me\s+for\s+approval)\b",
+    r"let\s+me\s+(?:decide|approve)|"
+    r"ask\s+me\s+for\s+(?:my\s+)?" + _APPROVAL_NOUN + r"|"
+    r"ask\s+me\s+before\s+(?:you\s+)?(?:start|begin|implement|code|coding|build|proceed|writ)\w*|"
+    # "the plan needs my approval" is about the agent's plan; "releases need my approval" is a feature request
+    r"(?:plan|spec)\s+(?:needs?|requires?)\s+my\s+(?:own\s+)?" + _APPROVAL_NOUN + r")\b",
     re.I,
 )
-_MANUAL_APPROVAL_NEGATION = re.compile(
-    r"\b(?:don'?t|do\s+not|never|no\s+need\s+to)\b.{0,60}\b(?:ask|approval|approve|decide)\w*|"
+# The wordings that are also ordinary feature requests ("a page where releases need my approval", "see the design in dark
+# mode", "enable manual approval of refunds") count only as a short imperative that ends its clause.
+_MANUAL_APPROVAL_IMPERATIVE = _LazyRe(
+    _CLAUSE_START + r"(?:"
+    r"(?:wait\s+for|require|get)\s+my\s+(?:own\s+)?" + _APPROVAL_NOUN + r"|"
+    r"(?:i\s+want|i'?d\s+like|i\s+would\s+like)\s+to\s+(?:review|check|read|see|look\s+at)\s+(?:the|this|your|that)\s+"
+    r"(?:plan|spec)(?:\s+(?:and|or|&)\s+(?:the\s+)?(?:plan|spec))?|"
+    r"let\s+me\s+(?:review|check|read|see|look\s+at)\s+(?:the|this|your|that)\s+(?:plan|spec)|"
+    r"(?:use|enable|switch\s+to|turn\s+on|set)\s+(?:the\s+)?manual\s+(?:plan[- ])?approval(?:\s+mode)?"
+    r"(?:\s+for\s+(?:this|the)\s+(?:run|plan|task|job))?(?:\s+(?:please|pls))?"
+    r")\b" + _CLAUSE_END,
+    re.I,
+)
+# A negation cancels the request only when it is about asking / approving in the same sentence ("don't ask me", "go
+# without my approval", "no need for my approval"): "without breaking the API. Ask me for approval" does not.
+_SAME_SENTENCE = r"(?:[^.!?;\n]|\.(?=\S))"
+_MANUAL_APPROVAL_NEGATION = _LazyRe(
+    r"\b(?:don'?t|do\s+not|never|no\s+need\s+to)\b" + _SAME_SENTENCE + r"{0,60}\b(?:ask|approval|approve|decide)\w*|"
+    r"\b(?:no\s+need\s+for|without)\s+(?:(?!(?:and|but|then|so|or|also)\b)[\w'-]+\s+){0,3}(?:ask|approval|approve|decide)\w*|"
+    r"\bnot\s+(?:the\s+)?manual\s+(?:plan[- ])?(?:approval|mode)\b|"
     r"\b(?:sorma|sormana\s+gerek\s+yok|onay\s+bekleme|onay\s+isteme)\b|"
     r"\b(?:unless|if|when|whenever|only\s+if|eğer|şayet|kullanıcı\s+isterse|"
-    r"user\s+(?:wants|asks|says))\b.{0,100}\b(?:ben|bana|me|let\s+me|karar|onay|approve)\b",
+    r"user\s+(?:wants|asks|says))\b.{0,100}\b(?:ben|bana|me|let\s+me|karar|onay|approve|i\s+want|i'?d\s+like|"
+    r"i\s+would\s+like)\b",
     re.I,
 )
 
 
 def manual_approval_requested(prompt: str) -> bool:
     """Whether the user clearly asks to retain the plan-approval decision."""
-    text = norm_lower(prompt or "")
-    return bool(_MANUAL_APPROVAL_REQUEST.search(text)) and not bool(_MANUAL_APPROVAL_NEGATION.search(text))
+    text = _lower(prompt)
+    asked = _MANUAL_APPROVAL_REQUEST.search(text) or _MANUAL_APPROVAL_IMPERATIVE.search(text)
+    return bool(asked) and not _MANUAL_APPROVAL_NEGATION.search(text)
 
 
 def approval(prompt: str) -> Optional[str]:
@@ -178,39 +345,80 @@ def approval(prompt: str) -> Optional[str]:
     approve the plan and only add execution instructions (`…onaylıyorum yap`, `onay verdim devam et`)
     also count as approve — unless they attach a change request (`ama T001'i çıkar`).
     """
-    text = norm_lower(prompt or "").strip()
+    text = _lower(prompt).strip()
     if not text:
         return None
     if _APPROVE_EXACT.match(text) and not _NEG_HINT.search(text):
         return "approve"
-    if _APPROVE_PHRASE.search(text) and not _APPROVE_CHANGE.search(text) and not _APPROVE_QUESTION.search(text):
+    approving = _APPROVE_PHRASE.search(text) or _APPROVE_IMPERATIVE.match(text)
+    if approving and not _change_requested(text) and not _APPROVE_QUESTION.search(text):
         return "approve"
     if _EXPLICIT_REJECT.search(text + " "):
         return "reject"
     return None
 
 
+def _option_keys(kind: str, index: int) -> frozenset:
+    """Folded spellings (every language) of one option of an AskUserQuestion flow (messages/protocol.PROMPTS)."""
+    pair = _protocol.PROMPTS[kind]["options"][index]                        # type: ignore[index]
+    return frozenset(_protocol.fold(label) for label in pair)
+
+
+_APPROVE_LABELS = _option_keys("approve", 0)        # "Approve and start implementing" / "Onayla — uygulamaya başla"
+_ROLLBACK_APPLY, _ROLLBACK_ALL, _ROLLBACK_CANCEL = (_option_keys("rollback", i) for i in range(3))
+# the Cursor chat form of the rollback answer: `/orkestra-rollback apply [--all]` (Turkish: `uygula`)
+_ROLLBACK_COMMAND = _LazyRe(r"^orkestra rollback (apply|uygula)( all)?$")
+
+
 def approval_answer(answer: str) -> Optional[str]:
-    """AskUserQuestion answer: the predefined option label, or free text typed via 'Other'."""
-    a = norm_lower(answer or "").strip()
+    """AskUserQuestion answer: the predefined option label, or free text typed via 'Other'.
+
+    The approve option is accepted in either language, without regard to case, diacritics or the dash
+    (`Onayla — uygulamaya başla`, `onayla uygulamaya basla`, `APPROVE AND START IMPLEMENTING`); text after the label
+    still approves unless it carries a change request. Every other option (`I want changes`, `Cancel`, `Değişiklik
+    istiyorum`, `İptal et`) and anything unrecognised is a reject."""
+    a = _lower(answer).strip()
     if not a:
         return None
-    if a.startswith("onayla — uygulamaya başla") or a in ("onayla", "approve"):
+    key = _protocol.fold(a)
+    if key in _APPROVE_LABELS or key in ("onayla", "approve"):
+        return "approve"
+    if (any(key.startswith(label + " ") for label in _APPROVE_LABELS)
+            and not _NEG_HINT.search(a) and not _change_requested(a)):
         return "approve"
     if _APPROVE_EXACT.match(a) and not _NEG_HINT.search(a):
         return "approve"
     return "reject"
 
 
+def rollback_answer(answer: str) -> Optional[str]:
+    """Answer of the rollback flow: `apply` | `apply_all` | `cancel`, or None when it is none of them.
+
+    Accepts the option labels of either language (`Apply (orkestra changes only)`, `Uygula (yalnız orkestra
+    değişiklikleri)`, ...) and the Cursor chat command `/orkestra-rollback apply [--all]` (`uygula`). Exact matches
+    only: a near miss is None, never a guess, because applying a rollback reverts files."""
+    key = _protocol.fold(answer)
+    if key in _ROLLBACK_APPLY:
+        return "apply"
+    if key in _ROLLBACK_ALL:
+        return "apply_all"
+    if key in _ROLLBACK_CANCEL:
+        return "cancel"
+    m = _ROLLBACK_COMMAND.match(key)
+    if m:
+        return "apply_all" if m.group(2) else "apply"
+    return None
+
+
 # --- run size (XS/S finish fast; M/L keep the full pipeline) -----------------
 
 SIZES = ("XS", "S", "M", "L")
 
-_EXPLICIT_SIZE = re.compile(
+_EXPLICIT_SIZE = _LazyRe(
     r"(?:(?:--)?size|boyut)\s*[:=]?\s*(XS|S|M|L)\b|\b(XS|S|M|L)\s*(?:boyut|size)\b",
     re.I,
 )
-_L_SIZE = re.compile(
+_L_SIZE = _LazyRe(
     r"\b(migrat(?:e|ion|ing)?|bulk|çoklu\s+platform|multi[- ]?platform|"
     r"tüm\s+(sistem|uygulama|proje|kod|modül)|rewrite\s+the\s+whole|"
     r"büyük\s+(iş|özellik|refactor|değişiklik)|end[- ]to[- ]end|"
@@ -218,21 +426,21 @@ _L_SIZE = re.compile(
     r"full\s+rewrite|kapsamlı\s+refactor)\b",
     re.I,
 )
-_RISK_FLOOR_M = re.compile(
+_RISK_FLOOR_M = _LazyRe(
     r"\b(auth(?:entication|orization)?|oauth|payment|billing|stripe|revenuecat|"
     r"deploy|store\s+submit|testflight|play\s+console|schema\s+change|"
     r"security|kvkk|gdpr|credential|secret|encryption|rls|"
     r"permission|pci|hipaa)\b",
     re.I,
 )
-_XS_SIZE = re.compile(
+_XS_SIZE = _LazyRe(
     r"\b(typo|yazım\s*hatası|rename|yeniden\s*adlandır|one[- ]line|tek\s*satır|"
     r"trivial|çok\s*basit|çok\s*küçük|minik|nit\b|cosmetic|"
     r"fix\s+the\s+typo|sadece\s+(şunu|bunu)\s+değiştir|"
     r"tek\s+kelime|one\s+word)\b",
     re.I,
 )
-_S_SIZE = re.compile(
+_S_SIZE = _LazyRe(
     r"\b(küçük|basit|small\s+(fix|change|bug|tweak)|bug\s*fix|hotfix|"
     r"bir\s+dosya|tek\s+dosya|few\s+files|birkaç\s+dosya|"
     r"add\s+(a\s+)?(test|helper|function|method)|"
@@ -240,7 +448,7 @@ _S_SIZE = re.compile(
     r"sub\s+fonksiyonu|düzelt(?:me)?\b|fix\s+(this|the|a)\b)\b",
     re.I,
 )
-_M_SIZE = re.compile(
+_M_SIZE = _LazyRe(
     r"\b(feature|özellik|ekran|screen|endpoint|api\s+ekle|yeni\s+(modül|ekran|sayfa)|"
     r"refactor\b|yeniden\s+yapılandır|dark\s+mode|yeni\s+özellik)\b",
     re.I,
@@ -288,10 +496,10 @@ def infer_size(request: str) -> str:
     return "M"
 
 
-_CONTINUE_INTENT = re.compile(
+_CONTINUE_INTENT = _LazyRe(
     r"(?:"
     r"\bdevam(?:\s*et\w*|\s*edelim)?\b|"
-    r"\bcontinue\b|\bresume\b|"
+    r"\bcontinue\b|\bresume\b|\b(?:go\s+on|keep\s+going|carry\s+on|proceed)\b|"
     r"/orkestra[-:]?resume\b|"
     r"\b(?:sonraki|next)\s+(?:g[oö]rev|task|ad[iı]m|step)\b|"
     r"\borkestra\s+(?:next|status)\b|"
@@ -302,7 +510,7 @@ _CONTINUE_INTENT = re.compile(
     re.I,
 )
 # In-run operational asks (tests/gates/git/skills) keep the bind; they are not a new feature request.
-_RUN_OPS_INTENT = re.compile(
+_RUN_OPS_INTENT = _LazyRe(
     r"(?:"
     r"\b(?:test(?:ler(?:i)?)?|tests|gate|kapı|build|lint|typecheck|verify|coverage)\b|"
     r"\b(?:çalıştır|koş(?:tur)?|run\s+(?:the\s+)?tests?|run\s+(?:the\s+)?gate)\b|"
@@ -359,34 +567,36 @@ def _mentions_other_workspace_project(text: str, project) -> bool:
 
 
 def off_topic_vs_project(prompt: str, project, run_id: str = "", title: str = "") -> bool:
-    """True when the user's message is not about the bound run (another project, or no bound cue).
+    """True when the user's message tells this chat to let go of the bound run. Only EXPLICIT signals do:
+      * the user says to pause / stop / abort the run, or to switch topic ("forget this", "never mind", "duraklat",
+        "başka bir konu") -- in either language;
+      * the message names another project of the workspace and nothing in it ties it to the bound run.
+    An ordinary message ("make the header blue", "devam", "thanks") keeps the binding: the run guards keep protecting the
+    run, and the Stop hook releases a turn that did not drive it (activity.turn_drove_run).
 
-    On-topic: names the bound project / run_id / path / title keywords, or an explicit continue
-    (devam/continue/resume/orkestra-resume/next task/T0xx) or plan approval wording.
-    Off-topic: names a different workspace project, OR (v1) has none of the on-topic cues — so
-    "make this dashboard friendlier" while still bound does not keep Stop driving the old run.
+    Ties to the bound run (they win over a named other project): its name / id / path / title keywords, an explicit
+    continue (devam/continue/resume/next task/T0xx), a git permission or run operation, plan approval wording.
     """
     from pathlib import Path as _Path
     project = _Path(project)
     text = norm_lower(prompt or "")
     if not text.strip():
         return False
+    said = _lower(prompt)
+    if _PAUSE_WORD.search(said) or _ABORT_WORD.search(said) or _SWITCH_WORD.search(said):
+        return True
     if _mentions_bound_project(text, project, run_id, title):
         return False
     if _CONTINUE_INTENT.search(text):
         return False
     # Git permission / run-ops lines ("şimdi commit et", "testleri çalıştır") are about the
-    # bound run — unbinding would drop the grant and open a hole in the quiet path.
+    # bound run -- unbinding would drop the grant and open a hole in the quiet path.
     if git_grants(prompt) or _RUN_OPS_INTENT.search(text):
         return False
-    # Only clear approvals keep the bind. Reject heuristics match words like "düzelt" in
-    # unrelated requests — those must still unbind.
     if approval(text) == "approve":
         return False
     if manual_approval_requested(prompt):
         return False
     if re.fullmatch(r"(hayır|iptal|reject|vazgeç\.?|no)", text.strip()):
-        return False
-    if _mentions_other_workspace_project(text, project):
-        return True
-    return True
+        return False                                    # the bare answer of an open question
+    return _mentions_other_workspace_project(text, project)

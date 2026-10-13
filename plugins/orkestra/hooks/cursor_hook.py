@@ -142,12 +142,16 @@ def started_by_an_agent_command() -> str:
     if not _trust_marked() and any(os.environ.get(k) for k in AGENT_MARKERS):
         return "its environment carries the agent shell's markers"
     try:
+        import shutil
         import subprocess
+        if not shutil.which("ps"):      # Windows, minimal containers: no process listing, only the marker check above
+            return ""
         pid, deadline = os.getppid(), time.time() + 2.0
         for _ in range(8):
             if pid <= 1 or time.time() > deadline:
                 break
-            cp = subprocess.run(["ps", "-ww", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True, text=True, timeout=1)
+            cp = subprocess.run(["ps", "-ww", "-o", "ppid=,command=", "-p", str(pid)], capture_output=True,
+                                encoding="utf-8", errors="replace", timeout=1)
             line = cp.stdout.strip()
             if not line:
                 break
@@ -276,8 +280,11 @@ def _light(name: str, ev: dict):
             _drop(_side("notes", sid))
         return {}
     from orkestra_core import intent                # regexes only (no state, no guards)
-    if intent.git_grants(str(ev.get("prompt") or "")):
-        return None                                 # gives a permission: origin-checked and written by the full path
+    # A prompt that gives a permission (git, pause, abort, /orkestra-resume) is origin-checked and written by the full
+    # path. A bare "continue" in a chat that has no run is not one: it stays on the light path.
+    given = intent.prompt_grants(str(ev.get("prompt") or ""))
+    if set(given) - {"resume"} or ("resume" in given and "orkestra" in str(ev.get("prompt") or "").lower()):
+        return None
     _turn_begin(sid, str(ev.get("generation_id") or ""))
     _drop(_home() / "grants" / f"{_safe(sid)}.json")            # an older prompt's permission ends with a new prompt
     _drop(_side("notes", sid))
@@ -315,9 +322,10 @@ def _quiet(name: str, ev: dict):
 class _Lazy:
     def __getattr__(self, name):
         import dispatch                                         # same directory: the handlers
-        from orkestra_core import activity, engines, paths
+        from orkestra_core import activity, engines, i18n, paths
         from orkestra_core import state as ST
         self.D, self.activity, self.engines, self.paths, self.ST = dispatch, activity, engines, paths, ST
+        self.i18n = i18n
         return self.__dict__[name]
 
 
@@ -404,10 +412,10 @@ def _related(project: str, ev: dict) -> bool:
     roots = [str(r) for r in (ev.get("workspace_roots") or []) if r]
     if not roots:
         return True
-    p = os.path.realpath(project)
+    p = os.path.normcase(os.path.realpath(project))
     for r in roots:
-        r = os.path.realpath(r)
-        if r == p or p.startswith(r.rstrip("/") + "/") or r.startswith(p.rstrip("/") + "/"):
+        r = os.path.normcase(os.path.realpath(r))
+        if r == p or p.startswith(r.rstrip(os.sep) + os.sep) or r.startswith(p.rstrip(os.sep) + os.sep):
             return True
     return False
 
@@ -436,7 +444,7 @@ def _transcript(conv: str, ev: dict, runs) -> str:
     """Where this conversation's transcript is. The first events of a new conversation carry no path (measured:
     `transcript_path: null`), so the known locations are tried too."""
     cands = [str(ev.get("transcript_path") or ""), str(os.environ.get("CURSOR_TRANSCRIPT_PATH") or "")]
-    cands = [c for c in cands if c and f"/{conv}" in c]
+    cands = [c for c in cands if c and f"/{conv}" in c.replace("\\", "/")]       # Windows paths use backslashes
     if re.fullmatch(r"[A-Za-z0-9-]{8,80}", conv):
         for project, rid, _sid in runs:
             data = _read(L.paths.run_dir(project, rid) / "agents.json") or {}
@@ -666,10 +674,10 @@ def _close_tasks(sid: str, b: dict) -> None:
     for x in L.activity.cursor_returned(project, rid, sid):
         kind = str(x.get("type") or "agent")
         cev = {"session_id": sid, "tool_name": "Agent", "tool_input": {"subagent_type": kind}}
-        L.activity.record(project, rid, cev, "result", f"← {kind}: döndü")
+        L.activity.record(project, rid, cev, "result", L.i18n.t("dispatch.task_returned", kind=kind))
         if x.get("child"):
             L.activity.record(project, rid, {"session_id": sid, "agent_type": kind, "agent_id": str(x["child"])},
-                              "agent_done", f"{kind} bitti")
+                              "agent_done", L.i18n.t("dispatch.agent_done", agent=kind))
 
 
 def _deny(reason: str) -> dict:
@@ -717,6 +725,31 @@ def on_before_submit_prompt(ev: dict) -> dict:
     return {"continue": True}
 
 
+CONTROL_WORD_RE = re.compile(r"\b(?:pause|abort|resume|unblock|block|await)\b")
+
+
+def _controls_a_run(name: str, command: str) -> bool:
+    """`orkestra pause|abort|resume|...` from a chat that drives no run: whose run it changes is orkestra's business (the
+    ownership guard), whatever the chat is. Everything else of such a chat stays unchecked, as before."""
+    return name == "Shell" and "orkestra" in command and bool(CONTROL_WORD_RE.search(command))
+
+
+def _ownership_only(cev: dict, command: str) -> str:
+    """The refusal text of the ownership guard for a real `orkestra pause|abort|...` call of a chat that drives no run
+    ("" = nothing to refuse). Words of a commit message or a comment are not such a call: control_targets reads the
+    command line, not the text."""
+    try:
+        from orkestra_core import guards, shellparse
+        ev = dict(cev, tool_name="Bash", tool_input={"command": command})
+        grants = L.ST.current_grant(cev.get("session_id") or "", cev.get("prompt_id"))
+        d = guards.ownership_guard(ev, guards.expand_cli_commands(shellparse.segments(command)), L.paths.global_config(),
+                                   grants)
+        return f"[orkestra:{d.guard}] {d.reason}" if d.denied else ""
+    except Exception as exc:
+        _log(f"ownership check failed: {exc}")
+        return ""
+
+
 def on_pre_tool_use(ev: dict) -> dict:
     name = str(ev.get("tool_name") or "")
     ti = ev.get("tool_input") if isinstance(ev.get("tool_input"), dict) else {}
@@ -730,6 +763,10 @@ def on_pre_tool_use(ev: dict) -> dict:
     cur = _cwd_get(conv, ev) if name == "Shell" else ""
     call_id = str(ev.get("tool_use_id") or "")
     if not b and not _known(sid, cev) and not _global_guards():
+        if _controls_a_run(name, command):
+            why = _ownership_only(cev, command)     # only the ownership guard: the every-session guards stay off
+            if why:
+                return _deny(why)
         if name == "Shell":
             _cwd_follow(conv, command, cur, call_id)
         return {"permission": "allow"}              # not an orkestra run: this chat is none of our business
@@ -783,8 +820,27 @@ def on_post_tool_use(ev: dict) -> dict:
     return {"additional_context": text} if text else {}
 
 
+def _record_turn_end(ev: dict, status: str) -> None:
+    """A Cursor stop that is not "completed" (aborted by the user, error): one cheap activity row for a bound chat."""
+    try:
+        cev = claude_event("Stop", ev)
+        if cev.get("agent_type") or not cev["session_id"]:
+            return
+        b = L.ST.session_binding(cev["session_id"])
+        if not b:
+            return
+        kind = "api_error" if status == "error" else "idle"
+        text = (L.i18n.t("dispatch.api_error", what=status) if kind == "api_error"
+                else L.i18n.t("dispatch.turn_stopped", status=status))
+        L.activity.record(Path(b["project"]), b["run_id"], cev, kind, text)
+    except Exception as exc:
+        _log(f"turn end row failed: {exc}")
+
+
 def on_stop(ev: dict) -> dict:
-    if str(ev.get("status") or "completed") != "completed":
+    status = str(ev.get("status") or "completed")
+    if status != "completed":
+        _record_turn_end(ev, status)                # the turn ended without a nudge: say so (no silent end)
         return {}                                   # the user stopped it, or it failed: never push it on
     cev = claude_event("Stop", ev)
     if cev.get("agent_type"):
@@ -803,7 +859,7 @@ def on_stop(ev: dict) -> dict:
                     last, Path(b["project"]), str(b["run_id"]), title=""):
                 L.ST.unbind_session(cev["session_id"])
                 L.activity.record(Path(b["project"]), b["run_id"], cev, "idle",
-                                  "tur bitti · transcript off-topic → oturum çözüldü")
+                                  L.i18n.t("dispatch.turn_transcript_off_topic"))
                 return {}
         except Exception:
             pass
@@ -844,7 +900,7 @@ def on_session_end(ev: dict) -> dict:
         if b:
             _close_tasks(sid, b)
             L.activity.record(Path(b["project"]), b["run_id"], {"session_id": sid}, "idle",
-                              f"tur bitti · durum {b['state'].get('status')} (oturum kapandı)")
+                              L.i18n.t("dispatch.turn_session_closed", status=b["state"].get("status")))
     else:
         _drop(_home() / "grants" / f"{_safe(sid)}.json")
     _drop(_side("turns", sid))
@@ -902,11 +958,17 @@ def main() -> int:
                 out = dict(fallback(name), refused=why) if ev.get("_driver") else fallback(name)
             else:
                 handler = HANDLERS.get(name)
-                out = handler(ev) if handler else fallback(name)
+                out = L.D.run_with_hook_deadline(lambda: handler(ev)) if handler else fallback(name)
     except Exception as exc:  # fail open — but always with a well-formed answer (Cursor blocks on malformed JSON)
         import traceback
         _log(f"ERROR in cursor:{name}: {exc}\n{traceback.format_exc()}")
         out = fallback(name)
+    except BaseException as exc:
+        if type(exc).__name__ != "_Deadline":
+            raise
+        # the hook-wide deadline: refuse a guarded call (a timed-out hook lets it through), end the rest quietly
+        _log(f"DEADLINE ({getattr(exc, 'kind', '?')}) in cursor:{name}")
+        out = _deny(L.D.deadline_denial(exc).reason) if name in PERMISSION_EVENTS else fallback(name)
     try:        # bytes, ASCII-only JSON: a deny must not be lost to the locale of the process that started Cursor
         sys.stdout.buffer.write(json.dumps(out if isinstance(out, dict) else {}, ensure_ascii=True).encode("ascii"))
         sys.stdout.buffer.flush()

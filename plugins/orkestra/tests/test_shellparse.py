@@ -1,3 +1,4 @@
+import shlex
 import unittest
 
 import helpers  # noqa: F401
@@ -6,6 +7,39 @@ from orkestra_core import shellparse as sp
 
 def progs(cmd):
     return [s.program for s in sp.segments(cmd)]
+
+
+def nested(inner, levels, how):
+    """`inner` wrapped `levels` times in bash -c / eval / $(...)."""
+    cmd = inner
+    for _ in range(levels):
+        cmd = {"bash": lambda c: "bash -c " + shlex.quote(c), "eval": lambda c: "eval " + shlex.quote(c),
+               "subst": lambda c: "echo $(" + c + ")"}[how](cmd)
+    return cmd
+
+
+class TestNestingDepth(unittest.TestCase):
+    """Past MAX_DEPTH the parser used to return no segments at all: every guard then saw an empty command and let
+    `git push` or `cat ~/.ssh/id_rsa` through. Too deep is now a segment of its own that the guards refuse."""
+
+    def test_a_command_inside_the_limit_is_still_parsed(self):
+        for how in ("bash", "eval", "subst"):
+            with self.subTest(how=how):
+                found = progs(nested("git push", sp.MAX_DEPTH, how))
+                self.assertIn("git", found)
+                self.assertNotIn(sp.NESTED_TOO_DEEP, found)
+
+    def test_a_command_past_the_limit_is_marked_instead_of_dropped(self):
+        for how in ("bash", "eval", "subst"):
+            for extra in (1, 2, 6):
+                with self.subTest(how=how, extra=extra):
+                    self.assertIn(sp.NESTED_TOO_DEEP, progs(nested("git push", sp.MAX_DEPTH + extra, how)))
+
+    def test_an_empty_or_blank_inner_command_is_not_marked(self):
+        for how in ("bash", "eval"):
+            with self.subTest(how=how):
+                self.assertNotIn(sp.NESTED_TOO_DEEP, progs(nested("   ", sp.MAX_DEPTH + 1, how)))
+        self.assertEqual(sp.segments(""), [])
 
 
 class TestSegments(unittest.TestCase):
