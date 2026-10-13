@@ -1101,7 +1101,7 @@ def render_text(views: List[Dict[str, Any]], color: bool = False, width: Optiona
         return s if len(s) <= n else s[: max(0, n - 1)] + "…"
 
     if not views:
-        return i18n.t("monitor.none_open", workspace=paths.workspace_root())
+        return i18n.t("monitor.none_open", workspace=paths.workspace_display())
     out: List[str] = []
     now = time.time()
     for v in views:
@@ -2294,7 +2294,7 @@ def page_html(build: str = "", started: Optional[float] = None) -> str:
     when the server began (epoch seconds) and feeds the trust line in the footer."""
     code = i18n.lang()
     meta = {"version": plugin_version(), "build": build, "started": _STARTED if started is None else started,
-            "workspace": str(paths.workspace_root())}
+            "workspace": paths.workspace_display()}
     page = PAGE.replace("__LANG__", code).replace("__BUILD__", html.escape(build, quote=True))
     page = page.replace("__CUR_EN__", ' aria-current="true"' if code == "en" else "")
     page = page.replace("__CUR_TR__", ' aria-current="true"' if code == "tr" else "")

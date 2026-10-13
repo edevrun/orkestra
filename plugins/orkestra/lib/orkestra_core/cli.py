@@ -180,7 +180,7 @@ def _resolve_project(arg: Optional[str], required: bool = True) -> Optional[Path
         return Path(env).expanduser().resolve(strict=False)
     found = paths.find_project_root(Path.cwd())
     if found is None and required:
-        raise OrkestraError(i18n.t("cli.no_project", workspace=paths.workspace_root()))
+        raise OrkestraError(i18n.t("cli.no_project", workspace=paths.workspace_display()))
     return found
 
 

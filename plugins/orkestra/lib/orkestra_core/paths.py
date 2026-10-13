@@ -111,6 +111,37 @@ def workspace_root() -> Path:
     return Path(os.path.expanduser(raw)).resolve(strict=False)
 
 
+def display_path(path: os.PathLike | str) -> str:
+    """Portable form of a path for human-facing text.
+
+    Paths under the user's home become `~/…` so a dashboard, CLI message or log never prints
+    `/Users/<name>/…` or `/home/<name>/…`. Paths outside the home stay absolute. Separators are
+    forward slashes so the same string is readable on every OS.
+    """
+    raw = str(path or "").strip()
+    if not raw:
+        return raw
+    if raw == "~" or raw.startswith("~/") or raw.startswith("~\\"):
+        return raw.replace("\\", "/")
+    try:
+        abs_path = Path(os.path.expanduser(raw)).resolve(strict=False)
+        home = Path.home().resolve(strict=False)
+        rel = abs_path.relative_to(home)
+    except (OSError, ValueError, RuntimeError):
+        return raw.replace("\\", "/")
+    parts = rel.as_posix()
+    return "~" if parts in (".", "") else f"~/{parts}"
+
+
+def workspace_display() -> str:
+    """Configured workspace as people should see it (prefer `~/Projects`, never an expanded home path)."""
+    env = os.environ.get("ORKESTRA_WORKSPACE")
+    if env not in (None, ""):
+        return display_path(env)
+    raw = global_config().get("workspace_root") or DEFAULT_GLOBAL_CONFIG["workspace_root"]
+    return display_path(str(raw))
+
+
 # ---------------------------------------------------------------- projects
 
 def _same_path(a: Path, b: Path) -> bool:

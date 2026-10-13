@@ -315,7 +315,8 @@ class TestViewJson(MonitorBase):
         data = json.loads(meta)
         self.assertEqual((data["build"], data["started"]), ("abc123def456", NOW))
         self.assertRegex(data["version"], r"^\d+\.\d+\.\d+")
-        self.assertEqual(data["workspace"], str(Path(os.environ["ORKESTRA_WORKSPACE"])))
+        self.assertEqual(data["workspace"], MON.paths.workspace_display())
+        self.assertNotRegex(data["workspace"], r"^/(?:Users|home)/[^/]+/")
         self.assertIn('const BUILD="abc123def456"', page)
 
 
@@ -609,13 +610,16 @@ class TestPageSections(PageCase):
         snap, _ = self.snap([])
         text = snap["other"][0]
         self.assertIn("No runs yet", text)
-        self.assertIn(os.environ["ORKESTRA_WORKSPACE"], text)
+        shown = MON.paths.workspace_display()
+        self.assertIn(shown, text)
+        self.assertNotRegex(text, r"/(?:Users|home)/[^/\s]+/")
         self.assertIn("/orkestra:run describe the work", text)
         self.assertIn('orkestra start --title "Short title" --request "What to build"', text)
         self.assertIn("Include runs older than 12 hours", text)
         tr, _ = self.snap([], code="tr")
         self.assertIn("Hen\u00fcz \u00e7al\u0131\u015fma yok", tr["other"][0])
         self.assertIn("/orkestra:run i\u015fi anlat", tr["other"][0])
+        self.assertIn(shown, tr["other"][0])
 
     def test_many_runs_keep_the_dom_small_and_the_finished_list_short(self):
         views = [view(i, ["you", "stalled", "running", "paused", "done"][i % 5], "working", i, status="done" if i % 5 == 4 else "active",

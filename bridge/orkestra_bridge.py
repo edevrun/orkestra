@@ -160,7 +160,7 @@ def resolve_project(cfg: Dict[str, Any], name: str) -> Path:
         raise ValueError(t("bridge.err.invalid_project", name=repr(name)))
     path = (workspace(cfg) / name).resolve()
     if path.parent != workspace(cfg) or not path.is_dir():
-        raise ValueError(t("bridge.err.project_not_found", name=name, workspace=workspace(cfg)))
+        raise ValueError(t("bridge.err.project_not_found", name=name, workspace=OP.display_path(workspace(cfg))))
     allowed = cfg.get("allowed_projects") or []
     if allowed and name not in allowed:
         raise ValueError(t("bridge.err.project_not_allowed", name=name))

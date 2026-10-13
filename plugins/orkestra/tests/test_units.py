@@ -347,5 +347,24 @@ class TestConfigMergeIsTypeSafe(unittest.TestCase):
         self.assertEqual(merged["extra"], {"anything": 1})                                   # unknown keys pass through
 
 
+class TestWorkspaceDisplayIsPortable(unittest.TestCase):
+    def test_home_paths_become_tilde_and_tilde_config_stays(self):
+        from orkestra_core import paths
+        home = Path.home().resolve(strict=False)
+        self.assertEqual(paths.display_path(home / "Projects"), "~/Projects")
+        self.assertEqual(paths.display_path(str(home / "Projects" / "demo")), "~/Projects/demo")
+        self.assertEqual(paths.display_path("~/Projects"), "~/Projects")
+        self.assertEqual(paths.display_path("~"), "~")
+        outside = Path("/tmp/orkestra-display-outside")
+        self.assertEqual(paths.display_path(outside), str(outside).replace("\\", "/"))
+        with mock.patch.dict(os.environ, {"ORKESTRA_WORKSPACE": str(home / "Projects")}, clear=False):
+            self.assertEqual(paths.workspace_display(), "~/Projects")
+            self.assertNotRegex(paths.workspace_display(), r"^/(?:Users|home)/")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ORKESTRA_WORKSPACE", None)
+            with mock.patch.object(paths, "global_config", return_value={"workspace_root": "~/Projects"}):
+                self.assertEqual(paths.workspace_display(), "~/Projects")
+
+
 if __name__ == "__main__":
     unittest.main()

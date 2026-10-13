@@ -461,12 +461,14 @@ class TestTerminalView(MonitorBase):
             text = MON.render_text([])
         self.assertEqual(text.splitlines()[0], "No open orkestra runs. (To also see runs finished in the last 12 hours: "
                                                "`orkestra watch --all`.)")
-        self.assertEqual(text.splitlines()[1], f"Workspace: {self.ws.resolve()}")
+        self.assertEqual(text.splitlines()[1], f"Workspace: {MON.paths.workspace_display()}")
+        self.assertNotRegex(text, r"^Workspace: /(?:Users|home)/")
         with lang("tr"):
             text = MON.render_text([])
         self.assertEqual(text.splitlines()[0], "Açık orkestra çalışması yok. (Son 12 saatte bitenleri de görmek için "
                                                "`orkestra watch --all`.)")
-        self.assertEqual(text.splitlines()[1], f"Çalışma alanı: {self.ws.resolve()}")
+        self.assertEqual(text.splitlines()[1], f"Çalışma alanı: {MON.paths.workspace_display()}")
+        self.assertNotRegex(text, r"^Çalışma alanı: /(?:Users|home)/")
 
     def test_watch_once_in_process_in_both_languages(self):
         self.populate()
