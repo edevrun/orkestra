@@ -145,6 +145,15 @@ EN: Dict[str, str] = {
     "cli.kit_not_installed": "not installed",
     # `orkestra pause|resume|unblock|block|await|abort` on a run that already is in that state
     "cli.status_unchanged": "{run}: already {status}, nothing changed",
+    # orkestra clean
+    "cli.clean_disabled": "artifact cleanup is disabled (cleanup_artifacts=false in config)",
+    "cli.clean_header": "{mode} — {count} path(s), {freed}",
+    "cli.clean_mode_dry": "DRY RUN (nothing removed)",
+    "cli.clean_mode_done": "REMOVED",
+    "cli.clean_none": "nothing to clean",
+    "cli.clean_bytes": "{size} GiB",
+    "cli.clean_line": "- {path} ({size})",
+    "cli.clean_error": "error: {path}: {error}",
 }
 
 TR: Dict[str, str] = {
@@ -276,4 +285,12 @@ TR: Dict[str, str] = {
     "cli.kit_active": "etkin",
     "cli.kit_not_installed": "kurulu değil",
     "cli.status_unchanged": "{run}: zaten {status}, bir şey değişmedi",
+    "cli.clean_disabled": "artık temizliği kapalı (config'te cleanup_artifacts=false)",
+    "cli.clean_header": "{mode} — {count} yol, {freed}",
+    "cli.clean_mode_dry": "KURU ÇALIŞTIRMA (hiçbir şey silinmedi)",
+    "cli.clean_mode_done": "SİLİNDİ",
+    "cli.clean_none": "temizlenecek bir şey yok",
+    "cli.clean_bytes": "{size} GiB",
+    "cli.clean_line": "- {path} ({size})",
+    "cli.clean_error": "hata: {path}: {error}",
 }

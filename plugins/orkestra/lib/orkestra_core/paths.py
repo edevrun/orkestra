@@ -51,6 +51,9 @@ DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
     # bridge turns (bridge/orkestra_bridge.py): wall-clock budget of one headless turn, and how long a turn may produce
     # no run activity (no activity row, no state change, no running Bash row) before it is interrupted and resumed
     "bridge": {"turn_timeout_seconds": 7200, "turn_idle_seconds": 1800},
+    # After phase → done: wipe regenerable tool dumps under the project (test-results, android/**/build, …).
+    # Project `.orkestra/config.json` may set "cleanup_artifacts": false to skip for that repo.
+    "cleanup_artifacts": True,
 }
 
 MARKERS = (

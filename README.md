@@ -398,6 +398,7 @@ live in `<project>/.orkestra/config.json`. The keys you are most likely to touch
 | `tempo.max_dispatches` | `3` | The same agent launched this often for the same task without new evidence makes `orkestra next` answer `escalate`. |
 | `watchdog.autostart` | `true` | SessionStart may start the fast watcher; `daemon_idle_minutes` (30) is how long it lingers without an open run. |
 | `gates_parallel` | `1` | Above 1, typecheck, lint and test gates run side by side (at most half the CPUs). |
+| `cleanup_artifacts` | `true` | When a run reaches `done`, remove regenerable dumps under the project (`test-results`, `playwright-report`, `android/**/build`, …). Manual: `orkestra clean`. |
 
 ## FAQ and troubleshooting
 

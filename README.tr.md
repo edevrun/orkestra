@@ -398,6 +398,7 @@ Genel ayarlar `~/.orkestra/config.json` içindedir (klasör `ORKESTRA_HOME` ile 
 | `tempo.max_dispatches` | `3` | Aynı ajan aynı görev için yeni kanıt olmadan bu kadar başlatılırsa `orkestra next` `escalate` cevabı verir. |
 | `watchdog.autostart` | `true` | SessionStart hızlı izleyiciyi başlatabilir; `daemon_idle_minutes` (30) açık run yokken ne kadar kalacağıdır. |
 | `gates_parallel` | `1` | 1'den büyükse typecheck, lint ve test kapıları yan yana çalışır (en çok CPU sayısının yarısı). |
+| `cleanup_artifacts` | `true` | Run `done` olunca proje altındaki yeniden üretilebilir artıkları siler (`test-results`, `playwright-report`, `android/**/build`, …). Elle: `orkestra clean`. |
 
 ## SSS ve sorun giderme
 

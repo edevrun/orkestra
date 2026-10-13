@@ -1131,6 +1131,41 @@ def cmd_diff(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_clean(a: argparse.Namespace) -> int:
+    """Remove regenerable Playwright/Android dumps under the project (same set as post-done cleanup)."""
+    from . import artifacts as ART
+    from . import i18n
+    project = _resolve_project(a.project)
+    assert project is not None
+    if not ART.cleanup_enabled(project) and not getattr(a, "gradle_transforms", False):
+        _out(i18n.t("cli.clean_disabled"))
+        return 0
+    reports = []
+    if ART.cleanup_enabled(project):
+        reports.append(ART.clean_project(project, dry_run=bool(a.dry_run)))
+    if getattr(a, "gradle_transforms", False):
+        reports.append(ART.clean_gradle_transforms(dry_run=bool(a.dry_run)))
+    removed = []
+    errors = []
+    freed = 0
+    for r in reports:
+        removed.extend(r.get("removed") or [])
+        errors.extend(r.get("errors") or [])
+        freed += int(r.get("freed_bytes") or 0)
+    if not removed and not errors:
+        _out(i18n.t("cli.clean_none"))
+        return 0
+    mode = i18n.t("cli.clean_mode_dry") if a.dry_run else i18n.t("cli.clean_mode_done")
+    _out(i18n.t("cli.clean_header", mode=mode, count=len(removed),
+                freed=i18n.t("cli.clean_bytes", size=freed / (1024 ** 3))))
+    for item in removed:
+        _out(i18n.t("cli.clean_line", path=paths.display_path(item["path"]),
+                    size=i18n.t("cli.clean_bytes", size=int(item.get("bytes") or 0) / (1024 ** 3))))
+    for err in errors:
+        _out(i18n.t("cli.clean_error", path=paths.display_path(err["path"]), error=err["error"]))
+    return 1 if errors and not removed else 0
+
+
 def cmd_rollback(a: argparse.Namespace) -> int:
     project = _resolve_project(a.project)
     assert project is not None
@@ -1730,7 +1765,7 @@ HANDLERS = {
     "phase": cmd_phase, "await": cmd_status_change, "block": cmd_status_change, "unblock": cmd_status_change,
     "pause": cmd_status_change, "abort": cmd_status_change, "gate": cmd_gate, "tdd": cmd_tdd, "task": cmd_task,
     "brief": cmd_brief, "plan": cmd_check, "trace": cmd_check, "deps": cmd_check, "review": cmd_check,
-    "changes": cmd_changes, "diff": cmd_diff, "rollback": cmd_rollback, "memory": cmd_memory,
+    "changes": cmd_changes, "diff": cmd_diff, "rollback": cmd_rollback, "clean": cmd_clean, "memory": cmd_memory,
     "playbook": cmd_playbook, "template": cmd_template, "doctor": cmd_doctor,
     "watch": cmd_watch, "dashboard": cmd_dashboard,
     "evidence": cmd_evidence, "integrity": cmd_integrity, "report": cmd_report,

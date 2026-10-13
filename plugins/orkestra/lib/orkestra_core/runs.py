@@ -487,6 +487,17 @@ def phase_next(project: Path, run_id: str, note: str = "") -> Tuple[str, str]:
     if target == "done":
         set_active_run(project, None)
         point_current(project, None)
+        # Regenerable Playwright/Android dumps grow across runs; wipe them after delivery (fail-open).
+        try:
+            from . import artifacts as ART
+            report = ART.clean_after_run(project)
+            n = len(report.get("removed") or [])
+            freed = int(report.get("freed_bytes") or 0)
+            if n or report.get("skipped"):
+                detail = report.get("reason") or f"{n} path(s), {freed} bytes"
+                ledger(project, run_id, f"artifact cleanup: {detail}")
+        except Exception:
+            pass
     return cur, target
 
 
