@@ -25,7 +25,7 @@ git clone https://github.com/soft-ai-solutions/orkestra.git
 cd orkestra
 ```
 
-Claude Code eklentisi `plugins/orkestra` altından yerinde yüklenir; bu yüzden checkout'u bulunduğu yerde bırak.
+`orkestra setup`, Claude Code eklentisini `plugins/orkestra` altından `~/.claude/plugins/cache/` içine kopyalar; Claude Code o kopyayı çalıştırır. Checkout'u bulunduğu yerde bırak: Cursor ve Copilot doğrudan onu okur.
 
 ## 3. Kur
 
@@ -159,8 +159,10 @@ olduğu gibi kalır.
 
 ## Güncelleme ve kaldırma
 
-Güncellemek için checkout'ta `git pull` yap. Eklenti yerinde yüklendiği için hook ve CLI kodu hemen geçerli olur; ajan,
-skill ve `hooks.json` değişiklikleri yeni açılan Claude Code oturumunda geçerlidir. Cursor tarafını
+Güncellemek için checkout'ta `git pull` yap, sonra sürümü yükseltip `orkestra setup` çalıştır: Claude Code,
+`~/.claude/plugins/cache/` altındaki sürüme göre anahtarlanmış kopyayı çalıştırır; yalnız `git pull` orada hiçbir şeyi
+değiştirmez (Cursor ve Copilot checkout'u okur). Ajan, skill ve `hooks.json` değişiklikleri yeni açılan Claude Code
+oturumunda geçerlidir. Cursor tarafını
 `orkestra cursor status` ile denetle; bridge kullanıyorsan yeniden başlat (uzun ömürlü bir süreçtir).
 
 ```bash

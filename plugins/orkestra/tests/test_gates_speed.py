@@ -64,13 +64,29 @@ class TestRunnerProcessGroups(unittest.TestCase):
         seen = []
         gates = [{"name": "quick", "cmd": "true", "kind": "test"},
                  {"name": "hang", "cmd": self._spawner(), "kind": "test", "timeout": 60}]
-        timer = threading.Timer(1.5, __import__("_thread").interrupt_main)
-        timer.start()
+        stop = threading.Event()
+
+        def interrupt_once_the_hanging_gate_runs():       # event based: a fixed delay is flaky on a loaded machine
+            end = time.time() + 60
+            while not stop.is_set() and time.time() < end:
+                if (self.td / "pid").exists() and (self.td / "pid").read_text().strip():
+                    time.sleep(0.3)
+                    __import__("_thread").interrupt_main()
+                    return
+                time.sleep(0.05)
+
+        import signal
+        # a process started in the background by a shell (nohup sh -c '...' &) inherits SIGINT=ignored: interrupt_main
+        # would then do nothing. Make the test independent of how the suite was started.
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        watcher = threading.Thread(target=interrupt_once_the_hanging_gate_runs, daemon=True)
+        watcher.start()
         try:
             with self.assertRaises(KeyboardInterrupt):
                 G.run_all(self.td, gates, self.td / "logs", "t", on_result=seen.append)
         finally:
-            timer.cancel()
+            stop.set()
+            signal.signal(signal.SIGINT, previous)
         self.assertEqual([r["name"] for r in seen[-1]], ["quick"])
         pid = int((self.td / "pid").read_text().strip())
         self.assertTrue(_wait_gone(pid), "an interrupted run left an orphan")

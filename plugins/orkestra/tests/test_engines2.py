@@ -770,6 +770,9 @@ class TestLightPrompts(helpers.Sandbox):
             time.sleep(0.02)
         self.assertTrue(out_path.exists(), f"cursor hook {event}: no output")
         text = out_path.read_text(encoding="utf-8")
+        while "\n" not in text and time.time() < deadline:        # the writer may still be mid-write on a loaded machine
+            time.sleep(0.02)
+            text = out_path.read_text(encoding="utf-8")
         try:
             out_path.unlink(missing_ok=True)
             out_path.parent.rmdir()

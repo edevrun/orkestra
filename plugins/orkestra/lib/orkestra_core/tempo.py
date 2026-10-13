@@ -762,6 +762,25 @@ def tempo_line(project: Path, st: Dict[str, Any], now: Optional[float] = None,
     return "tempo: " + " · ".join(parts) + (" · FLAGS: " + " | ".join(fl[:2]) if fl else "")
 
 
+def report_lines(rid: str, st: Dict[str, Any], tm: Dict[str, Any], dw: Dict[str, Any], cls: Dict[str, Any],
+                 flag_lines: Optional[List[str]] = None) -> List[str]:
+    """The human-readable lines of `orkestra tempo` (labels from the catalog; durations and figures as measured)."""
+    t = i18n.t
+    out = [t("tempo.cmd_head", rid=rid, status=st["status"], phase=st["phase"], total=dur(tm["run"])),
+           t("tempo.cmd_phases", phases=" · ".join(f"{name} {dur(sec)}" for name, sec in tm["phases"].items()))]
+    if tm["tasks_total"]:
+        out.append(t("tempo.cmd_tasks", done=tm["tasks_done"], total=tm["tasks_total"])
+                   + (t("tempo.cmd_task_avg", dur=dur(tm["task_avg"])) if tm.get("task_avg") else "")
+                   + (t("tempo.cmd_task_median", dur=dur(tm["task_last_round_median"])) if tm.get("task_last_round_median") else "")
+                   + t("tempo.cmd_rejects", n=tm["reopens"], tasks=tm["tasks_reopened"]))
+    if dw["window"]:
+        out.append(t("tempo.cmd_dead_wait", dead=dur(dw["dead"]), window=dur(dw["window"]), share=f"{dw['share'] * 100:.0f}",
+                     count=dw["count"], longest=dur(dw["longest"])))
+    out.append(t("tempo.cmd_now", text=cls["text"]) + (t("tempo.cmd_now_since", dur=dur(cls["since"])) if cls.get("since") else ""))
+    out.extend(t("tempo.cmd_flag", flag=f) for f in flag_lines or [])
+    return out
+
+
 # ---------------------------------------------------------------- stall classification (read-only)
 
 BATCH_MARGIN = 3.0       # tool calls of one parallel batch land within this many seconds of each other

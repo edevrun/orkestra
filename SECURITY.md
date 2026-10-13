@@ -27,8 +27,9 @@ diffs in a target project (those playbooks live under `plugins/orkestra/skills/`
 
 - Hooks deny or allow **tool calls** from a bound agent session. They do not isolate processes, filesystems, or
   network. The agent runs as your OS user.
-- Claude Code and Cursor hooks are **fail-open**: if a hook crashes or times out, the call is allowed so a broken
-  guard cannot lock you out of the editor. Treat fail-open as availability over hard deny: that remains the
+- Claude Code and Cursor hooks are **fail-open**: if a hook crashes or the host kills it at 15 s, the call is allowed so a broken
+  guard cannot lock you out of the editor. A hook's own deadline (6 s CPU, 9 s wall) comes first and denies a `PreToolUse`
+  call instead. Treat fail-open as availability over hard deny: that remains the
   product decision for those engines.
 - Copilot `PreToolUse` is **fail-closed**: a hook crash or invalid payload returns `permissionDecision: deny` and
   blocks the tool call. Other Copilot hook events still fail open. Do not assume one fail policy across engines.

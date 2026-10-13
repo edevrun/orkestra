@@ -889,19 +889,8 @@ def cmd_tempo(a: argparse.Namespace) -> int:
         _out(json.dumps({"run": rid, "timings": tm, "dead_wait": dw, "stall": cls, "flags": T.flags(project, st, rows[-200:])},
                         indent=2, ensure_ascii=False, default=str))
         return 0
-    _out(f"{rid} · status {st['status']} · phase {st['phase']} · total {T.dur(tm['run'])}")
-    _out("phases: " + " · ".join(f"{name} {T.dur(sec)}" for name, sec in tm["phases"].items()))
-    if tm["tasks_total"]:
-        _out(f"tasks: {tm['tasks_done']}/{tm['tasks_total']} done"
-             + (f" · implement time per finished task {T.dur(tm['task_avg'])}" if tm.get("task_avg") else "")
-             + (f" · median last round {T.dur(tm['task_last_round_median'])}" if tm.get("task_last_round_median") else "")
-             + f" · review rejects {tm['reopens']} on {tm['tasks_reopened']} task(s)")
-    if dw["window"]:
-        _out(f"dead wait (subagent finished → main session's next action): {T.dur(dw['dead'])} of {T.dur(dw['window'])} "
-             f"recorded = {dw['share'] * 100:.0f}% · {dw['count']} gaps · longest {T.dur(dw['longest'])}")
-    _out(f"now: {cls['text']}" + (f" ({T.dur(cls['since'])})" if cls.get("since") else ""))
-    for f in dict.fromkeys(T.flags(project, st, rows[-200:]) + cls.get("loops", [])):
-        _out(f"flag: {f}")
+    for line in T.report_lines(rid, st, tm, dw, cls, list(dict.fromkeys(T.flags(project, st, rows[-200:]) + cls.get("loops", [])))):
+        _out(line)
     return 0
 
 
@@ -1018,7 +1007,7 @@ def review_packet(project: Path, rid: str, tid: str) -> str:
     cut = len(body) > REVIEW_DIFF_LINES
     out.append(f"## Diff of the task's files ({', '.join(files) or 'no files recorded'})\n"
                + ("\n".join(body[:REVIEW_DIFF_LINES]) if body else "(no tracked diff)")
-               + (f"\n… {len(body) - REVIEW_DIFF_LINES} more diff lines: `orkestra diff -p {project.name}`" if cut else ""))
+               + (f"\n… {len(body) - REVIEW_DIFF_LINES} more diff lines: `orkestra diff {T.p_arg(project)}`" if cut else ""))
     out.append("Start from this packet; open more only to verify a doubt (callers of changed functions, a log you need in full).")
     return "\n\n".join(out)
 

@@ -780,5 +780,19 @@ class TestCli(FW):
         self.assertTrue([k for k in M.EN if k.startswith("watchdog.fast_")])
 
 
+class TestRunForeverRestoresSignalHandlers(helpers.Sandbox):
+    def test_the_embedding_process_keeps_its_ctrl_c_behaviour(self):
+        """run_forever installs SIGINT/SIGTERM handlers while it loops; leaving them behind made every later
+        KeyboardInterrupt in the same process a no-op (an order-dependent failure in the suite)."""
+        import signal
+        import threading
+        from orkestra_core import fastwatch as F
+        before = (signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM))
+        stop = threading.Event()
+        stop.set()
+        self.assertEqual(F.run_forever(idle_exit=0.0, stop=stop), 0)
+        self.assertEqual((signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)), before)
+
+
 if __name__ == "__main__":
     unittest.main()

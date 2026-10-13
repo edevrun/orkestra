@@ -897,7 +897,10 @@ class Watcher:
                "what": "fastwatch: closed (a later row of the same agent outlived it)", "synthetic": True}
         if s["aid"]:
             row["aid"] = s["aid"]
-        append_record(rc.dir / "activity.jsonl", (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
+        path = rc.dir / "activity.jsonl"
+        # the lock activity._rotate holds while it rewrites the file from a snapshot: an unlocked append in that window is lost
+        with file_lock(path, timeout=1.0, on_timeout="proceed", shared=True):
+            append_record(path, (json.dumps(row, ensure_ascii=False) + "\n").encode("utf-8"))
 
     # -------------------------------------------------------------- incidents, notifications, resumes
     def _settle(self, rc: _Run, now: float, cfg: Dict[str, Any]) -> None:
@@ -1152,16 +1155,23 @@ def run_forever(idle_exit: Optional[float] = None, stop: Optional[threading.Even
         return 0
     set_lock_policy("hook")                           # short lock budgets: a busy lock degrades, it never stalls the loop
     stop = stop or threading.Event()
+    previous = {}
     if threading.current_thread() is threading.main_thread():
         import signal
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
-                signal.signal(sig, lambda *_: stop.set())
+                previous[sig] = signal.signal(sig, lambda *_: stop.set())
             except (ValueError, OSError):
                 pass
     try:
         Watcher(async_spawn=True).run(stop, idle_exit)
     finally:
+        for sig, handler in previous.items():          # a caller that embeds the loop keeps its own Ctrl+C behaviour
+            try:
+                import signal
+                signal.signal(sig, handler if handler is not None else signal.SIG_DFL)
+            except (ValueError, OSError):
+                pass
         single.release()
     return 0
 

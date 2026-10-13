@@ -59,6 +59,7 @@ STOP_NUDGE_WINDOW = 1800.0           # ... in this many seconds, whatever the pr
 # deny escalation: identical refusals of one actor are counted; 2nd = short note, 3rd = "do not retry", 8th in 10 min = blocked
 DENY_NOTE_AT, DENY_SHORT_AT = 2, 3
 DENY_BLOCK_HITS, DENY_BLOCK_WINDOW, DENY_WINDOW, DENY_MAX_KEYS = 8, 600.0, 1800.0, 200
+DENY_FAMILY_AT = 6              # refusals of ONE guard to ONE actor, however the call is varied, that count as a loop
 STATUS_LINE_RE = re.compile(r"\b(?:STATUS|VERDICT):\s*[A-Z_]+[^\n]{0,80}")
 
 
@@ -441,6 +442,8 @@ def _branch_from_head(cwd: str):
     for d in [cur, *cur.parents][:40]:
         git = d / ".git"
         if git.is_dir():
+            if not ((git / "objects").is_dir() and (git / "refs").is_dir()):
+                continue                    # not a repository (a planted `.git/HEAD`): real git skips it too
             try:
                 head = (git / "HEAD").read_text(encoding="utf-8", errors="replace").strip()
             except OSError:
@@ -600,7 +603,17 @@ def escalate_denial(ev: dict, b, d):
         if path is None:
             return text, key
         actor = str(ev.get("agent_id") or ev.get("agent_type") or "main")
-        total, fast = bump_denial(path, f"{key}:{actor}", time.time())
+        now = time.time()
+        total, fast = bump_denial(path, f"{key}:{actor}", now)
+        # a retry with a small variation (another commit message, an extra flag) has a new key every time: the same
+        # guard refusing the same actor again and again is counted under one family key as well
+        fam_total, fam_fast = bump_denial(path, f"~{d.guard}:{actor}", now)
+        if fam_total >= DENY_FAMILY_AT and total < DENY_SHORT_AT:
+            if not (b and fam_fast >= DENY_BLOCK_HITS):
+                note = (f"\n(denied {fam_total}x by [{d.guard}] for varied calls: do not retry variations of it. Change the "
+                        f"approach, or end your turn and tell the user.)")
+                return (f"[orkestra:{d.guard}] {head}{note}{way_out}" if way_out else text + note), key
+            total, fast = fam_total, fam_fast            # the run blocks below, as for an identical loop
         if total < DENY_NOTE_AT:
             return text, key
         if total < DENY_SHORT_AT:
@@ -723,6 +736,7 @@ def apply_markers(ev: dict, sid: str, text: str) -> list:
       * it names this hook's own ORKESTRA_HOME (the CLI of a sandbox home prints a line for THAT home; none = older CLI);
       * the run exists, is open and the project path is absolute (ST.bind_problem);
       * the chat is not already driving another live run (ST.try_bind): that binding is kept, with a notice."""
+    takeover_noted = set()
     binds, unbinds = list(BIND_RE.finditer(text)), list(UNBIND_RE.finditer(text))
     if not binds and not unbinds:
         return []
@@ -745,6 +759,12 @@ def apply_markers(ev: dict, sid: str, text: str) -> list:
         for m in unbinds:
             rec = ST.binding_record(sid)        # the file as written: a closed run (abort, done) hides behind `cur`
             if own_home(m) and rec and rec.get("run_id") == m.group(2) and Path(rec.get("project", "")) == Path(m.group(1)):
+                # the CLI prints the line only after it closed or paused the run: a line for a run that is still being
+                # driven is forged text (a `cat` of a file) and must not release the chat
+                live = (ST.read_json(ST.state_path(Path(m.group(1)), m.group(2))) or {}).get("status") in ST.DRIVEN_STATUSES
+                if live:
+                    log(f"ignored an unbind marker for the still open run {m.group(2)} in session {short_sid(sid)}")
+                    continue
                 ST.unbind_session(sid)
     warnings: list = []
     if not binds or not from_cli(BIND_COMMANDS):
@@ -758,9 +778,19 @@ def apply_markers(ev: dict, sid: str, text: str) -> list:
             targets = _bind_targets(command, str(ev.get("cwd") or os.getcwd()))
         except Exception as exc:
             log(f"bind target lookup failed: {exc}")
-    for m in binds:
-        if not own_home(m):
-            continue
+    ours = [m for m in binds if own_home(m)]
+    if targets is None and keys is not None and len({(m.group(1), m.group(2)) for m in ours}) > 1:
+        # the command's own target cannot be read (-p "$X", ORKESTRA_PROJECT): several different markers mean at least
+        # one is not the CLI's. Only the project of the working directory is believed, none when it matches nothing.
+        cwd_project = None
+        try:
+            cwd_project = guards._cli_project(None, str(ev.get("cwd") or os.getcwd()))
+        except Exception:
+            pass
+        ours = [m for m in ours if cwd_project is not None and resolve_path(m.group(1)) == resolve_path(str(cwd_project))]
+        if not ours:
+            log(f"ignored several bind markers: the command's target is unknown and none names {cwd_project}")
+    for m in ours:
         bproj, brun = Path(m.group(1)), m.group(2)
         if targets is not None and not any(
                 resolve_path(str(bproj)) == resolve_path(str(tp)) and (tr is None or tr == brun) for tp, tr in targets):
@@ -795,8 +825,9 @@ def apply_markers(ev: dict, sid: str, text: str) -> list:
         if engine:
             runs.record_engine_origin(bproj, brun, engine)
         activity.record(bproj, brun, ev, "bind", _t("dispatch.bound", sid=short_sid(sid)))
-        if others:
+        if others and (brun, others[0]["id"]) not in takeover_noted:      # once per run and other session, not per marker
             o = others[0]
+            takeover_noted.add((brun, o["id"]))
             try:
                 if o["age"] < lease:
                     ST.ledger(bproj, brun, f"WARNING second session {short_sid(sid)} bound while {short_sid(o['id'])} is active "

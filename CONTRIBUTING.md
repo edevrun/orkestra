@@ -3,8 +3,9 @@
 Thank you for looking into Orkestra. By participating you agree to the [Code of Conduct](CODE_OF_CONDUCT.md).
 A few rules keep it safe to change.
 
-1. **Do not edit hook, guard or agent files while a run is open.** Claude Code loads the plugin in place, so a
-   half-edited `hooks/`, `lib/orkestra_core/` or `agents/` file takes effect in running sessions immediately.
+1. **Do not edit hook, guard or agent files while a run is open.** Cursor and Copilot read the checkout, and Claude
+   Code picks a change up at the next `orkestra setup`, so a half-edited `hooks/`, `lib/orkestra_core/` or `agents/` file
+   takes effect in running sessions.
    Work on a copy or a branch; `orkestra watch` shows open runs.
 2. **Every change comes with a test** that fails without it. The suite must stay green on Python 3.9 and on the
    newest Python you have:

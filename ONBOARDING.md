@@ -25,7 +25,7 @@ git clone https://github.com/soft-ai-solutions/orkestra.git
 cd orkestra
 ```
 
-The Claude Code plugin is loaded in place from `plugins/orkestra`, so keep the checkout where it is.
+`orkestra setup` copies the Claude Code plugin from `plugins/orkestra` into `~/.claude/plugins/cache/`; Claude Code runs that copy. Keep the checkout where it is: Cursor and Copilot read it directly.
 
 ## 3. Install
 
@@ -155,8 +155,9 @@ control, `orkestra pause -p <project>` or `orkestra abort -p <project> --reason 
 
 ## Updating and uninstalling
 
-Update with `git pull` in the checkout. Because the plugin is loaded in place, hook and CLI code applies at once, and
-agent, skill and `hooks.json` changes apply in a newly opened Claude Code session. Check the Cursor side with
+Update with `git pull` in the checkout, then bump the version and run `orkestra setup`: Claude Code runs the copy cached
+under `~/.claude/plugins/cache/`, keyed by the version, so a pull alone changes nothing there (Cursor and Copilot read
+the checkout). Agent, skill and `hooks.json` changes apply in a newly opened Claude Code session. Check the Cursor side with
 `orkestra cursor status`, and restart the bridge if you use it (it is a long-lived process).
 
 ```bash

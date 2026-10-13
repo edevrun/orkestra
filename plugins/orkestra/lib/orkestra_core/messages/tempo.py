@@ -35,6 +35,18 @@ EN: Dict[str, str] = {
                                 "records{lost}",
     "tempo.stall_silent": "silent session: no records for {dur}; the session may have closed or crashed{lost}",
     "tempo.stall_working": "working",
+    # ---- `orkestra tempo` (the command a person runs)
+    "tempo.cmd_head": "{rid} · status {status} · phase {phase} · total {total}",
+    "tempo.cmd_phases": "phases: {phases}",
+    "tempo.cmd_tasks": "tasks: {done}/{total} done",
+    "tempo.cmd_task_avg": " · implement time per finished task {dur}",
+    "tempo.cmd_task_median": " · median last round {dur}",
+    "tempo.cmd_rejects": " · review rejects {n} on {tasks} task(s)",
+    "tempo.cmd_dead_wait": "dead wait (subagent finished → main session's next action): {dead} of {window} recorded = "
+                           "{share}% · {count} gaps · longest {longest}",
+    "tempo.cmd_now": "now: {text}",
+    "tempo.cmd_now_since": " ({dur})",
+    "tempo.cmd_flag": "flag: {flag}",
 }
 
 TR: Dict[str, str] = {
@@ -61,4 +73,16 @@ TR: Dict[str, str] = {
                                 "doğrulanamıyor{lost}",
     "tempo.stall_silent": "sessiz oturum — {dur} kayıt yok; oturum kapanmış ya da çökmüş olabilir{lost}",
     "tempo.stall_working": "çalışıyor",
+    # ---- `orkestra tempo`
+    "tempo.cmd_head": "{rid} · durum {status} · aşama {phase} · toplam {total}",
+    "tempo.cmd_phases": "aşamalar: {phases}",
+    "tempo.cmd_tasks": "görevler: {done}/{total} bitti",
+    "tempo.cmd_task_avg": " · biten görev başına uygulama süresi {dur}",
+    "tempo.cmd_task_median": " · son turun medyanı {dur}",
+    "tempo.cmd_rejects": " · review reddi {n}, {tasks} görevde",
+    "tempo.cmd_dead_wait": "ölü bekleme (alt-ajan bitti → ana oturumun sonraki eylemi): kayıtlı {window} içinde {dead} = "
+                           "%{share} · {count} boşluk · en uzunu {longest}",
+    "tempo.cmd_now": "şimdi: {text}",
+    "tempo.cmd_now_since": " ({dur})",
+    "tempo.cmd_flag": "bayrak: {flag}",
 }

@@ -41,7 +41,7 @@ kazanır:
 
 ## Mimari
 
-Dört parça var; hepsi `plugins/orkestra/` altında ve yerinde yüklenir (kopyalanmaz):
+Dört parça var; hepsi `plugins/orkestra/` altında (Claude Code, `orkestra setup`'ın önbelleğe aldığı kopyayı çalıştırır; Cursor ve Copilot checkout'u okur):
 
 | Parça | Yer | İş |
 |---|---|---|
@@ -309,8 +309,9 @@ cd ./integrations/openclaw/plugin && npm test
 python3 ./plugins/orkestra/bin/orkestra doctor
 ```
 
-Eklenti yerinde yüklendiği için kod değişikliği için kurulum gerekmez: hook'lar ve CLI her çağrıda diskteki dosyayı
-okur. Ajan ve skill metinleri ile `hooks.json` yeni açılan Claude Code oturumunda geçerli olur. Bridge uzun yaşayan bir
+Claude Code, `orkestra setup`'ın `~/.claude/plugins/cache/` altına (sürüme göre anahtarlanmış) önbelleğe aldığı kopyayı
+çalıştırır; bu yüzden kod değişikliği ona ancak sürümü yükseltip `orkestra setup` çalıştırınca ulaşır. Cursor ve Copilot
+her çağrıda checkout'u okur. Ajan ve skill metinleri ile `hooks.json` yeni açılan Claude Code oturumunda geçerli olur. Bridge uzun yaşayan bir
 süreçtir; bridge kodu değiştiyse yeniden başlatılır. `install.sh` yalnız ilk kurulum, MCP ekleme ve testleri bu
 makinede koşmak için gerekir.
 
@@ -336,7 +337,7 @@ Sabitlenmiş referansları yenilemek: `bash install.sh --refresh-vendor` (kaynak
   denenmedi (aynı hook sözleşmesi; IDE'ye özgü bir fark gözlenmedi çünkü bakılmadı).
 - Cursor, Claude Code'un eklenti kaydındaki eski orkestra kopyasını (1.0.0, `~/.claude/plugins/cache/…`) da yükler;
   o kopyanın hook'ları Cursor sohbetlerinde eski kurallarla cevap verir (ör. `klasör/**` Grep'ini reddeder).
-  `claude plugin update orkestra@orkestra-local` kaydı yeniler; Claude Code'un yerinde yüklemesine etkisi denenmedi.
+  `claude plugin update orkestra@orkestra-local` kaydı yeniler; Claude Code'un çalıştırdığı kopyaya etkisi denenmedi.
 - Kendi kendini onaylama gerçek bir run'da görüldü ve üç katmanla kapatıldı (CHANGELOG 1.5.0); ortamını temizleyip
   üst süreçlerinden kopan, adları gizleyen bir betik hâlâ aşabilir. Claude Code tarafında hook'un "beni ajan başlattı"
   denetimi yok (Claude Code'un süreç düzeni ölçülmedi); komut ve içerik denetimi iki motorda da var.

@@ -84,7 +84,7 @@ In a Claude Code or Copilot chat type `/orkestra:run <request>`, in Cursor `/ork
 
 The full installer does the same and more: it runs the plugin and bridge test suites on your machine first (a few
 minutes, and it stops if anything is red), registers the checkout as a Claude Code marketplace
-(`orkestra@orkestra-local`, loaded in place from `plugins/orkestra`), installs the Cursor and Copilot hooks you
+(`orkestra@orkestra-local`; Claude Code runs the copy it caches from `plugins/orkestra`), installs the Cursor and Copilot hooks you
 accept and, with `install.sh` only, adds optional MCP servers and creates the bridge token.
 
 ```bash
@@ -124,7 +124,7 @@ engine in the run state, and the engine that started a run is the one that resum
 | Undo a run's file changes | `/orkestra:rollback` | `/orkestra-rollback` | `/orkestra:rollback` |
 | Commit and push (only you call it) | `/orkestra:ship` | `/orkestra-ship` | `/orkestra:ship` |
 
-- **Claude Code**: the plugin is loaded in place from this checkout; a hook change applies to the next session.
+- **Claude Code**: `orkestra setup` installs a copy of the plugin into `~/.claude/plugins/cache/`; after a `git pull` bump the version and run `orkestra setup` again, otherwise the cached copy keeps running.
 - **Cursor**: `orkestra cursor install` links skills and subagents into `~/.cursor` and appends its entries to
   `~/.cursor/hooks.json` without touching yours (after a timestamped backup); `orkestra cursor uninstall` removes
   exactly those. Only chats that carry an Orkestra run are guarded; set `engine.cursor.global_guards` to apply the
@@ -160,7 +160,7 @@ Every transition is `orkestra phase next`, and the CLI refuses it until the cond
 | Phase | What happens | Moves on when (checked by code) |
 | --- | --- | --- |
 | intake | The request is restated, typed and sized (XS, S, M, L). | `request.md` exists. |
-| discover | Scouts map the code, a researcher checks current docs, baseline gates are recorded. | `context.md` is filled and the baseline gates are recorded. |
+| discover | Scouts map the code, a researcher checks current docs, baseline gates are recorded. | `context.md` is filled. The baseline gates (run in the background) must be recorded before the move to implement. |
 | clarify | Only questions that change the outcome are asked (at most 4 per call). `spec.md` is written. | `spec.md` has a Clarifications section and FR/SC ids. |
 | plan | The architect writes `plan.md` with atomic TDD tasks; the plan-critic tries to break it. | `orkestra plan check` is clean and the critic says PASS. |
 | approve | Autopilot records a policy approval of the reviewed plan; manual mode asks you. | An approval is recorded and the spec and plan have not changed since. |

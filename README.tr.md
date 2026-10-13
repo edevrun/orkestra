@@ -83,7 +83,7 @@ Claude Code ya da Copilot sohbetinde `/orkestra:run <istek>`, Cursor'da `/orkest
 
 Tam kurulum aynı işi yapar ve fazlasını ekler: önce eklenti ve bridge test takımlarını makinende koşar (birkaç dakika;
 biri kırmızıysa durur), checkout'u Claude Code marketplace'i olarak kaydeder (`orkestra@orkestra-local`, `plugins/orkestra`
-altından yerinde yüklenir), kabul ettiğin Cursor ve Copilot hook'larını kurar ve yalnız `install.sh` ile isteğe bağlı MCP
+altından önbelleğe aldığı kopyayı çalıştırır), kabul ettiğin Cursor ve Copilot hook'larını kurar ve yalnız `install.sh` ile isteğe bağlı MCP
 sunucularını ekler, bridge token'ını oluşturur.
 
 ```bash
@@ -123,7 +123,7 @@ durumunda taşır ve yarım kalan run'ı başlatan motor sürdürür.
 | Bir run'ın dosya değişikliklerini geri al | `/orkestra:rollback` | `/orkestra-rollback` | `/orkestra:rollback` |
 | Commit ve push (yalnız sen çağırırsın) | `/orkestra:ship` | `/orkestra-ship` | `/orkestra:ship` |
 
-- **Claude Code**: eklenti bu checkout'tan yerinde yüklenir; bir hook değişikliği sonraki oturumda geçerli olur.
+- **Claude Code**: `orkestra setup` eklentinin bir kopyasını `~/.claude/plugins/cache/` altına kurar; `git pull` sonrası sürümü yükseltip `orkestra setup` komutunu yeniden çalıştır, yoksa önbellekteki kopya çalışmaya devam eder.
 - **Cursor**: `orkestra cursor install` skill ve alt-ajanları `~/.cursor` altına bağlar, girdilerini `~/.cursor/hooks.json`
   dosyasına seninkilere dokunmadan ekler (önce zaman damgalı yedek alır); `orkestra cursor uninstall` tam olarak onları
   kaldırır. Yalnız Orkestra run'ı taşıyan sohbetler denetlenir; her oturum guard'larını tüm Cursor sohbetlerine uygulamak
@@ -160,7 +160,7 @@ Her geçiş `orkestra phase next` iledir ve fazın koşulları sağlanmadan CLI 
 | Faz | Ne olur | Geçiş koşulu (kod denetler) |
 | --- | --- | --- |
 | intake | İstek yeniden yazılır, türü ve boyutu (XS, S, M, L) belirlenir. | `request.md` var. |
-| discover | Scout'lar kodu haritalar, researcher güncel dokümanı doğrular, başlangıç (baseline) kapıları kaydedilir. | `context.md` dolu ve baseline kapıları kayıtlı. |
+| discover | Scout'lar kodu haritalar, researcher güncel dokümanı doğrular, başlangıç (baseline) kapıları kaydedilir. | `context.md` dolu. Baseline kapıları (arka planda koşar) implement'e geçmeden önce kayıtlı olmalı. |
 | clarify | Yalnız sonucu değiştiren sorular sorulur (çağrı başına en çok 4). `spec.md` yazılır. | `spec.md` içinde Netleştirmeler bölümü ve FR/SC kimlikleri var. |
 | plan | Architect atomik TDD görevleriyle `plan.md` yazar; plan-critic planı çürütmeye çalışır. | `orkestra plan check` temiz ve critic PASS diyor. |
 | approve | Autopilot incelenmiş plan için politika onayı kaydeder; manuel modda sana sorar. | Onay kayıtlı ve spec ile plan sonradan değişmemiş. |

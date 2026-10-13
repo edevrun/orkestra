@@ -476,9 +476,21 @@ def phase_next(project: Path, run_id: str, note: str = "") -> Tuple[str, str]:
     return cur, target
 
 
+MAX_PHASE_BACKS = 25            # `phase back` calls one run may make: a run that went back this often is not converging
+
+
 def phase_back(project: Path, run_id: str, target: str, reason: str) -> Tuple[str, str]:
     with StateTxn(project, run_id) as st:
         cur = st["phase"]
+        status = str(st.get("status") or "")
+        if status in ("blocked", "paused") or status in TERMINAL_STATUSES:
+            # a block (deny loop, external dependency), a pause or a close is lifted by its own command, never by moving the phase
+            raise OrkestraError(f"run '{run_id}' is {status}: `phase back` does not lift that. "
+                                f"Ask the user; they resume or unblock it.")
+        backs = sum(1 for h in (st.get("history") or []) if str(h.get("note") or "").startswith("back:"))
+        if backs >= MAX_PHASE_BACKS:
+            raise OrkestraError(f"run '{run_id}' already went back {backs} times: it is not converging. "
+                                f"Run `orkestra block \"<why>\"` and tell the user.")
         if target not in BACK_EDGES.get(cur, []):
             raise OrkestraError(f"cannot go back {cur} → {target}; allowed: {BACK_EDGES.get(cur, [])}")
         if PHASES.index(target) < PHASES.index("implement") and st.get("approved"):

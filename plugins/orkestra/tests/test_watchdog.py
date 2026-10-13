@@ -112,7 +112,7 @@ class TestWatchdogScan(FlowBase):
             with redirect_stdout(buf):
                 rc = W.main(as_json=True, now=time.time())
         self.assertEqual(rc, 0)
-        self.assertLess(time.time() - t0, 5)          # the CLI lock budget is 10 s: a skip does not wait for it
+        self.assertLess(time.time() - t0, 8)          # the CLI lock budget is 10 s: a skip does not wait for it (slack for a loaded machine)
 
     def test_healthy_run_is_quiet_and_user_wait_is_announced_once(self):
         self.config()

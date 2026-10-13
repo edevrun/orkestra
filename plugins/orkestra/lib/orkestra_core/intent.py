@@ -159,11 +159,16 @@ _ABORT_WORD = _LazyRe(
     + r"|" + _CTL_START + r"(?:" + _CTL_OBJ_TR + r"\s+)?(?:iptal\s+et|iptal\s+edelim|vazgeç(?:tim|tik|iyorum)|sonlandır)"
     + r"[a-zçğıöşü]*" + _CTL_END_TR,
     re.I)
+# anchored like pause / abort: the verb opens its clause and ends it (optionally with the run for object), so "do not
+# resume this run", "I will continue tomorrow" and "resolved conflicts in README" are no request
+_RESUME_START = r"(?:" + _CTL_START + r"|\b(?:yes|yeah|yep|sure|evet|tamam|olur)\s+)"
 _RESUME_WORD = _LazyRe(
-    r"\b(?:resume|continue|go\s+on|carry\s+on|keep\s+going|proceed|unblock\w*|resolved)\b|\bdevam\b|\bçözüldü\b|"
-    r"kald[ıi][gğ][ıi]n\s+yerden|/orkestra[-:]resume\b|"
+    _RESUME_START + r"(?:resume|continue|go\s+on|carry\s+on|keep\s+going|proceed|unblock\w*)(?:\s+" + _CTL_OBJ_EN + r")?" + _CTL_END_EN
+    + r"|" + _RESUME_START + r"(?:resolved|unblocked)" + _CTL_END_EN
+    + r"|" + _RESUME_START + r"(?:devam(?:\s+(?:et|edelim|edin|ediyoruz))?|çözüldü)" + _CTL_END_TR
+    + r"|kald[ıi][gğ][ıi]n\s+yerden(?!\s+devam\s+etme)|/orkestra[-:]resume\b"
     # the bare yes to "shall I continue the run?"
-    r"^\s*(?:yes|yeah|yep|sure|ok|okay|go\s+ahead|please\s+do|evet|tamam|olur|başla)[\s.!]*$", re.I)
+    + r"|^\s*(?:yes|yeah|yep|sure|ok|okay|go\s+ahead|please\s+do|evet|tamam|olur|başla)[\s.!]*$", re.I)
 # the user switches topic without naming the other project
 _SWITCH_WORD = _LazyRe(
     r"\b(?:forget|drop|leave|ditch|abandon)\s+(?:about\s+)?(?:this|that|it|the\s+(?:run|task|job|work|feature))\b|"

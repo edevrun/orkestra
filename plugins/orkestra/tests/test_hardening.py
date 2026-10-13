@@ -458,6 +458,25 @@ class TestHookOutputAndGrants(Base):
         obj = json.loads(cp.stdout)                                          # raises on "Extra data"
         self.assertEqual(obj["hookSpecificOutput"]["additionalContext"].count("WARNING"), 1)
 
+    def test_the_takeover_warning_is_once_per_run_even_when_the_age_ticks_over_a_second(self):
+        """The warning text carries '<n> s ago': two markers one second apart used to give two different texts (a flaky
+        double WARNING). It is keyed by run and other session now."""
+        from unittest import mock
+        from orkestra_core import hookmain as HM
+        out = self.start()
+        marker = [ln for ln in out.splitlines() if ln.startswith("[orkestra:bind]")][0]
+        ages = iter([1, 2, 3, 4])
+        real = HM.ST.run_sessions
+
+        def sessions(project, run):
+            return [dict(s, age=next(ages)) for s in real(project, run)]
+
+        ev = {"session_id": "sess-2", "tool_name": "Bash", "hook_event_name": "PostToolUse",
+              "tool_input": {"command": "orkestra resume"}, "cwd": str(self.proj)}
+        with mock.patch.object(HM.ST, "run_sessions", sessions):
+            warnings = HM.apply_markers(ev, "sess-2", marker + "\n" + marker + "\n")
+        self.assertEqual(len([w for w in warnings if "WARNING" in w]), 1, warnings)
+
     def test_git_permission_does_not_survive_a_hand_back(self):
         """13 — with or without prompt ids: commit only when asked in THAT message."""
         self.start()

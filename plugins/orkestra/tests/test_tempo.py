@@ -403,7 +403,7 @@ class TestTempoCommand(TempoBase):
     def test_tempo_report_and_closed_run_usage(self):
         self.to_implement()
         self.cli("task", "start", "T001", "-p", "demo")
-        out = self.cli("tempo", "-p", "demo").stdout
+        out = self.cli("tempo", "-p", "demo", env={"ORKESTRA_LANG": "en"}).stdout     # the labels follow the language
         self.assertIn("phases: intake", out)
         self.assertIn("tasks: 0/3 done", out)
         data = json.loads(self.cli("tempo", "--json", "-p", "demo").stdout)

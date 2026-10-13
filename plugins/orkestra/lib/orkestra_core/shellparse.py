@@ -118,7 +118,7 @@ def _extract_substitutions(cmd: str) -> Tuple[str, List[str]]:
                     depth -= 1
                 j += 1
             bodies.append(cmd[i + 2:j - 1])
-            out.append(" __SUBST__ ")
+            out.append(" __SUBST__" if cmd[j:j + 1] == "#" else " __SUBST__ ")   # `$(x)#y`: the # is mid-word, no comment
             i = j
             continue
         if not in_single and ch == "`":
@@ -126,7 +126,7 @@ def _extract_substitutions(cmd: str) -> Tuple[str, List[str]]:
             if j == -1:
                 j = n
             bodies.append(cmd[i + 1:j])
-            out.append(" __SUBST__ ")
+            out.append(" __SUBST__" if cmd[j + 1:j + 2] == "#" else " __SUBST__ ")
             i = j + 1
             continue
         out.append(ch)
@@ -139,10 +139,12 @@ def _newlines_to_semicolons(cmd: str) -> str:
     in_single = in_double = False
     i, n = 0, len(cmd)
     escaped_to = -1                 # index right after an escape pair: a `#` there continues the word (`x\ #` is no comment)
+    parens: list = []               # per open `(` outside quotes: was it `$(`, `<(` or `>(` (a substitution)?
+    subst_close = -2                # index of the last `)` that closed a substitution: a `#` right after it is mid-word
     while i < n:
         ch = cmd[i]
-        if ch == "\\" and i + 1 < n:
-            if cmd[i + 1] == "\n" and not in_single:
+        if ch == "\\" and i + 1 < n and not in_single:        # inside '...' a backslash is a plain character
+            if cmd[i + 1] == "\n":
                 i += 2
                 continue
             out.append(cmd[i:i + 2])
@@ -153,11 +155,16 @@ def _newlines_to_semicolons(cmd: str) -> str:
             in_single = not in_single
         elif ch == '"' and not in_single:
             in_double = not in_double
+        elif ch == "(" and not in_single and not in_double:
+            parens.append(i > 0 and cmd[i - 1] in "$<>")
+        elif ch == ")" and not in_single and not in_double:
+            if parens and parens.pop():
+                subst_close = i
         elif ch == "\n" and not in_single and not in_double:
             out.append(" ; ")
             i += 1
             continue
-        elif (ch == "#" and not in_single and not in_double and i != escaped_to
+        elif (ch == "#" and not in_single and not in_double and i != escaped_to and i - 1 != subst_close
               and (i == 0 or cmd[i - 1] in " \t\n;&|()")):
             # a comment runs to the end of ITS line only; the newline (next command) is kept
             j = cmd.find("\n", i)

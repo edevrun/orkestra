@@ -45,6 +45,10 @@ def today() -> str:
 def read_text(path: Path, default: str = "") -> str:
     try:
         return Path(path).read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        # Latin-1 source, a binary with a text extension: the evidence checks only count and diff lines, and the git
+        # baseline is decoded with "replace" too, so both sides stay comparable
+        return Path(path).read_text(encoding="utf-8", errors="replace")
     except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
         return default
 
@@ -243,15 +247,17 @@ def _nb_flag(module: Any, name: str) -> Optional[int]:
     return value if isinstance(value, int) else None
 
 
-def _lock_attempt(fh: Any) -> str:
+def _lock_attempt(fh: Any, shared: bool = False) -> str:
     """One try at the OS lock: the kind now held ("fcntl" | "msvcrt"), "" when this file system cannot lock, _Busy
     when another process holds it. A locking module without a non-blocking flag (never a real fcntl/msvcrt) is used
-    the old way: blocking."""
+    the old way: blocking. `shared` asks for a flock shared lock (readers of one critical section do not queue on each
+    other); msvcrt has no shared mode and takes the exclusive one."""
     fd = fh.fileno()
     if fcntl is not None:
         nb = _nb_flag(fcntl, "LOCK_NB")
+        mode = fcntl.LOCK_SH if shared and isinstance(getattr(fcntl, "LOCK_SH", None), int) else fcntl.LOCK_EX
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | nb if nb is not None else fcntl.LOCK_EX)
+            fcntl.flock(fd, mode | nb if nb is not None else mode)
             return "fcntl"
         except OSError as exc:
             if nb is not None and exc.errno in _LOCK_BUSY:
@@ -292,14 +298,14 @@ def _log_unlocked(exc: "LockTimeout") -> None:
         pass
 
 
-def _acquire(fh: Any, lock_path: Path, budget: float, proceed: bool) -> str:
+def _acquire(fh: Any, lock_path: Path, budget: float, proceed: bool, shared: bool = False) -> str:
     """Poll the lock without ever blocking in the kernel: a holder that is frozen or wedged cannot hang the caller.
     Short growing naps with jitter; a holder that dies drops its flock and is noticed within one nap."""
     started = _clock()
     delay = 0.002
     while True:
         try:
-            return _lock_attempt(fh)
+            return _lock_attempt(fh, shared) if shared else _lock_attempt(fh)
         except _Busy:
             waited = _clock() - started
             if waited >= budget:
@@ -313,13 +319,16 @@ def _acquire(fh: Any, lock_path: Path, budget: float, proceed: bool) -> str:
 
 
 @contextlib.contextmanager
-def file_lock(path: Path, timeout: Optional[float] = None, on_timeout: Optional[str] = None) -> Iterator[None]:
+def file_lock(path: Path, timeout: Optional[float] = None, on_timeout: Optional[str] = None,
+              shared: bool = False) -> Iterator[None]:
     """Exclusive advisory lock on <path>.lock (fcntl, else msvcrt 1-byte, else no-op).
 
     Never waits forever: it polls for `timeout` seconds (default lock_budget(): 2 s in a hook, 10 s in the CLI) and
     then raises LockTimeout, whose message names the holder (every holder writes pid, start time and command into
     the lock file). on_timeout="proceed" goes on WITHOUT the lock instead, with one hooks.log line: the default in a
-    hook, whose bookkeeping must not hold the host up. on_timeout="raise" is for writes that must never run unlocked."""
+    hook, whose bookkeeping must not hold the host up. on_timeout="raise" is for writes that must never run unlocked.
+    shared=True takes a flock shared lock (several holders at once, excluded only by an exclusive holder): for appenders
+    that merely must not overlap a rewrite of the file."""
     lock_path = Path(str(path) + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     policy = lock_policy()
@@ -328,8 +337,8 @@ def file_lock(path: Path, timeout: Optional[float] = None, on_timeout: Optional[
     fh = open(lock_path, "a+b", buffering=0)
     held = ""
     try:
-        held = _acquire(fh, lock_path, budget, proceed)
-        if held:
+        held = _acquire(fh, lock_path, budget, proceed, shared) if shared else _acquire(fh, lock_path, budget, proceed)
+        if held and not (shared and held == "fcntl"):       # shared holders do not overwrite each other's stamp
             _stamp_holder(fh.fileno(), 1 if held == "msvcrt" else 0)
         yield
     finally:

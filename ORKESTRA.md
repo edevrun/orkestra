@@ -43,7 +43,7 @@ What stays the same in both languages:
 
 ## Architecture
 
-There are four parts, all under `plugins/orkestra/`, loaded in place (not copied):
+There are four parts, all under `plugins/orkestra/` (Claude Code runs the copy `orkestra setup` caches; Cursor and Copilot read the checkout):
 
 | Part | Location | Job |
 |---|---|---|
@@ -312,8 +312,9 @@ cd ./integrations/openclaw/plugin && npm test
 python3 ./plugins/orkestra/bin/orkestra doctor
 ```
 
-Because the plugin is loaded in place, a code change needs no installation: the hooks and the CLI read the file on disk
-on every call. Agent and skill texts and `hooks.json` take effect in a newly opened Claude Code session. The bridge is a
+Claude Code runs the plugin copy that `orkestra setup` caches under `~/.claude/plugins/cache/` (keyed by the version), so a
+code change reaches it only after you bump the version and run `orkestra setup`; Cursor and Copilot read the checkout on
+every call. Agent and skill texts and `hooks.json` take effect in a newly opened Claude Code session. The bridge is a
 long-lived process; restart it when the bridge code changed. `install.sh` is needed only for the first installation,
 adding the MCP, and running the tests on this machine.
 
@@ -339,7 +340,7 @@ Refreshing the pinned references: `bash install.sh --refresh-vendor` (sources an
   was not tried separately (same hook contract; no IDE-specific difference was observed because none was looked for).
 - Cursor also loads the old orkestra copy in Claude Code's plugin registry (1.0.0, `~/.claude/plugins/cache/…`);
   that copy's hooks answer in Cursor chats with the old rules (for example it rejects a `folder/**` Grep).
-  `claude plugin update orkestra@orkestra-local` refreshes the registry; its effect on Claude Code's in-place loading
+  `claude plugin update orkestra@orkestra-local` refreshes the registry; its effect on the copy Claude Code runs
   has not been tried.
 - Self-approval was seen in a real run and closed with three layers (CHANGELOG 1.5.0); a script that cleans its
   environment, detaches from its parent processes and hides names can still get around it. On the Claude Code side the

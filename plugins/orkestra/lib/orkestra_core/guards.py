@@ -1068,6 +1068,13 @@ CONTROL_EXAMPLE = {"pause": "pause the run", "abort": "abort the run", "resume":
 def _cli_project(arg: Optional[str], cwd: str) -> Optional[Path]:
     """The project folder `orkestra -p <arg>` resolves to, found the way cli._resolve_project finds it (None: the CLI
     would refuse, or there is nothing to find). test_binding_model pins the two together."""
+    try:
+        return _cli_project_unsafe(arg, cwd)
+    except (OSError, RuntimeError, ValueError):      # name too long, symlink loop, NUL, lone surrogate: the CLI refuses it too
+        return None
+
+
+def _cli_project_unsafe(arg: Optional[str], cwd: str) -> Optional[Path]:
     from . import paths as P
     ws = P.workspace_root()
     if not arg:
@@ -1301,8 +1308,14 @@ def _strip_shell_comments(text: str) -> str:
     out: List[str] = []
     i, n, quote = 0, len(text), ""
     escaped_to = -1                 # index right after an escape pair: `x\ #` is one word, not a comment
+    parens: List[bool] = []         # per open `(` outside quotes: was it `$(`, `<(` or `>(` (a substitution)?
+    subst_close = -2                # index of the last `)` that closed a substitution: a `#` right after it is mid-word
     while i < n:
         ch = text[i]
+        if not quote and ch == "(":
+            parens.append(i > 0 and text[i - 1] in "$<>")
+        elif not quote and ch == ")" and parens and parens.pop():
+            subst_close = i
         if quote:
             out.append(ch)
             if ch == "\\" and quote == '"' and i + 1 < n:
@@ -1319,7 +1332,7 @@ def _strip_shell_comments(text: str) -> str:
         elif ch in "\"'":
             quote = ch
             out.append(ch)
-        elif ch == "#" and i != escaped_to and (i == 0 or text[i - 1] in " \t\n;&|()"):
+        elif ch == "#" and i != escaped_to and i - 1 != subst_close and (i == 0 or text[i - 1] in " \t\n;&|()"):
             j = text.find("\n", i)
             if j < 0:
                 break
@@ -1703,7 +1716,10 @@ def pre_tool_decision(event: Dict[str, Any], cfg: Dict[str, Any], binding: Optio
                                         "in the current message (/orkestra:rollback, 'discard the changes' or "
                                         "'değişiklikleri geri al'). "
                                         "Show the dry run instead.")
-        d = ownership_guard(event, segs, cfg, grants)
+        try:
+            d = ownership_guard(event, segs, cfg, grants)
+        except Exception:                           # an unusable control call must not skip the guards behind it (the hook fails open)
+            d = ALLOW
         if d.denied:
             return d
         if guards.get("git", True):

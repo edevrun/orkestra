@@ -96,8 +96,9 @@ def record(project: Path, run_id: str, ev: Dict[str, Any], kind: str, extra: str
         if ev.get("agent_type") and ev.get("agent_id"):
             row["aid"] = str(ev["agent_id"])[:64]           # which instance (two implementers share one type)
         # the append shares _rotate's lock: a rotation rewrites the file from a snapshot and would drop a row appended
-        # meanwhile (end/deny rows feed the stall classifiers). Short wait, then append unlocked: never hold a hook up.
-        with file_lock(path, timeout=1.0, on_timeout="proceed"):
+        # meanwhile (end/deny rows feed the stall classifiers). Shared, so concurrent appenders never queue on each other
+        # (only a rotation excludes them). Short wait, then append unlocked: never hold a hook up.
+        with file_lock(path, timeout=1.0, on_timeout="proceed", shared=True):
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
         if path.stat().st_size > MAX_BYTES:
