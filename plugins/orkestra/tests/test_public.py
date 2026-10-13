@@ -163,7 +163,7 @@ class TestPublicRepository(unittest.TestCase):
         for path in ("bridge/dist/package.json", "bridge/internal/guide.md"):
             cp = subprocess.run(["git", "check-ignore", "--no-index", "--quiet", "--", path], cwd=ROOT)
             self.assertEqual(cp.returncode, 1, f"{path} should not be ignored by the root-only rules")
-        # FR-005 / E8: personal sibling tokens banned in shipped plugin sources only
+        # FR-005 / E8: sibling project tokens banned in shipped plugin sources only
         # (hooks/lib/agents/skills; vendor + tests/ out of scope — fixtures stay).
         sibling = re.compile(r"other-app|sample-app", re.I)
         sibling_hits = []
@@ -215,7 +215,7 @@ class TestPublicRepository(unittest.TestCase):
         # The public clone path is the soft-ai-solutions org. Personal account names and private
         # home paths remain forbidden everywhere else.
         allowed_clone = re.compile(r"github\.com/soft-ai-solutions/orkestra", re.I)
-        personal = re.compile(r"firatkocabay|yaln[ıi]z F[ıi]rat", re.I)
+        personal = re.compile(r"[A-Za-z0-9._%+-]+@(gmail|hotmail|outlook|yahoo|icloud)\.", re.I)
         home_orkestra = re.compile(r"~/Projects/orkestra|~/Projects/n8n")
         hits = []
         for path in self.files():
