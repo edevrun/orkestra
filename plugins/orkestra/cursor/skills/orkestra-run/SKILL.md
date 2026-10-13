@@ -1,6 +1,6 @@
 ---
 name: orkestra-run
-description: "Orkestra end-to-end delivery pipeline for software work in the user's projects (~/Projects/*). Autopilot is the default; use manual approval only when the user explicitly wants to decide. Discovery → spec + reviewed plan → TDD implementation → no-regression gates → adversarial review → delivery report and project memory. Use for build, change, fix, refactor, migrate or ship work; not for pure explanations or code reading."
+description: "Orkestra end-to-end local pipeline for work in the user's projects (~/Projects/*). Autopilot is the default; use manual approval only when the user explicitly wants to decide. Every request opens a tracked run the dashboard can follow: delivery (build, change, fix, refactor, migrate, ship) or advisory (explain, Q&A, read-only). Discovery to spec and plan when code changes; a short XS path when the ask is advisory. Hooks block commits, deploys, and secret files unless you ask."
 ---
 [orkestra · Cursor engine] The instructions below were written for Claude Code. In Cursor:
 - A subagent `orkestra:<name>` is the Cursor subagent `orkestra-<name>`: launch it with the Task tool
@@ -46,19 +46,22 @@ User request: (what the user wrote with this command)
 ## Start
 
 1. Run `orkestra context` (add `-p <project>` if you can resolve it). If the cwd is the workspace root, select the project most directly named by the request; if no safe target can be identified, block without writing to any candidate project.
-2. If the output shows an **active run** for this project → this is a continuation: follow `orkestra playbook resume`.
-3. If memory is **NOT INITIALIZED** → run `orkestra playbook onboard` first (once per project, ~3 scout calls).
-4. Start: `orkestra start -p <project> --title "<≤6 words>" --request "<the user's request verbatim>"` (default `--size auto` infers XS/S/M/L).
+2. If the output shows an **active run** for this project → continue that run (do **not** call `orkestra start` again).
+   `orkestra run` and the bridge pre-open a tracked run so the dashboard / Flows panel can follow every ask, including
+   advisory ones. Follow `orkestra playbook resume` when the phase is already past intake; otherwise continue from intake.
+3. If memory is **NOT INITIALIZED** → run `orkestra playbook onboard` first (once per project, ~3 scout calls), then continue the open run (or start one if none exists yet).
+4. If there is **no** active run yet: `orkestra start -p <project> --title "<≤6 words>" --request "<the user's request verbatim>"` (default `--size auto` infers XS/S/M/L).
    Override with `--size XS|S|M|L` only when the inference is wrong. Add `--approval-mode manual` only when the user explicitly wants the decision; otherwise the run is autopilot.
-   **Size discipline:** XS ≈ one-file trivial/typo · S ≈ few clear files / small bugfix · M ≈ a real feature · L ≈ bulk / multi-capability.
-   Prefer XS/S whenever the ask is clear and safe — Orkestra’s full pipeline is for **M/L** (bulk/large) work.
+   **Every request must be a tracked run**: never answer only in chat without `orkestra start` (or a pre-opened run). Pure explanations and code reading are still runs (advisory, usually XS).
+   **Size discipline:** XS ≈ one-file trivial/typo or advisory Q&A · S ≈ few clear files / small bug fix · M ≈ a real feature · L ≈ bulk / multi-capability.
+   Prefer XS/S whenever the ask is clear and safe. Orkestra's full pipeline is for **M/L** (bulk/large) work.
    **XS/S fast track (enforced):** no scouts (S: 0–1 optional), write plan yourself, skip plan-critic, skip per-task review, skip adversary; final reviewer only.
-   Baseline, `plan check`, TDD evidence and `gate verify` remain mandatory as applicable.
-   The run folder is always reachable as **`.orkestra/current/`** (symlink) — use it instead of globs like `features/001-*`.
+   Baseline, `plan check`, TDD evidence and `gate verify` remain mandatory as applicable for delivery work; advisory runs still advance phases with a thin plan and no invented code tasks.
+   The run folder is always reachable as **`.orkestra/current/`** (symlink) - use it instead of globs like `features/001-*`.
 5. Then loop until done:
    **`orkestra playbook` (no argument = the current phase) → do exactly that → `orkestra phase next`**.
    If `phase next` refuses, it prints the unmet preconditions: satisfy them; never work around them.
-   Whenever you are unsure what comes next — after a subagent report, a pause, a new session, a compaction —
+   Whenever you are unsure what comes next (after a subagent report, a pause, a new session, a compaction),
    run **`orkestra next -p <project>`**: it derives the one next step from state, evidence and review files.
 
 ## Agent team (use `subagent_type: "orkestra-<name>"`)

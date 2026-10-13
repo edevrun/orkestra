@@ -1247,7 +1247,8 @@ def cmd_playbook(a: argparse.Namespace) -> int:
 
 def cmd_run(a: argparse.Namespace) -> int:
     """Start a run from the terminal with the engine of your choice (default: claude). Opens that engine's own
-    interactive UI in the project with the request submitted — questions and the plan approval happen there."""
+    interactive UI in the project with the request submitted — questions and the plan approval happen there.
+    Opens the tracked run first (delivery or advisory) so `orkestra dashboard` / bridge flows can follow it."""
     import shlex
     if _ASKER:
         raise OrkestraError("`orkestra run` opens an agent UI: use it from your terminal. Inside an agent session "
@@ -1285,6 +1286,15 @@ def cmd_run(a: argparse.Namespace) -> int:
     if a.print:
         _out(f"cd {shlex.quote(str(project))} && " + " ".join(shlex.quote(x) for x in argv))
         return 0
+    _require_project_config(project)
+    _require_usable_home()
+    st = R.open_run_for_request(project, request, engine=engine, mode="interactive", approval_mode=approval_mode)
+    rid = st["run_id"]
+    _out(i18n.t("cli.run_opened", run=rid, project=project.name, size=st.get("size") or ""))
+    _out(f"artifacts: {paths.feature_dir(project, rid)}  (short path: .orkestra/current/)")
+    _out(i18n.t("cli.run_dashboard_hint"))
+    sys.stdout.flush()
+    sys.stderr.flush()
     os.chdir(str(project))
     env = EN.child_env(engine)
     env.pop("ORKESTRA_HEADLESS", None)              # this is the interactive UI: the user answers in it

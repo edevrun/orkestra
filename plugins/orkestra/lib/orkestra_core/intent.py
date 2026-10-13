@@ -458,6 +458,35 @@ _M_SIZE = _LazyRe(
     r"refactor\b|yeniden\s+yapılandır|dark\s+mode|yeni\s+özellik)\b",
     re.I,
 )
+# Explain / Q&A / read-only asks: still open a tracked run (dashboard), but stay on the XS fast track.
+_ADVISORY = _LazyRe(
+    r"(?:"
+    r"\b(?:explain|describe|summarize|clarify|walk\s+me\s+through|help\s+me\s+understand)\b|"
+    r"\b(?:what|how|why|where|when|which)\b.{0,40}\b(?:does|is|are|do|did|work|mean|happen)\b|"
+    r"\b(?:açıkla|anlat|özetle|nedir|nasıl|neden|niçin|nerede|ne\s+zaman|hangisi)\b|"
+    r"\b(?:ne\s+yapıyor|ne\s+işe\s+yarar|nasıl\s+çalışır|kısaca\s+anlat)\b|"
+    r"\b(?:read[- ]only|no\s+code\s+change|kod\s+değiştirme|sadece\s+oku|yalnız\s+oku)\b"
+    r")",
+    re.I,
+)
+
+
+def is_advisory_request(request: str) -> bool:
+    """True when the ask is explain/Q&A/read-only: track on the dashboard, do not invent a product change."""
+    text = (request or "").strip()
+    if not text:
+        return False
+    if _RISK_FLOOR_M.search(norm_lower(text)) or _L_SIZE.search(norm_lower(text)) or _M_SIZE.search(norm_lower(text)):
+        return False
+    return bool(_ADVISORY.search(text))
+
+
+def title_from_request(request: str, max_words: int = 6) -> str:
+    """Short title for `orkestra start` / pre-opened runs (≤6 words; ASCII-safe via slugify later)."""
+    words = re.findall(r"[^\W_]+(?:['’-][^\W_]+)*", (request or "").strip(), flags=re.UNICODE)
+    if not words:
+        return "request"
+    return " ".join(words[: max(1, int(max_words))])
 
 
 def skips_plan_critic(size: str) -> bool:
@@ -492,6 +521,8 @@ def infer_size(request: str) -> str:
         return "L"
     if _RISK_FLOOR_M.search(low):
         return "M"
+    if is_advisory_request(text) and n < 400:
+        return "XS"
     if _XS_SIZE.search(low) and n < 220:
         return "XS"
     if _M_SIZE.search(low) or n > 480:

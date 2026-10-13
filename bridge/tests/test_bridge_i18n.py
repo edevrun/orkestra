@@ -534,6 +534,13 @@ class TestMessages(Sandbox):
         def close_jobs():
             for existing in B.list_jobs():
                 B.save_job(dict(existing, status="done"))
+            demo = Path(self.cfg["workspace"]) / "demo"
+            from orkestra_core.state import project_active_run
+            if project_active_run(demo):
+                subprocess.run(
+                    [sys.executable, str(B.ORKESTRA_BIN), "abort", "i18n-test-cleanup", "-p", str(demo)],
+                    capture_output=True, text=True, env=os.environ.copy(),
+                )
 
         with mock.patch.object(B, "run_turn", side_effect=run_turn):
             for code in ("en", "tr"):

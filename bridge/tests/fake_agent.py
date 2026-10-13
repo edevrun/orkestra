@@ -106,8 +106,14 @@ def ork(*a):
 
 said = prompt.split("\n\n")[-1].strip()            # the driver may put hook context in front of the user's words
 if "orkestra playbook run" in prompt and "İstek:" in prompt:
-    cp = ork("start", "--title", "fake", "--request", prompt.split("İstek:", 1)[1].strip(), "--size", "S")
-    assert cp.returncode == 0, cp.stderr
+    req = prompt.split("İstek:", 1)[1].strip()
+    cp = ork("start", "--title", "fake", "--request", req, "--size", "S")
+    # A host may already have opened the tracked run (dashboard Flows); bind this session then.
+    already = "already has an open run" in ((cp.stdout or "") + (cp.stderr or ""))
+    assert cp.returncode == 0 or already, cp.stderr
+    if already:
+        cp = ork("resume")
+        assert cp.returncode == 0, cp.stderr
     ork("await", "Varsayılan öncelik ne olsun?")
     result = "1. Varsayılan öncelik ne olsun? (a) medium (Önerilen)"
 elif "orkestra resume" in prompt:

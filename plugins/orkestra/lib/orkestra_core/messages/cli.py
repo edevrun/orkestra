@@ -72,6 +72,8 @@ EN: Dict[str, str] = {
     "cli.ask_yes_default": "Y/n",
     "cli.ask_no_default": "y/N",
     "cli.run_usage": 'usage: orkestra run [--engine claude|cursor|copilot] [-p <project>] "<request>"',
+    "cli.run_opened": "run opened for tracking: {run} in {project} (size {size})",
+    "cli.run_dashboard_hint": "follow live: `orkestra dashboard --open` or the bridge Flows panel",
     "cli.watchdog_launchd_wrote": ("wrote {plist}\nload it with:  launchctl load -w {plist}\n(not needed when the bridge "
                                    "runs: it scans every minute by itself)"),
     # orkestra cursor build
@@ -206,6 +208,8 @@ TR: Dict[str, str] = {
     "cli.ask_yes_default": "E/h",
     "cli.ask_no_default": "e/H",
     "cli.run_usage": 'kullanım: orkestra run [--engine claude|cursor|copilot] [-p <proje>] "<istek>"',
+    "cli.run_opened": "takip için run açıldı: {run} · {project} (boyut {size})",
+    "cli.run_dashboard_hint": "canlı takip: `orkestra dashboard --open` veya bridge Flows paneli",
     "cli.watchdog_launchd_wrote": ("yazıldı: {plist}\nşununla yükle:  launchctl load -w {plist}\n(bridge çalışırken gerekmez: "
                                    "o kendisi dakikada bir tarar)"),
     "cli.cursor_assets_written": "cursor dosyaları: {count} dosya yazıldı: {files}",

@@ -103,6 +103,20 @@ def start_run(project: Path, title: str, request: str, size: str, mode: str, eng
         return _start_run_locked(project, title, request, size, mode, engine, approval_mode)
 
 
+def open_run_for_request(project: Path, request: str, *, engine: str, mode: str,
+                         approval_mode: Optional[str] = None, title: Optional[str] = None,
+                         size: Optional[str] = None) -> Dict[str, Any]:
+    """Open a tracked run for any `orkestra run` / bridge job (delivery or advisory) so the dashboard can follow it."""
+    request = (request or "").strip()
+    if approval_mode not in ("autopilot", "manual"):
+        approval_mode = "manual" if intent.manual_approval_requested(request) else "autopilot"
+    title = (title or intent.title_from_request(request)).strip() or "request"
+    size = size or intent.infer_size(request)
+    if size not in intent.SIZES:
+        raise OrkestraError(f"invalid size {size!r}")
+    return start_run(project, title, request, size, mode, engine, approval_mode)
+
+
 def _start_run_locked(project: Path, title: str, request: str, size: str, mode: str, engine: str,
                       approval_mode: str) -> Dict[str, Any]:
     existing = project_active_run(project)

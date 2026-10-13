@@ -1,9 +1,9 @@
 import unittest
 
 import helpers  # noqa: F401
-from orkestra_core.intent import (approval, git_grants, infer_size, manual_approval_requested,
+from orkestra_core.intent import (approval, git_grants, infer_size, is_advisory_request, manual_approval_requested,
                                   min_context_chars, off_topic_vs_project, skips_adversary, skips_plan_critic,
-                                  approval_answer)
+                                  approval_answer, title_from_request)
 
 GRANT_CASES = {
     "commitle ve pushla": ["commit", "push"],
@@ -183,6 +183,8 @@ SIZE_CASES = {
     "typo düzelt README": "XS",
     "çok basit rename: Foo → Bar": "XS",
     "boyut: XS sadece bunu değiştir": "XS",
+    "explain how the dashboard tracks runs": "XS",
+    "bu gate nasıl çalışır?": "XS",
     "sub fonksiyonu ekle": "S",
     "küçük bugfix: null check": "S",
     "dark mode özelliği ekle": "M",
@@ -208,6 +210,15 @@ class TestInferSize(unittest.TestCase):
         self.assertTrue(skips_adversary("S") and not skips_adversary("L"))
         self.assertEqual(min_context_chars("XS"), 80)
         self.assertEqual(min_context_chars("S"), 200)
+
+    def test_advisory_detection_and_title(self):
+        self.assertTrue(is_advisory_request("explain how orkestra watch works"))
+        self.assertTrue(is_advisory_request("bu dosya ne işe yarar?"))
+        self.assertFalse(is_advisory_request("dark mode özelliği ekle"))
+        self.assertFalse(is_advisory_request("add oauth login"))
+        self.assertEqual(title_from_request("explain how the dashboard tracks open runs please"),
+                         "explain how the dashboard tracks open")
+        self.assertEqual(title_from_request(""), "request")
 
 
 class TestEnglishApproval(unittest.TestCase):

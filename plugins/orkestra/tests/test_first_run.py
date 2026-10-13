@@ -425,6 +425,21 @@ class TestFirstSession(FreshMachine):
         self.assertIn("/orkestra:run", res.out)
         self.assertFalse((project / ".orkestra").exists(), "--print must not touch the project")
 
+    def test_run_opens_a_tracked_run_before_the_engine_ui(self):
+        """Even advisory asks must appear on the dashboard: `orkestra run` opens the run before execve."""
+        project = self.project("shop")
+        self.orc("init", cwd=project, expect=0)
+        # Stub `claude` on PATH is exec'd (exits 0); the tracked run must already exist.
+        res = self.orc("run", "explain how the dashboard tracks runs", cwd=project, expect=0)
+        self.assertIn("run opened for tracking", res.out)
+        runs = list((project / ".orkestra" / "runs").glob("*/state.json"))
+        self.assertEqual(len(runs), 1, runs)
+        st = json.loads(runs[0].read_text(encoding="utf-8"))
+        self.assertEqual(st["status"], "active")
+        self.assertEqual(st["phase"], "intake")
+        self.assertIn("explain", st["title"].lower())
+        self.assertEqual(st.get("size"), "XS")
+
     def test_playbooks_are_readable_before_any_run(self):
         project = self.project("shop")
         self.assertIn("orkestra", self.orc("playbook", "run", cwd=project, expect=0).out.lower())
