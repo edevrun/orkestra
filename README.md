@@ -2,8 +2,8 @@
 
 English · [Türkçe](README.tr.md)
 
-**A local, hook-enforced delivery pipeline for AI coding agents: the same phases, evidence and safety guards on
-Claude Code, Cursor and GitHub Copilot.**
+**You describe a change. Orkestra walks an AI coding agent through the same local steps every time, and blocks
+unsafe actions unless you ask. It runs on Claude Code, Cursor, and GitHub Copilot.**
 
 Version 1.6.0 · [changelog](CHANGELOG.md) · [MIT License](LICENSE) · Python 3.9+ standard library only ·
 macOS, Linux and Windows
@@ -15,6 +15,21 @@ macOS, Linux and Windows
 [Tests and CI](#tests-and-ci) · [Docs](#documentation)
 
 ## What it is
+
+**Purpose.** Orkestra is a local pipeline for a development request. It learns the project, asks only the questions
+that would change the result, writes a spec and a plan, implements with tests, checks that existing behavior still
+passes, and writes a delivery report.
+
+**How you use it.** Clone this repository, run setup once, then start a run from your agent chat or from a terminal
+inside the project. The exact commands are in [Quickstart](#quickstart). After that, `orkestra watch` shows the run
+and `orkestra next` names the single next step.
+
+**Legal.** The code is [MIT License](LICENSE). Copyright 2026 Orkestra contributors. Orkestra is not a product of
+Anthropic, Anysphere, or GitHub, and Claude Code, Cursor, and GitHub Copilot are their owners' products. It is not a
+sandbox and not a hosted service: the agent runs as you, on your files, and you remain responsible for what it does.
+The license gives no warranty. Report a vulnerability in private through
+[GitHub Security Advisories](https://github.com/soft-ai-solutions/orkestra/security/advisories/new), as
+[SECURITY.md](SECURITY.md) describes. Third-party code is listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 Orkestra takes a development request through a repeatable path: discovery, a reviewed plan, TDD implementation,
 no-regression gates, independent review and a delivery report. Autopilot is the default: it resolves ordinary

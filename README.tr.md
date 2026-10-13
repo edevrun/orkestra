@@ -2,8 +2,8 @@
 
 [English](README.md) · Türkçe
 
-**Yapay zekâ kodlama ajanları için yerel, hook'larla zorlanan bir teslimat hattı: Claude Code, Cursor ve GitHub
-Copilot üzerinde aynı fazlar, aynı kanıt, aynı güvenlik guard'ları.**
+**Bir değişikliği anlatırsın. Orkestra, yapay zekâ kodlama ajanını her seferinde aynı yerel adımlardan geçirir ve
+sen istemedikçe güvensiz işleri durdurur. Claude Code, Cursor ve GitHub Copilot üzerinde çalışır.**
 
 Sürüm 1.6.0 · [değişiklik günlüğü](CHANGELOG.md) · [MIT Lisansı](LICENSE) · Python 3.9+ yalnız standart kütüphane ·
 macOS, Linux ve Windows
@@ -15,6 +15,21 @@ macOS, Linux ve Windows
 [Test ve CI](#test-ve-ci) · [Belgeler](#belgeler)
 
 ## Nedir
+
+**Amaç.** Orkestra, bir geliştirme isteği için yerel bir hattır. Projeyi öğrenir, yalnız sonucu değiştirecek soruları
+sorar, bir spec ve bir plan yazar, testlerle uygular, eski davranışın durduğunu kontrol eder ve bir teslim raporu yazar.
+
+**Nasıl kullanılır.** Bu depoyu klonla, kurulumu bir kez çalıştır, sonra run'ı ajan sohbetinden ya da projenin
+içindeki bir terminalden başlat. Komutların tamamı [Hızlı başlangıç](#hızlı-başlangıç) bölümündedir. Sonra
+`orkestra watch` run'ı gösterir, `orkestra next` sıradaki tek adımı yazar.
+
+**Hukuk.** Kod [MIT Lisansı](LICENSE) altındadır. Telif 2026 Orkestra contributors. Orkestra; Anthropic, Anysphere
+veya GitHub'ın ürünü değildir. Claude Code, Cursor ve GitHub Copilot kendi sahiplerinin ürünleridir. Bu bir kum
+havuzu ya da barındırılan bir servis değildir: ajan sen olarak, senin dosyalarında çalışır ve yapılan işten sen
+sorumlusun. Lisans garanti vermez. Bir açığı özel olarak
+[GitHub Security Advisories](https://github.com/soft-ai-solutions/orkestra/security/advisories/new) üzerinden bildir.
+Ayrıntı [SECURITY.md](SECURITY.md) içindedir. Üçüncü taraf kod [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+listesindedir.
 
 Orkestra bir geliştirme isteğini tekrarlanabilir bir yoldan geçirir: keşif, incelenmiş bir plan, TDD ile uygulama,
 regresyon kapıları, bağımsız review ve teslim raporu. Varsayılan autopilot'tur: olağan belirsizlikleri istekten ve

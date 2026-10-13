@@ -212,9 +212,9 @@ class TestPublicRepository(unittest.TestCase):
         for needle in ("*.p8", "*.pem", "*.mobileprovision", "credentials.json", ".secrets/",
                        "CLAUDE.local.md", "*.key", ".env.*"):
             self.assertIn(needle, ignore)
-        # Only the canonical GitHub clone path may mention firatkocabay; other personal
-        # branding and private home paths remain forbidden.
-        allowed_clone = re.compile(r"github\.com/firatkocabay/orkestra", re.I)
+        # The public clone path is the soft-ai-solutions org. Personal account names and private
+        # home paths remain forbidden everywhere else.
+        allowed_clone = re.compile(r"github\.com/soft-ai-solutions/orkestra", re.I)
         personal = re.compile(r"firatkocabay|yaln[ıi]z F[ıi]rat", re.I)
         home_orkestra = re.compile(r"~/Projects/orkestra|~/Projects/n8n")
         hits = []
