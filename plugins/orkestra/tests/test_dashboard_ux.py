@@ -148,6 +148,28 @@ class TestAttention(MonitorBase):
     def stall(self, key="working", cls=0, since=None):
         return {"cls": cls, "key": key, "since": since, "text": key, "loops": []}
 
+    def test_turn_ended_copy_depends_on_the_approval_mode(self):
+        st = {"run_id": "r1", "status": "active", "phase": "implement", "engine": "claude", "tasks": {}}
+        proj = Path("/w/demo")
+        for lg, auto_head, auto_what, man_head in (
+                ("en", "Chat is idle", "write \"continue\" in the chat", "Waiting for your reply"),
+                ("tr", "Sohbet bekliyor", "sohbete \"devam\" yazman", "Yanıtını bekliyor")):
+            with lang(lg):
+                auto = MON._attention(dict(st, approval_mode="autopilot"), {"level": "wait"},
+                                      self.stall("turn_ended", 1, 420), [], proj, [], NOW, NOW, 0)
+                manual = MON._attention(dict(st, approval_mode="manual"), {"level": "wait"},
+                                        self.stall("turn_ended", 1, 420), [], proj, [], NOW, NOW, 0)
+                legacy = MON._attention(dict(st), {"level": "wait"},
+                                        self.stall("turn_ended", 1, 420), [], proj, [], NOW, NOW, 0)   # no approval_mode: old copy
+            self.assertEqual(auto["code"], "turn_ended")
+            self.assertEqual(auto["head"], auto_head)
+            self.assertIn(auto_what, auto["what"])
+            self.assertNotIn("\u2014", auto["head"] + auto["what"])
+            self.assertNotRegex((auto["head"] + auto["what"]).lower(), r"approv|onay")
+            self.assertEqual(legacy["head"], man_head)       # only a state that says autopilot gets the autopilot copy
+            self.assertEqual(manual["head"], man_head)
+            self.assertNotIn(auto_what, manual["what"])
+
     def test_the_other_codes_of_the_table(self):
         st = {"run_id": "r1", "status": "active", "phase": "implement", "engine": "claude", "tasks": {}}
         proj = Path("/w/demo")
@@ -498,8 +520,10 @@ class TestPageStyle(PageCase):
         """A lone card in .grid used to grow with `1fr` to ~1560px; keep a reading-width column cap."""
         css = self.css()
         self.assertIn("minmax(min(100%,420px),520px)", css)
-        self.assertIn("minmax(min(100%,420px),560px)", css)
         self.assertNotRegex(css, r"\.grid\{[^}]*minmax\([^)]+,1fr\)")
+        self.assertRegex(css, r"\.list\{[^}]*grid-template-columns:minmax\(0,1fr\);max-width:960px")
+        self.assertRegex(css, r"@media\(min-width:601px\)\{[^}]*\.compact\{[^}]*grid-template-columns:auto minmax\(0,1fr\) auto")
+        self.assertNotRegex(css, r"\.compact\{[^}]*max-width:560px")
         self.assertIn("max-height:min(40vh,280px)", css)
 
     def test_the_page_stays_self_contained_and_never_builds_markup_from_text(self):

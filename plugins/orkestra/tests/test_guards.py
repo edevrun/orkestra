@@ -275,6 +275,31 @@ class TestRunGuards(unittest.TestCase):
         self.assertTrue(decide(bash("cp a.ts /w/other/a.ts"), b).denied)
         self.assertFalse(decide(write("/tmp/x.txt"), b).denied)
 
+    def test_isolation_into_another_project_tells_the_driver_how_to_switch(self):
+        import tempfile
+        # not under the system temp dir: that is exempt from isolation
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as td:
+            other = Path(td).resolve() / "other"
+            (other / ".orkestra").mkdir(parents=True)
+            target = str(other / "src" / "a.ts")
+            b = binding(phase="implement")
+            driver = decide(write(target), b).reason
+            self.assertIn("orkestra pause -p /w/proj", driver)
+            self.assertIn(f"orkestra start -p {other}", driver)
+            self.assertIn("do not ask them", driver)
+            sub = decide(write(target, agent="orkestra:implementer"), b).reason.split("unblock:")[0]
+            self.assertIn("STATUS: BLOCKED", sub)
+            self.assertNotIn("orkestra pause", sub)
+            self.assertFalse(decide(write(target), binding(phase="implement", project=str(other))).denied)
+            # a monorepo root that encloses the bound project is not "another project"
+            parent = Path(td).resolve()
+            (parent / ".orkestra").mkdir(exist_ok=True)
+            enclosing = decide(write(str(parent / "README.md")), binding(phase="implement", project=str(other))).reason
+            self.assertNotIn("another project", enclosing)
+        hosts = decide(write("/etc/hosts"), b)
+        self.assertTrue(hosts.denied)
+        self.assertNotIn("another project", hosts.reason)
+
     def test_roles(self):
         b = binding(phase="implement")
         self.assertTrue(decide(write("/w/proj/src/a.ts", agent="orkestra:reviewer"), b).denied)

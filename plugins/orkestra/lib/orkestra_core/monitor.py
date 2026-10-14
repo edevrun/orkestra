@@ -747,6 +747,9 @@ def _attention(st: Dict[str, Any], live: Dict[str, Any], stall: Dict[str, Any], 
         if headless:       # the process exited with its turn: nobody can type a reply anywhere
             head_key = "monitor.attn_turn_ended_head_headless"
             what = i18n.t("monitor.attn_turn_ended_what_headless", ago=_hago(since))
+        elif st.get("approval_mode") == "autopilot":   # nothing to approve: any short chat message resumes it
+            head_key = "monitor.attn_turn_ended_head_auto"
+            what = i18n.t("monitor.attn_turn_ended_what_auto", engine=engine_name, ago=_hago(since))
         else:
             what = i18n.t("monitor.attn_turn_ended_what", engine=engine_name, ago=_hago(since))
     elif cls == 3 or long_wait or (eff == "stale" and cmd and cmd_age is not None and cmd_age > 0 and cls != 2):
@@ -1343,11 +1346,11 @@ main{padding:8px max(16px,env(safe-area-inset-left)) 24px max(16px,env(safe-area
 main:focus{outline:none}
 .sec{margin:12px 0}.sec:first-child{margin-top:4px}
 h2{font-size:15px;margin:0 0 6px;display:flex;gap:8px;align-items:baseline}h2 small{font-weight:500;color:var(--ink2);font-size:13px}
-/* Cap column max (~520/560px): with `1fr` a lone card stretched across the whole main (up to 1560px). */
+/* Cap column max (~520px): with `1fr` a lone card stretched across the whole main (up to 1560px). */
 .grid{display:grid;gap:12px;justify-content:start;align-items:start;
 grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),520px))}
-.list{display:grid;gap:8px;justify-content:start;align-items:start;
-grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),560px))}
+/* Finished/paused rows: one row per run, a single column. */
+.list{display:grid;gap:8px;align-items:start;grid-template-columns:minmax(0,1fr);max-width:960px}
 .card{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--edge,var(--line));
 border-radius:12px;padding:10px 14px 6px;min-width:0;width:100%;max-width:100%;box-sizing:border-box}
 .many .card{content-visibility:auto;contain-intrinsic-size:auto 220px}
@@ -1427,6 +1430,10 @@ box-sizing:border-box}
 .compact .nm{font-weight:600;min-width:0}.compact .nm span{font-weight:400;color:var(--ink2)}
 .compact .sub{grid-column:1/-1;font-size:12px;color:var(--ink2)}
 .compact .age{grid-column:1/-1;white-space:normal;text-align:left;min-width:0;margin-left:0}
+@media(min-width:601px){
+.compact{grid-template-columns:auto minmax(0,1fr) auto}
+.compact .age{grid-column:3;grid-row:1;white-space:nowrap;text-align:right}
+.compact .sub{grid-column:2/-1;grid-row:2}}
 .compact[hidden]{display:none}
 .item .card{margin-top:6px}.item .card[hidden]{display:none}
 .more{display:block;margin:8px 0 0;font:inherit;font-size:13px;color:var(--focus);background:none;border:0;

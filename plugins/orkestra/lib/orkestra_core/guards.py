@@ -26,7 +26,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from . import shellparse as sp
 from .gates import normalize_pkg
 from .lazy import LazyModule
-from .paths import is_headless, orkestra_home
+from .paths import find_project_root, is_headless, orkestra_home
 from .util import is_relative_to, resolve_path
 
 # The CLI's own parser (argparse: ~15 ms to import and build). A hook reaches it only for the few `orkestra ...` lines
@@ -1466,6 +1466,25 @@ def _script_writes_run_state(raw: str) -> bool:
     return bool(SCRIPT_STRICT_RE.search(re.sub(r"&?>&?\s*(?:/dev/null\b|\d\b)", " ", raw)))
 
 
+def _switch_project_hint(event: Dict[str, Any], project: Path, run_id: str, path: str) -> str:
+    """Isolation refusal that lands in ANOTHER project: say how this chat moves there, so it never answers "ask the user
+    to stop the run in a terminal". The driver may pause its own run (ownership_guard lets it); a subagent reports."""
+    try:
+        other = find_project_root(path)
+    except Exception:
+        other = None
+    other_dir = Path(str(other)).resolve(strict=False) if other is not None else None
+    if other_dir is None or is_relative_to(other_dir, project) or is_relative_to(project, other_dir):
+        return ""
+    if event.get("agent_type") or event.get("agent_id"):
+        return (f"\nThe target belongs to project {other}, not to run {run_id}: end with STATUS: BLOCKED and say so; "
+                f"only the orchestrator chat may switch projects.")
+    return (f"\nThe target belongs to another project ({other}). This chat is the driver of run {run_id}, so when the "
+            f"user's request is about {Path(str(other)).name}, do not ask them to stop it in a terminal: run "
+            f"`orkestra pause -p {project}` yourself (reversible with `orkestra resume -p {project}`), then continue with "
+            f"`orkestra start -p {other} ...`.")
+
+
 def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any], segs: List[sp.Segment]) -> Decision:
     st = binding.get("state") or {}
     if st.get("status") not in ("active", "awaiting_user", "blocked", "paused"):
@@ -1502,7 +1521,8 @@ def run_guard(event: Dict[str, Any], cfg: Dict[str, Any], binding: Dict[str, Any
         if kind == "outside":
             if guards.get("isolation", True):
                 return deny("isolation", f"Write outside the run's project is blocked (project isolation). "
-                                         f"Project: {project} · attempted ({via}): {path}")
+                                         f"Project: {project} · attempted ({via}): {path}"
+                                         f"{_switch_project_hint(event, project, run_id, path)}")
             return ALLOW
         if kind == "source" and phase in PRE_APPROVAL_PHASES and guards.get("phase", True):
             return deny("phase", f"Source changes are blocked in phase '{phase}': the plan is not approved yet. "
