@@ -164,6 +164,42 @@ def _unreadable_view(project: Path, st: Dict[str, Any], mtime: float, exc: BaseE
     }
 
 
+def _driving_engine(project: Path, run_id: str, stored: str) -> str:
+    """Who drives the run now. `stored` is who started it (`claude` when the CLI did not see Cursor).
+
+    A Cursor CLI or IDE chat binds afterwards (`sessions/cursor-*.json`, `engine: cursor`). The card must name
+    that driver. A session file that names no engine leaves the stored value alone."""
+    stored = stored or "claude"
+    d = paths.sessions_dir()
+    if not d.is_dir():
+        return stored
+    newest_hb, newest_engine = -1.0, ""
+    found = False
+    for f in d.glob("*.json"):
+        data = read_json(f)
+        if not isinstance(data, dict) or data.get("run_id") != run_id:
+            continue
+        if Path(str(data.get("project") or "")) != Path(project):
+            continue
+        try:
+            hb = f.stat().st_mtime
+        except OSError:
+            continue
+        sid = f.stem
+        if sid.startswith("cursor-"):
+            identified = "cursor"
+        elif sid.startswith("copilot-"):
+            identified = "copilot"
+        else:
+            eng = str(data.get("engine") or "")
+            identified = eng if eng in ("claude", "cursor", "copilot") else ""
+        if hb >= newest_hb:
+            found, newest_hb, newest_engine = True, hb, identified
+    if not found:
+        return stored
+    return newest_engine or stored
+
+
 def _sessions_for(project: Path, run_id: str) -> List[Dict[str, Any]]:
     out = []
     d = paths.sessions_dir()
@@ -938,6 +974,9 @@ def _clean_rows(rows: List[Any], now: float) -> List[Dict[str, Any]]:
 
 def collect(project: Path, st: Dict[str, Any], mtime: float = 0.0, n_activity: int = 14) -> Dict[str, Any]:
     rid = st["run_id"]
+    engine = _driving_engine(project, rid, str(st.get("engine") or ""))
+    if engine and engine != (st.get("engine") or ""):
+        st = dict(st, engine=engine)          # do not rewrite the run file; the card names the live driver
     now = time.time()
     rdir = paths.run_dir(project, rid)
     rows = _clean_rows(A.read_rows(project, rid), now)
@@ -1346,9 +1385,13 @@ main{padding:8px max(16px,env(safe-area-inset-left)) 24px max(16px,env(safe-area
 main:focus{outline:none}
 .sec{margin:12px 0}.sec:first-child{margin-top:4px}
 h2{font-size:15px;margin:0 0 6px;display:flex;gap:8px;align-items:baseline}h2 small{font-weight:500;color:var(--ink2);font-size:13px}
-/* Cap column max (~520px): with `1fr` a lone card stretched across the whole main (up to 1560px). */
-.grid{display:grid;gap:12px;justify-content:start;align-items:start;
-grid-template-columns:repeat(auto-fill,minmax(min(100%,420px),520px))}
+/* Three open runs share one row. A definite 520px track max only fitted two columns
+   inside the 1560px main (3*520 + gaps overflow), so the third card wrapped under the
+   first. Tracks are counted from a minimum that fits three on a desktop width; each
+   card stays capped so one run does not stretch across the page. */
+.grid{display:grid;gap:12px;justify-content:start;justify-items:start;align-items:start;
+grid-template-columns:repeat(auto-fit,minmax(min(100%,320px),1fr))}
+.grid>.card{width:100%;max-width:520px}
 /* Finished/paused rows: one row per run, a single column. */
 .list{display:grid;gap:8px;align-items:start;grid-template-columns:minmax(0,1fr);max-width:960px}
 .card{background:var(--surface);border:1px solid var(--line);border-left:4px solid var(--edge,var(--line));

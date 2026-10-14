@@ -230,6 +230,20 @@ class TestViewJson(MonitorBase):
             self.assertEqual(v["home"], os.path.expanduser("~"))
         self.assertEqual(len({v["key"] for v in views}), len(views))
 
+    def test_a_cursor_driver_is_shown_even_when_the_run_was_recorded_as_claude(self):
+        """Cursor CLI binds after start. The stored origin stays claude; the card must say cursor."""
+        proj = self.make_run("shop", "run-cursor", engine="claude")
+        d = self.home / "sessions"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "cursor-11111111-2222-4333-8444-555555555555.json").write_text(json.dumps({
+            "project": str(proj), "run_id": "run-cursor", "engine": "cursor", "bound_at": self.iso(time.time()),
+        }), encoding="utf-8")
+        with lang("tr"):
+            v = {x["run_id"]: x for x in self.views()}["run-cursor"]
+        self.assertEqual(v["engine"], "cursor")
+        raw = (proj / ".orkestra" / "runs" / "run-cursor" / "state.json").read_text(encoding="utf-8")
+        self.assertIn('"engine": "claude"', raw)
+
     def test_the_key_is_the_project_path_and_the_run_not_the_folder_name(self):
         self.make_run("shop", "r-same")
         other = self.ws / "clients" / "shop"
@@ -517,10 +531,12 @@ class TestPageStyle(PageCase):
         self.assertIn('aria-live="polite"', page)
 
     def test_open_cards_do_not_stretch_across_the_whole_main(self):
-        """A lone card in .grid used to grow with `1fr` to ~1560px; keep a reading-width column cap."""
+        """Three open runs fit in three columns. A lone card stays at reading width (520px),
+        not stretched across the 1560px main. A definite 520px track max only fitted two."""
         css = self.css()
-        self.assertIn("minmax(min(100%,420px),520px)", css)
-        self.assertNotRegex(css, r"\.grid\{[^}]*minmax\([^)]+,1fr\)")
+        self.assertIn("repeat(auto-fit,minmax(min(100%,320px),1fr))", css)
+        self.assertIn(".grid>.card{width:100%;max-width:520px}", css)
+        self.assertNotIn("minmax(min(100%,420px),520px)", css)
         self.assertRegex(css, r"\.list\{[^}]*grid-template-columns:minmax\(0,1fr\);max-width:960px")
         self.assertRegex(css, r"@media\(min-width:601px\)\{[^}]*\.compact\{[^}]*grid-template-columns:auto minmax\(0,1fr\) auto")
         self.assertNotRegex(css, r"\.compact\{[^}]*max-width:560px")

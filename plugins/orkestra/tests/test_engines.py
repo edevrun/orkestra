@@ -497,9 +497,8 @@ class TestCursorSubagents(CursorBase):
         self.launch()
         tp = self.transcript(OTHER, "README'yi güncelle lütfen")
         readme = {"file_path": str(self.proj / "README.md")}
-        # while the launch still waits for its conversation, a chat that fits no launch is held to the waiting role
-        # (it might be that subagent with a first message we cannot match) — for this event only, nothing is kept
-        self.assertTrue(self.no(self.tool("Write", readme, conv=OTHER, gen="x1", transcript_path=tp)))
+        # a chat whose own message fits no launch is not a waiting subagent, even while the launch is open
+        self.assertEqual(self.tool("Write", readme, conv=OTHER, gen="x1", transcript_path=tp), {"permission": "allow"})
         self.assertFalse((self.home / "sessions" / "children" / f"{OTHER}.json").exists())
         # the real subagent finds its launch…
         tp2 = self.transcript(CHILD, self.PROMPT)

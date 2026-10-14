@@ -624,18 +624,18 @@ def cursor_launch(project: Path, run_id: str, session: str, launch_id: str, agen
 
 
 def cursor_claim(project: Path, run_id: str, conversation_id: str, first_text: str = "",
-                 now: Optional[float] = None, max_age: float = 3600.0, unmatched_age: float = 120.0) -> Optional[Dict[str, Any]]:
+                 now: Optional[float] = None, max_age: float = 3600.0, unmatched_age: float = 120.0,
+                 hold_unmatched: bool = False) -> Optional[Dict[str, Any]]:
     """Match an unknown conversation to a recorded launch. Returns the launch (marked as claimed), a dict with
     {"ambiguous": True, …} when it has to be treated as a subagent although which one cannot be told, or None.
 
     A subagent's first message is the Task prompt: the launch whose prompt the conversation starts with is taken and
-    written down. While a launch is still waiting for its conversation (nobody claimed it and its parent has not
-    moved on — a foreground Task blocks the parent), a conversation that cannot be identified is treated for THIS
-    event with the waiting launch's role — the most restrictive one when several kinds wait — and asked again on the
-    next event: always when it has no readable transcript (a subagent's first batch of calls), and for the first two
-    minutes of a launch also when its first message fits no launch (should the prompt ever be wrapped differently).
-    Nothing is written down for it: a subagent is not unguarded because it could not be identified, and an
-    unrelated chat never stays bound as somebody's subagent."""
+    written down. A conversation that already has its own words and matches no launch is a different chat. It is not
+    given a waiting launch's role: that hold blocked ordinary work in every other Cursor chat while one run had a
+    subagent open. The only silent case that borrows a role for THIS event is a conversation with no words yet
+    (a subagent's first tool calls arrive before its transcript exists). Nothing is written down for that case.
+    `hold_unmatched` keeps the short hold only for a conversation Cursor already named as a child of the driver
+    whose first message still does not match. A user chat never sets it."""
     try:
         path = _agents_path(project, run_id)
         if not path.exists():
@@ -656,6 +656,9 @@ def cursor_claim(project: Path, run_id: str, conversation_id: str, first_text: s
                 pick = next((x for x in open_ if (x.get("prompt") or "") and text.startswith(x["prompt"])), None) or \
                     next((x for x in open_ if len(x.get("prompt") or "") >= 80 and x["prompt"] in text), None)
             if pick is None:
+                # Own words that match nothing: this is not an unidentified subagent.
+                if text and not hold_unmatched:
+                    return None
                 waiting = [x for x in open_ if not x.get("closed")
                            and (not text or now - float(x.get("at") or 0) <= unmatched_age)]
                 if not waiting:

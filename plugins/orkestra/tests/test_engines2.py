@@ -115,15 +115,50 @@ class TestWhoIsThisConversation(Sub):
         self.assertEqual(json.loads(self.child_file(CHILD).read_text())["agent_type"], "orkestra:reviewer")
         self.assertEqual(json.loads(self.child_file(OTHER).read_text())["agent_type"], "orkestra:implementer")
 
-    def test_a_chat_whose_first_message_fits_no_launch_is_only_held_briefly(self):
+    def test_a_chat_with_its_own_message_is_not_held_while_a_launch_waits(self):
         self.to_implement()
         self.launch()
         tp = self.transcript(OTHER, "README'yi güncelle lütfen")
         readme = {"file_path": str(self.proj / "README.md")}
-        self.assertTrue(self.no(self.tool("Write", readme, conv=OTHER, gen="x1", transcript_path=tp)))
+        self.assertEqual(self.tool("Write", readme, conv=OTHER, gen="x1", transcript_path=tp), {"permission": "allow"})
+        self.assertFalse(self.child_file(OTHER).exists())
         self.age_launches(300)                      # a subagent that never showed up; its parent has not moved on
         self.assertEqual(self.tool("Write", readme, conv=OTHER, gen="x1", transcript_path=tp), {"permission": "allow"})
         self.assertTrue(self.no(self.tool("Write", readme, conv=CHILD, gen=CHILD)))  # no transcript at all: still held
+
+    def test_a_user_chat_works_while_another_runs_subagent_is_open(self):
+        """The other Cursor chat does ordinary work, and may even start its own run, without becoming a seat."""
+        self.to_implement()
+        self.launch()
+        other = self.make_project("puzzleo")
+        note = other / "note.txt"
+        note.write_text("x\n")
+        roots = [str(self.ws), str(self.proj), str(other)]
+        prompt = "puzzleo not dosyasina bir satir ekle"
+        self.assertEqual(self.say(prompt, conv=OTHER, gen="u1", workspace_roots=roots), {"continue": True})
+        out = self.tool("Write", {"file_path": str(note), "contents": "y\n"}, conv=OTHER, gen="u1",
+                        workspace_roots=roots)
+        self.assertEqual(out, {"permission": "allow"}, out)
+        self.assertFalse(self.child_file(OTHER).exists())
+        start = self.shell('orkestra start -p puzzleo --title "not" --request "bir satir ekle" --size S',
+                           conv=OTHER, gen="u1", workspace_roots=roots)
+        self.assertEqual(start, {"permission": "allow"}, start)
+        denied = self.tool("Write", {"file_path": str(self.proj / "calc.py")}, conv=CHILD, gen=CHILD,
+                           workspace_roots=roots)
+        self.assertTrue(self.no(denied), denied)
+        self.assertIn("read-only", denied["user_message"])
+
+    def test_a_declared_child_whose_message_fits_no_launch_is_held_briefly(self):
+        self.to_implement()
+        self.launch()
+        tp = self.transcript(CHILD, "bu metin gorev promptu degil")
+        src = {"file_path": str(self.proj / "calc.py")}
+        out = self.tool("Write", src, conv=CHILD, gen=CHILD, transcript_path=tp, parent_conversation_id=CONV)
+        self.assertTrue(self.no(out), out)
+        self.assertFalse(self.child_file(CHILD).exists())
+        self.age_launches(300)
+        self.assertEqual(self.tool("Write", src, conv=CHILD, gen=CHILD, transcript_path=tp,
+                                   parent_conversation_id=CONV), {"permission": "allow"})
 
     def test_a_short_prompt_never_binds_a_chat_that_merely_contains_it(self):
         self.to_implement()

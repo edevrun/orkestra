@@ -116,8 +116,21 @@ def _drop(path: Path) -> None:
 
 
 def _side(kind: str, key: str) -> Path:
-    """Per-conversation notes of this adapter: ~/.orkestra/cursor/<kind>/<id>.json (turns, notes, cwd, seen)."""
+    """Per-conversation notes of this adapter: ~/.orkestra/cursor/<kind>/<id>.json (turns, notes, cwd, seen, prompt)."""
     return _home() / "cursor" / kind / f"{_safe(key)}.json"
+
+
+def _remember_prompt(conv: str, prompt: str) -> None:
+    """The user's own message, kept so the next tool call can tell this chat from a subagent before the transcript
+    file exists. A subagent's first calls have no such message."""
+    text = (prompt or "").strip()
+    if conv and text:
+        _write(_side("prompt", conv), {"text": text[:8000], "ts": time.time()})
+
+
+def _remembered_prompt(conv: str) -> str:
+    data = _read(_side("prompt", conv))
+    return str(data.get("text") or "").strip() if isinstance(data, dict) else ""
 
 
 def _prune_side(days: int = 7) -> None:
@@ -286,6 +299,7 @@ def _light(name: str, ev: dict):
     if set(given) - {"resume"} or ("resume" in given and "orkestra" in str(ev.get("prompt") or "").lower()):
         return None
     _turn_begin(sid, str(ev.get("generation_id") or ""))
+    _remember_prompt(conv, str(ev.get("prompt") or ""))
     _drop(_home() / "grants" / f"{_safe(sid)}.json")            # an older prompt's permission ends with a new prompt
     _drop(_side("notes", sid))
     return {"continue": True}
@@ -467,6 +481,7 @@ def _claim_child(conv: str, ev: dict):
     Isolation (hard): never bind a chat to project B because project A has a waiting launch.
     Prefer the parent conversation's bound run; with multiple open runs only accept a unique
     prompt match — never an ambiguous/blind claim across projects.
+    A chat that already has its own user message is never a waiting subagent of some other run.
     """
     if not conv:
         return None
@@ -489,6 +504,12 @@ def _claim_child(conv: str, ev: dict):
         return None
     tpath = _transcript(conv, ev, runs)
     first = _first_message(tpath) if tpath else ""
+    if not first:
+        first = _remembered_prompt(conv)
+    # Only a conversation Cursor named as this driver's child may borrow a waiting role when its
+    # words do not match. Every other chat, including one that shares the multi-root workspace,
+    # keeps its own work.
+    hold_unmatched = bool(parent_b and parent_status in ("active", "awaiting_user", "blocked"))
     definitive = []
     blind = None
     for project, rid, sid in runs:
@@ -496,7 +517,7 @@ def _claim_child(conv: str, ev: dict):
         bare = sid[len(PREFIX):] if sid.startswith(PREFIX) else sid
         if conv == bare:
             continue
-        hit = L.activity.cursor_claim(project, rid, conv, first)
+        hit = L.activity.cursor_claim(project, rid, conv, first, hold_unmatched=hold_unmatched)
         if not hit:
             continue
         if hit.get("ambiguous"):    # role for THIS event only; asked again on the next one
@@ -704,6 +725,7 @@ def on_session_start(ev: dict) -> dict:
 
 def on_before_submit_prompt(ev: dict) -> dict:
     conv = _conv(ev)
+    _remember_prompt(conv, str(ev.get("prompt") or ""))
     driver = bool(ev.get("_driver"))
     if not conv or L.ST.child_binding(conv):
         return {"continue": True}
@@ -891,6 +913,7 @@ def on_session_end(ev: dict) -> dict:
         return {}
     _drop(_side("cwd", conv))
     _drop(_side("seen", conv))
+    _drop(_side("prompt", conv))
     if (_home() / "sessions" / "children" / f"{_safe(conv)}.json").exists():
         return {}
     sid = session_key(conv)
