@@ -225,7 +225,8 @@ class TestViewJson(MonitorBase):
         with lang("en"):
             v = {x["run_id"]: x for x in self.views()}["r-hung"]
         self.assertEqual(v["tasks_by_status"], {"done": 1, "in_progress": 1, "blocked": 0, "pending": 0, "deferred": 0})
-        self.assertEqual([t["tests"] for t in v["tasks"]], ["red_green", "none"])
+        self.assertEqual([t["tests"] for t in v["tasks"]], ["passed", "none"])
+        self.assertTrue(v["tasks_show_tests"])
         self.assertEqual([t["evidence"] for t in v["tasks"]], ["RG", "--"])      # the cryptic code stays for old consumers
         self.assertEqual(v["gates_struct"]["baseline"], {"state": "pass", "ok": 2, "total": 2})
         verify = v["gates_struct"]["verify"]
@@ -725,10 +726,25 @@ class TestCard(PageCase):
         self.assertEqual(r["line"], "4/7 done \u00b7 1 in progress \u00b7 1 blocked \u00b7 1 to do")
         self.assertEqual(r["before"], 0)                                                  # nothing is rendered inline as chips
         self.assertEqual(r["heads"], [["ID", "col"], ["Task", "col"], ["Status", "col"], ["Tests", "col"]])
-        self.assertEqual(r["rows"][0], "T001Task 1\u2713 donered and green")
-        self.assertEqual(r["rows"][4], "T005Task 5\u25d0 in progressred only")
-        self.assertEqual(r["rows"][5], "T006Task 6\u25a0 blockednone yet")
+        self.assertEqual(r["rows"][0], "T001Task 1\u2713 Completed\u2713 All tests passed")
+        self.assertEqual(r["rows"][4], "T005Task 5\u25d0 In progress\u25d0 Awaiting green")
+        self.assertEqual(r["rows"][5], "T006Task 6\u25a0 Blocked\u25cb Not run yet")
         self.assertEqual(r["caption"], "tasks")
+
+    def test_tests_column_hidden_when_every_task_skips_tdd(self):
+        tasks = [{"id": "T001", "status": "done", "title": "Docs only", "tests": "na", "tdd": "n/a", "evidence": "--"},
+                 {"id": "T002", "status": "done", "title": "Ship", "tests": "na", "tdd": "n/a", "evidence": "--"}]
+        v = view(1, "running", "working", tasks=tasks, tasks_total=2, tasks_done=2, tasks_show_tests=False,
+                 tasks_by_status={"done": 2, "in_progress": 0, "blocked": 0, "pending": 0, "deferred": 0})
+        out = self.run_page([v], [ev("const m=H.byId('main');"
+                                     "H.find(m,n=>n.dataset&&n.dataset.act==='tasks')[0].fire('click');"
+                                     "const t=H.find(m,n=>n.tag==='table')[0];"
+                                     "return {heads:H.find(t,n=>n.tag==='th').map(h=>h.textContent),"
+                                     "cls:t.className,cells:H.find(t,n=>n.tag==='tr')[1].children.length}", "r")])
+        r = out["results"]["r"]
+        self.assertEqual(r["heads"], ["ID", "Task", "Status"])
+        self.assertIn("no-tests", r["cls"])
+        self.assertEqual(r["cells"], 3)
 
     def test_health_chips_flag_the_regression_with_a_glyph_and_the_notices_are_deduped(self):
         v = view(1, "running", "working", gates={"baseline": "6/6 passed", "verify": "5/6 passed \u2717 regression: i18n-parity"},

@@ -941,12 +941,25 @@ def collect(project: Path, st: Dict[str, Any], mtime: float = 0.0, n_activity: i
     tasks = st.get("tasks") or {}
     tlist = []
     by_status = {"done": 0, "in_progress": 0, "blocked": 0, "pending": 0, "deferred": 0}
+    show_tests = False
     for tid in sorted(tasks):
         t = tasks[tid]
         red, green = bool((t.get("red") or {}).get("ok")), bool((t.get("green") or {}).get("ok"))
-        tlist.append({"id": tid, "status": t.get("status"), "title": t.get("title") or "", "tdd": t.get("tdd"),
+        tdd = t.get("tdd") or "required"
+        needs_tests = tdd != "n/a"
+        if needs_tests or red or green:
+            show_tests = True
+        if red and green:
+            tests = "passed"
+        elif red:
+            tests = "awaiting_green"
+        elif not needs_tests:
+            tests = "na"  # column hidden when every task is n/a; blank cell if mixed
+        else:
+            tests = "none"
+        tlist.append({"id": tid, "status": t.get("status"), "title": t.get("title") or "", "tdd": tdd,
                       "agent": t.get("agent") or "", "evidence": ("R" if red else "-") + ("G" if green else "-"),
-                      "tests": "red_green" if red and green else "red" if red else "none"})
+                      "tests": tests})
         by_status[t.get("status") if t.get("status") in by_status else "pending"] += 1
     done = sum(1 for t in tlist if t["status"] in ("done", "deferred"))
     hist = st.get("history") or []
@@ -998,6 +1011,7 @@ def collect(project: Path, st: Dict[str, Any], mtime: float = 0.0, n_activity: i
                    "task_avg": int(tm["task_avg"]) if tm.get("task_avg") else None, "reopens": tm["reopens"],
                    "tasks_reopened": tm["tasks_reopened"]},
         "tasks": tlist, "tasks_done": done, "tasks_total": len(tlist),
+        "tasks_show_tests": show_tests,
         "current_tasks": [t for t in tlist if t["status"] == "in_progress"],
         "gates": _gate_summary(rdir), "activity": feed, "ledger": ledger,
         "sessions": [{"session": s["session"], "bound_at": s["bound_at"]} for s in sessions], "usage": usage,
@@ -1237,7 +1251,9 @@ UI_KEYS = (
     "monitor.ui_t_progress", "monitor.ui_t_blocked", "monitor.ui_t_todo", "monitor.ui_t_all", "monitor.ui_t_hide",
     "monitor.ui_t_col_id", "monitor.ui_t_col_task", "monitor.ui_t_col_status", "monitor.ui_t_col_tests",
     "monitor.ui_ts_done", "monitor.ui_ts_in_progress", "monitor.ui_ts_blocked", "monitor.ui_ts_pending",
-    "monitor.ui_ts_deferred", "monitor.ui_tests_red_green", "monitor.ui_tests_red", "monitor.ui_tests_none",
+    "monitor.ui_ts_deferred",
+    "monitor.ui_tests_passed", "monitor.ui_tests_awaiting_green",
+    "monitor.ui_tests_none", "monitor.ui_tests_red_green", "monitor.ui_tests_red",
     "monitor.ui_gate_baseline", "monitor.ui_gate_verify",
     "monitor.ui_act", "monitor.ui_act_last", "monitor.ui_act_none", "monitor.ui_act_more", "monitor.ui_act_less",
     "monitor.ui_act_reads", "monitor.ui_act_times", "monitor.ui_act_blocked",
@@ -1367,6 +1383,15 @@ ol.steps li.sk{border-style:dashed}
 .ttable{overflow-x:auto;margin:4px 0}table.tt{border-collapse:collapse;width:100%;font-size:12px}
 .tt th{text-align:left;color:var(--ink2);font-weight:600;border-bottom:1px solid var(--line);padding:3px 6px}
 .tt td{padding:3px 6px;border-top:1px solid var(--line);vertical-align:top}.tt td.id{font-family:var(--mono);white-space:nowrap}.tt td:nth-child(3),.tt td:nth-child(4){white-space:nowrap}
+.tt td.st .g,.tt td.tests .g{display:inline-block;min-width:1em;margin-right:.3em;font-weight:700}
+.tt td.st-done .g,.tt td.tests-passed .g{color:var(--run-fg)}
+.tt td.st-in_progress .g,.tt td.tests-awaiting_green .g{color:var(--run-edge)}
+.tt td.st-blocked .g{color:var(--stall-fg)}
+.tt td.st-pending .g,.tt td.tests-none .g{color:var(--ctl)}
+.tt td.st-deferred .g{color:var(--ink2)}
+.tt td.tests-passed{color:var(--run-fg);font-weight:600}
+.tt td.tests-na{color:var(--ink2)}
+.tt.no-tests td:nth-child(3){white-space:nowrap}
 .chips{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}.chips:empty{display:none}
 .gchip{font-size:12px;border:1px solid var(--line);border-radius:6px;padding:1px 8px;color:var(--ink)}
 .gchip.bad{border-color:var(--stall-edge);color:var(--stall-fg);font-weight:700}
@@ -1466,6 +1491,9 @@ const GROUPS=["you","stalled","running","paused","done"];
 const GLYPH={you:"\u25c6",stalled:"\u2717",running:"\u25cf",paused:"\u2161",done:"\u2713"};
 const FAMILY={quiet:"\u25cb",blocked:"\u25a0",recorded:"\u25cf"};
 const TSG={done:"\u2713",in_progress:"\u25d0",blocked:"\u25a0",pending:"\u25cb",deferred:"\u2013"};
+const TG={passed:"\u2713",awaiting_green:"\u25d0",none:"\u25cb"};
+const TMAP={red_green:"passed",red:"awaiting_green",passed:"passed",awaiting_green:"awaiting_green",
+ none:"none",na:"na",not_required:"na"};
 const MAX_ROWS=4,PHONE_ROWS=3,FULL_CAP=24,MANY=30,FIN_SHOW=5,CMD_RESTART="orkestra dashboard --open";
 const LANG=document.documentElement.lang||"en";
 const BASE_TITLE=document.title;
@@ -1712,7 +1740,20 @@ function taskCounts(v){
  const c=v.tasks_by_status;if(c)return c;
  const o={done:0,in_progress:0,blocked:0,pending:0,deferred:0};
  (v.tasks||[]).forEach(t=>{o[t.status in o?t.status:"pending"]++;});return o;}
-function testsOf(t){return t.tests||(t.evidence==="RG"?"red_green":t.evidence&&t.evidence.charAt(0)==="R"?"red":"none");}
+function testsOf(t){return t.tests||(t.evidence==="RG"?"passed":t.evidence&&t.evidence.charAt(0)==="R"?"awaiting_green":
+ t.tdd==="n/a"?"na":"none");}
+function testsKey(t){return TMAP[testsOf(t)]||"none";}
+function showTestsCol(v){
+ if(typeof v.tasks_show_tests==="boolean")return v.tasks_show_tests;
+ return (v.tasks||[]).some(t=>testsKey(t)!=="na"||(t.tdd||"required")!=="n/a");}
+function cellStatus(t){
+ const s=t.status||"pending",td=el("td","st st-"+s),g=el("span","g",TSG[s]||"");
+ td.append(g,document.createTextNode(" "+(L["ui_ts_"+s]||s)));return td;}
+function cellTests(t){
+ const k=testsKey(t),td=el("td","tests tests-"+k);
+ if(k==="na")return td;
+ const g=el("span","g",TG[k]||"");
+ td.append(g,document.createTextNode(" "+(L["ui_tests_"+k]||k)));return td;}
 function patchTasks(st,v,a){
  const r=st.r,total=v.tasks_total|0,box=st.parts.tasks;
  show(box,total>0);if(!total)return;
@@ -1728,16 +1769,21 @@ function patchTasks(st,v,a){
  const open=!!openOf(st.key).tasks;
  setText(r.tlTog,open?L.ui_t_hide:fmt(L.ui_t_all,{n:total}));setAttr(r.tlTog,"aria-expanded",open?"true":"false");
  show(r.tlBox,open);
- if(open){const sig=JSON.stringify((v.tasks||[]).map(t=>[t.id,t.status,t.title,testsOf(t)]));
+ if(open){const withT=showTestsCol(v);
+  const sig=JSON.stringify([(v.tasks||[]).map(t=>[t.id,t.status,t.title,testsOf(t),t.tdd||""]),withT]);
   if(st.tsig!==sig){st.tsig=sig;buildTable(st,v);}}}
 function buildTable(st,v){
- const box=st.r.tlBox,tb=el("table","tt"),cap=el("caption","vh",L.ui_tasks),hd=el("thead"),hr=el("tr"),body=el("tbody");
- [L.ui_t_col_id,L.ui_t_col_task,L.ui_t_col_status,L.ui_t_col_tests].forEach(h=>{const th=el("th","",h);th.setAttribute("scope","col");hr.append(th);});
+ const box=st.r.tlBox,withT=showTestsCol(v),tb=el("table","tt"+(withT?"":" no-tests")),
+  cap=el("caption","vh",L.ui_tasks),hd=el("thead"),hr=el("tr"),body=el("tbody");
+ const heads=withT?[L.ui_t_col_id,L.ui_t_col_task,L.ui_t_col_status,L.ui_t_col_tests]
+  :[L.ui_t_col_id,L.ui_t_col_task,L.ui_t_col_status];
+ heads.forEach(h=>{const th=el("th","",h);th.setAttribute("scope","col");hr.append(th);});
  hd.append(hr);
  (v.tasks||[]).forEach(t=>{const tr=el("tr");
   const tt=el("td","",t.title);tt.dir="auto";
-  tr.append(el("td","id",t.id),tt,el("td","",(TSG[t.status]||"")+" "+(L["ui_ts_"+t.status]||t.status)),
-   el("td","",L["ui_tests_"+testsOf(t)]));body.append(tr);});
+  tr.append(el("td","id",t.id),tt,cellStatus(t));
+  if(withT)tr.append(cellTests(t));
+  body.append(tr);});
  tb.append(cap,hd,body);box.replaceChildren(tb);}
 
 function patchHealth(st,v,a){
