@@ -494,6 +494,14 @@ class TestPageStyle(PageCase):
         self.assertIn('<main id="main"', page)
         self.assertIn('aria-live="polite"', page)
 
+    def test_open_cards_do_not_stretch_across_the_whole_main(self):
+        """A lone card in .grid used to grow with `1fr` to ~1560px; keep a reading-width column cap."""
+        css = self.css()
+        self.assertIn("minmax(min(100%,420px),520px)", css)
+        self.assertIn("minmax(min(100%,420px),560px)", css)
+        self.assertNotRegex(css, r"\.grid\{[^}]*minmax\([^)]+,1fr\)")
+        self.assertIn("max-height:min(40vh,280px)", css)
+
     def test_the_page_stays_self_contained_and_never_builds_markup_from_text(self):
         page = self.page("en")
         script = re.findall(r"<script>(.*?)</script>", page, re.S)[-1]
