@@ -23,6 +23,7 @@ from .messages import protocol as P
 from .state import (OPEN_STATUSES, PHASES, OrkestraError, StateTxn, active_runs, bind_marker, ledger, load_state,
                     new_state, next_run_id, project_active_run, save_state, set_active_run, unbind_marker)
 from .state import TERMINAL_STATUSES
+from .workkind import classify, deliverable_file_problems, kind_of
 from .util import (file_lock, now_iso, read_json, read_text, sha256_bytes, tail_lines, write_json_atomic,
                    write_text_atomic)
 
@@ -51,8 +52,42 @@ def _run_shell_or_list(cmd: str, *, cwd: str, timeout: int, env: dict, argv: Opt
     return G._run_tree(cmd, cwd=cwd, env=env, timeout=timeout)
 
 
+# A project .gitignore that already names the directory, in any of these shapes, is enough.
+_ORKESTRA_IGNORE_LINES = {".orkestra/", ".orkestra", "*.orkestra", "**/.orkestra/", "**/.orkestra/**"}
+
+
+def ensure_project_gitignore(project: Path) -> bool:
+    """If the project already has a `.gitignore` and `.orkestra/` is not ignored, append that one line.
+
+    Does not create a `.gitignore`. `*.orkestra` would also hide a source file whose name ends in
+    `.orkestra`, so the line we add is the directory itself. Returns True when the file changed.
+    """
+    gi = Path(project) / ".gitignore"
+    if not gi.is_file():
+        return False
+    try:
+        text = gi.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    covered = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or line.startswith("!"):
+            continue
+        if line in _ORKESTRA_IGNORE_LINES:
+            covered = True
+            break
+    if covered:
+        return False
+    suffix = "" if text.endswith("\n") or text == "" else "\n"
+    addition = suffix + "# orkestra: local run state stays out of the repository\n.orkestra/\n"
+    write_text_atomic(gi, text + addition)
+    return True
+
+
 def init_project(project: Path) -> List[str]:
     created: List[str] = []
+    ensure_project_gitignore(project)
     ok = paths.okdir(project)
     for d in (paths.memory_dir(project) / "specs", paths.features_dir(project), paths.runs_dir(project)):
         if not d.exists():
@@ -131,7 +166,7 @@ def _start_run_locked(project: Path, title: str, request: str, size: str, mode: 
     (fdir / "tasks").mkdir(parents=True, exist_ok=True)
     (fdir / "reviews").mkdir(parents=True, exist_ok=True)
     rdir.mkdir(parents=True, exist_ok=True)
-    st = new_state(project, run_id, title, size, mode, engine, approval_mode)
+    st = new_state(project, run_id, title, size, mode, engine, approval_mode, work_kind=classify(request))
     base = S.take_baseline(project, rdir)
     st["baseline"] = {"git": base["git"], "head": base.get("head"), "at": base["at"],
                       "dirty_files": len(base.get("files") or {})}
@@ -294,7 +329,7 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
         if spec.strip() and not PP.spec_ids(spec):
             problems.append("spec.md defines no FR-###/SC-### ids")
     elif target == "approve":
-        problems += PP.check_plan(spec, plan, project)
+        problems += PP.check_plan(spec, plan, project, work_kind=kind_of(st), run_id=rid)
         if not intent.skips_plan_critic(st.get("size") or ""):
             critic = read_text(fdir / "reviews" / "plan-critic.md")
             v = PP.verdict(critic)
@@ -316,7 +351,7 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
                     problems.append("spec/plan changed after plan review; rerun plan-critic before autopilot approval")
         elif appr.get("hash") != spec_plan_hash(project, rid):
             problems.append("spec/plan changed after approval — rerun plan-critic and record a current approval")
-        problems += PP.check_plan(spec, plan, project)
+        problems += PP.check_plan(spec, plan, project, work_kind=kind_of(st), run_id=rid)
         # the baseline may run in the background during discover/clarify/plan (source cannot change before approval:
         # the phase guard), but it must be complete before the first edit
         if not (rdir / "gates-baseline.json").exists():
@@ -335,6 +370,8 @@ def preconditions(project: Path, st: Dict[str, Any], target: str) -> List[str]:
                 problems.append(f"{tid}: done without green test evidence (`orkestra tdd green {tid} -- <cmd>`)")
             if t.get("status") == "deferred" and not t.get("deferred_reason"):
                 problems.append(f"{tid}: deferred without a reason")
+        if kind_of(st) in ("writing", "general"):
+            problems += deliverable_file_problems(fdir / "deliverable.md")
     elif target == "review":
         changed = S.changed_files(project, rdir)            # ONE scan serves the newest-change check and the integrity check
         last = read_json(rdir / "gates-verify.json")

@@ -109,7 +109,8 @@ class StateTxn:
 
 
 def new_state(project: Path, run_id: str, title: str, size: str, mode: str, engine: str = "claude",
-              approval_mode: str = "autopilot") -> Dict[str, Any]:
+              approval_mode: str = "autopilot", work_kind: str = "software") -> Dict[str, Any]:
+    from .workkind import kind_of  # not at import time: a quiet hook loads state and must stay light
     return {
         "schema": SCHEMA,
         "run_id": run_id,
@@ -120,6 +121,7 @@ def new_state(project: Path, run_id: str, title: str, size: str, mode: str, engi
         "phase": "intake",
         "status": "active",
         "size": size,
+        "work_kind": kind_of({"work_kind": work_kind}),
         "mode": mode,
         "approval_mode": approval_mode,
         "engine": engine,               # which agent started it; any engine may resume it

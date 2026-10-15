@@ -173,6 +173,13 @@ class TestParallelWave(unittest.TestCase):
         with mock.patch.object(G.os, "cpu_count", return_value=1):
             self.assertEqual(G.effective_parallel(4), 1)
 
+    def test_a_unittest_command_without_kind_is_a_test_gate(self):
+        self.assertTrue(G._concurrent({"cmd": "python3 -m unittest discover -s plugins/orkestra/tests -q"}))
+        self.assertTrue(G._concurrent({"cmd": "pytest -q"}))
+        self.assertFalse(G._concurrent({"cmd": "true"}))
+        self.assertFalse(G._concurrent({"cmd": "python3 -m unittest discover -s x -q", "exclusive": True}))
+        self.assertFalse(G._concurrent({"cmd": "python3 -m unittest discover -s x -q", "parallel": False}))
+
     def test_three_gates_overlap_and_keep_config_order(self):
         gates = [{"name": n, "cmd": "sleep 1", "kind": "test"} for n in ("a", "b", "c")]
         with mock.patch.object(G.os, "cpu_count", return_value=16):

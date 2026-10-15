@@ -348,6 +348,12 @@ class TestParallelTasks(TempoBase):
         super().setUp()
         self.to_implement()
 
+    def test_the_next_step_names_a_disjoint_task(self):
+        text = self.nxt()
+        self.assertIn("T001", text)
+        self.assertIn("Also start T002", text)
+        self.assertNotIn("T003", text)
+
     def test_overlapping_tasks_cannot_run_together(self):
         self.cli("task", "start", "T001", "-p", "demo")
         cp = self.cli("task", "start", "T003", "-p", "demo", check=False)       # both touch calc.py

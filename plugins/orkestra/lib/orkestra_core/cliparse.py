@@ -15,7 +15,7 @@ from typing import Any, List, Optional, Tuple
 from . import __version__, i18n
 
 RUNS_A_COMMAND = ("tdd", "evidence")
-SUB_ACTION = ("task", "gate", "phase", "memory", "report", "agents", "cursor", "copilot")  # key = "<cmd>:<action>"
+SUB_ACTION = ("task", "gate", "phase", "memory", "report", "agents", "cursor", "copilot", "mcp")  # key = "<cmd>:<action>"
 SUB_CHECK = ("plan", "trace", "deps", "review", "integrity")                   # key = "<cmd>:check"
 GLOBAL_VALUE_OPTS = ("-p", "--project", "--run", "--lang")      # global options that take a value: hoisted to the front
 GLOBAL_EQ_PREFIXES = ("--project=", "--run=", "--lang=")
@@ -322,6 +322,12 @@ def build_parser(parser_class: Any = LocalizedParser, *, localize: bool = True) 
     s = sp_("copilot")
     s.add_argument("action", choices=["install", "uninstall", "status"])
     s.add_argument("--dry-run", action="store_true", help=h("help.opt.dry_run"))
+    s = sp_("mcp")
+    s.add_argument("action", choices=["install", "status"])
+    s.add_argument("--engine", choices=["claude", "cursor", "copilot", "all"], default="all",
+                   help=h("help.opt.mcp_engine"))
+    s.add_argument("--only", action="append", choices=["context7", "playwright", "serena"],
+                   help=h("help.opt.mcp_only"))
     s = sp_("setup")
     s.add_argument("--yes", "-y", action="store_true", help=h("help.opt.setup_yes"))
     sp_("doctor")

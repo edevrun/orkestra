@@ -53,6 +53,8 @@ TOOL_NAMES = {
 AGENT_ROLES = ("scout", "researcher", "architect", "plan-critic", "implementer", "reviewer", "adversary", "verifier")
 RESUME_COMMAND = re.compile(r"^\s*/orkestra(?::|-)resume\b", re.I)
 RUN_MARKER = re.compile(r"(?m)^\[orkestra:(?:bind|unbind)\] project=(.+?) run=(\S+)(?: home=.+?)?\s*$")
+ONE_CHAT = ("[orkestra] Stay in this chat. Do not open another chat or subagent. "
+            "Do this role here with the shell and the orkestra CLI.")
 
 
 def _copilot_session_id(value: Any) -> str:
@@ -144,28 +146,14 @@ def _active_role(session_id: str) -> Optional[str]:
 
 def _start_subagent(event: Dict[str, Any]) -> Dict[str, Any]:
     session_id = _copilot_session_id(event.get("session_id") or event.get("sessionId"))
-    role = _canonical_agent(event.get("agent_name") or event.get("agentName") or event.get("agent_display_name"))
     cwd = str(event.get("cwd") or os.getcwd())
     project = paths.find_project_root(cwd)
     if not session_id or not project:
         return {}
-    run_id = ST.project_active_run(project)
-    if not run_id:
+    if not ST.project_active_run(project):
         return {}
-
-    _change_role(session_id, role, 1)
-    own_binding = ST.session_binding(session_id)
-    if own_binding and Path(own_binding["project"]) == project and own_binding["run_id"] == run_id:
-        parent_session = session_id
-    else:
-        sessions = ST.run_sessions(project, run_id)
-        parent_session = sessions[0]["id"] if len(sessions) == 1 else ""
-    if parent_session:
-        ST.bind_child(session_id, parent_session, project, run_id, role)
-        return {}
-
-    return {"additionalContext": "[orkestra] This subagent could not be safely bound to one active run session. "
-            "Do not edit project files or run commands; return findings to the orchestrator."}
+    # An open run stays in the one chat that started it. A new chat is not a worker.
+    return {"permissionDecision": "deny", "permissionDecisionReason": ONE_CHAT}
 
 
 def _finish_subagent(event: Dict[str, Any]) -> None:
@@ -332,6 +320,18 @@ def _copilot_output(event_name: str, output: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _mention_one_chat(event_name: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Session and prompt events remind the model to stay in this chat. Other events are unchanged."""
+    if event_name not in ("SessionStart", "UserPromptSubmit"):
+        return payload
+    out = dict(payload)
+    prev = str(out.get("additionalContext") or "")
+    if ONE_CHAT in prev:
+        return out
+    out["additionalContext"] = (prev + "\n" + ONE_CHAT).strip() if prev else ONE_CHAT
+    return out
+
+
 def handle_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
     if event_name in ("SubagentStart", "subagentStart"):
         return _start_subagent(event)
@@ -347,6 +347,10 @@ def handle_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
             str(normalized.get("prompt") or "")
         )
         resume_context = _bind_explicit_resume(normalized) if is_explicit_resume else None
+        if event_name == "PreToolUse" and normalized.get("tool_name") in ("Agent", "Task"):
+            root = paths.find_project_root(str(normalized.get("cwd") or os.getcwd()))
+            if root and ST.project_active_run(root):
+                return {"permissionDecision": "deny", "permissionDecisionReason": ONE_CHAT}
         if event_name == "PreToolUse" and normalized.get("agent_type") and not ST.session_binding(normalized["session_id"]):
             return {"permissionDecision": "deny", "permissionDecisionReason":
                     "[orkestra:roles] Copilot subagent has no active run binding; tool call blocked."}
@@ -356,7 +360,8 @@ def handle_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
             dispatch.run_with_hook_deadline(lambda: handler(normalized))
         raw = captured.getvalue().strip()
         if not raw:
-            return {"additionalContext": resume_context} if resume_context else {}
+            base = {"additionalContext": resume_context} if resume_context else {}
+            return _mention_one_chat(event_name, base)
         raw_output = json.loads(raw)
         if not isinstance(raw_output, dict):
             raise ValueError("Orkestra hook returned a non-object")
@@ -368,7 +373,7 @@ def handle_event(event_name: str, event: Dict[str, Any]) -> Dict[str, Any]:
             )
         if event_name == "SubagentStop" and translated.get("decision") == "block":
             finish_subagent = False
-        return translated
+        return _mention_one_chat(event_name, translated)
     except dispatch._Deadline as exc:
         dispatch.log("DEADLINE (" + exc.kind + ") in Copilot " + event_name)
         if event_name == "PreToolUse":     # a hook that times out lets the call through unchecked: refuse it

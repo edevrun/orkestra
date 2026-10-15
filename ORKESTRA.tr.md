@@ -268,7 +268,7 @@ yan yana çalışır (en çok CPU sayısının yarısı).
 | `watchdog.agent_silent_seconds` | `150` | Yaşam belirtisi vermeyen kayıtlı alt-ajan bu süreden sonra kayıp sayılır. |
 | `watchdog.autostart` | `true` | SessionStart hızlı izleyiciyi başlatabilir. |
 | `watchdog.daemon_idle_minutes` | `30` | Ayrık izleyici açık run ve canlı oturum yokken bu kadar sonra çıkar. |
-| `gates_parallel` | `1` | Eşzamanlı typecheck, lint ve test kapıları (projenin `config.json` değeri öncelikli). |
+| `gates_parallel` | `2` | Eşzamanlı typecheck, lint ve test kapıları (projenin `config.json` değeri öncelikli). |
 | `gates_rerun_failed_baseline` | `false` | `true`: `gate verify` baseline'da düşen ya da zaman aşımına uğrayan kapıları yeniden çalıştırır. |
 | `headless.max_budget_usd` | `0` | 0'ın üstünde, başsız turlar için harcama tavanı. |
 | `bridge.turn_timeout_seconds` | `7200` | Bir bridge turunun duvar saati bütçesi. |

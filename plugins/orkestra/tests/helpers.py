@@ -194,7 +194,8 @@ class Sandbox(unittest.TestCase):
         agent_env = ("CLAUDECODE", "CURSOR_AGENT", "CURSOR_CONVERSATION_ID", "ORKESTRA_CURSOR_HOME", "ORKESTRA_SHIM_DIR",
                      "ORKESTRA_CURSOR_BIN", "ORKESTRA_CLAUDE_BIN", "CLAUDE_CONFIG_DIR")
         self._env_backup = {k: os.environ.get(k) for k in ("ORKESTRA_HOME", "ORKESTRA_WORKSPACE", "ORKESTRA_PROJECT",
-                                                           "ORKESTRA_HEADLESS") + agent_env}
+                                                           "ORKESTRA_HEADLESS", "ORKESTRA_PARALLEL_CLI") + agent_env}
+        os.environ["ORKESTRA_PARALLEL_CLI"] = "0"          # unit tests must not spawn a real engine CLI
         os.environ["ORKESTRA_HOME"] = str(self.home)
         os.environ["ORKESTRA_WORKSPACE"] = str(self.ws)
         os.environ.pop("ORKESTRA_PROJECT", None)

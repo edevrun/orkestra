@@ -86,9 +86,13 @@ class TestEngineUnits(unittest.TestCase):
                 "approval_mode": "autopilot", "max_autopilot_continues": 7}
         spec = EN.headless_command("copilot", "/bin/copilot", "copilot-S1", "do it", True, opts)
         self.assertEqual(spec["argv"], ["/bin/copilot", "-p", "--output-format", "json", "--allow-all-tools",
+                                        "--excluded-tools", EN.COPILOT_EXCLUDED_TOOLS,
                                         "--autopilot", "--no-ask-user", "--model", "gpt-6-luna",
                                         "--reasoning-effort", "max", "--max-autopilot-continues", "7",
                                         "--plugin-dir", "/plugins/orkestra", "--session-id", "S1", "do it"])
+        self.assertNotIn("task", spec["argv"][-1])
+        for name in ("task", "list_agents", "read_agent", "write_agent"):
+            self.assertIn(name, EN.COPILOT_EXCLUDED_TOOLS)
         self.assertIsNone(spec["stdin"])
         manual = EN.headless_command("copilot", "/bin/copilot", "copilot-S1", "p", False,
                                      dict(opts, approval_mode="manual"))["argv"]
@@ -101,8 +105,11 @@ class TestEngineUnits(unittest.TestCase):
             "model": "gpt-6-luna", "reasoning_effort": "max", "plugin_dir": "/plugins/orkestra",
             "approval_mode": "autopilot",
         })
-        self.assertEqual(argv, ["/bin/copilot", "-i", "start", "--allow-all-tools", "--autopilot", "--no-ask-user",
+        self.assertEqual(argv, ["/bin/copilot", "-i", "start", "--allow-all-tools",
+                                "--excluded-tools", EN.COPILOT_EXCLUDED_TOOLS,
+                                "--autopilot", "--no-ask-user",
                                 "--model", "gpt-6-luna", "--reasoning-effort", "max", "--plugin-dir", "/plugins/orkestra"])
+        self.assertNotIn("--fleet", argv)
 
     def test_prompts(self):
         self.assertEqual(EN.run_prompt("claude", "x yap"), "/orkestra:run x yap")
@@ -111,6 +118,10 @@ class TestEngineUnits(unittest.TestCase):
         self.assertEqual(EN.resume_prompt("claude", "demo"), "/orkestra:resume demo")
         self.assertEqual(EN.resume_prompt("claude"), "/orkestra:resume")
         self.assertIn("orkestra resume -p demo", EN.resume_prompt("cursor", "demo"))
+        copilot = EN.run_prompt("copilot", "x yap")
+        self.assertIn("Do not open another chat", copilot)
+        self.assertIn("orkestra playbook run", copilot)
+        self.assertTrue(copilot.endswith("İstek: x yap") or copilot.endswith("Request: x yap"))
 
     def test_text_is_renamed_only_for_cursor(self):
         src = 'use subagent_type "orkestra:reviewer", then /orkestra:resume — AskUserQuestion once'
@@ -127,6 +138,11 @@ class TestEngineUnits(unittest.TestCase):
         self.assertTrue(doc.startswith(EN.NOTES_MARK))
         self.assertNotIn(EN.ASK_FOOTNOTE, doc)                  # the header already says it
         self.assertEqual(EN.with_notes(src, "claude"), src)
+        copilot_doc = EN.with_notes(src, "copilot")
+        self.assertTrue(copilot_doc.startswith(EN.COPILOT_MARK))
+        self.assertIn("Do not open another chat", copilot_doc)
+        self.assertIn(src, copilot_doc)
+        self.assertNotIn("--fleet", copilot_doc)
 
     def test_subagent_names(self):
         self.assertEqual(EN.agent_type_from_cursor("orkestra-plan-critic"), "orkestra:plan-critic")

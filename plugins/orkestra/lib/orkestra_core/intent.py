@@ -507,7 +507,9 @@ def min_context_chars(size: str) -> int:
 def infer_size(request: str) -> str:
     """Pick XS/S/M/L from the user's request text. Prefer smaller when clearly safe; floor at M on risk.
 
-    Explicit `--size` / `boyut: S` in the text wins. Unclear feature work stays M (full pipeline).
+    Explicit `--size` / `boyut: S` in the text wins. A feature or a risk stays M/L.
+    A long small-fix note, and writing or general work without those signals, stays on the fast track.
+    Unclear text still stays M.
     """
     text = (request or "").strip()
     if not text:
@@ -525,9 +527,15 @@ def infer_size(request: str) -> str:
         return "XS"
     if _XS_SIZE.search(low) and n < 220:
         return "XS"
-    if _M_SIZE.search(low) or n > 480:
+    if _M_SIZE.search(low):
         return "M"
-    if _S_SIZE.search(low) or n < 140:
+    if _S_SIZE.search(low):
+        return "S"
+    # An article or other non-code job does not need scouts, a plan critic, or an adversary.
+    from .workkind import classify
+    if classify(text) in ("writing", "general"):
+        return "S"
+    if n < 140:
         return "S"
     return "M"
 

@@ -135,27 +135,27 @@ class TestCopilotHookAdapter(FlowBase):
         self.assertIn("additionalContext", out)
         self.assertIn("open orkestra run", out["additionalContext"])
 
-    def test_subagent_start_binds_role_and_enforces_readonly_guard(self):
+    def test_subagent_start_stays_in_the_one_chat(self):
         self.start()
         self.advance_to_approve()
         self.approve()
         self.phase_next()
         child_id = "copilot-child-scout"
-        copilot_hook.handle_event("subagentStart", {
+        out = copilot_hook.handle_event("subagentStart", {
             "hook_event_name": "subagentStart", "sessionId": child_id,
             "cwd": str(self.proj), "agentName": "Orkestra Scout",
         })
-        child = ST.child_binding(child_id)
-        self.assertIsNotNone(child)
-        self.assertEqual(child["agent_type"], "orkestra:scout")
-        out = copilot_hook.handle_event("PreToolUse", {
-            "hook_event_name": "PreToolUse", "session_id": child_id, "cwd": str(self.proj),
-            "tool_name": "Edit", "tool_input": {"file_path": str(self.proj / "calc.py")},
-        })
         self.assertEqual(out.get("permissionDecision"), "deny")
-        self.assertIn("[orkestra:roles]", out.get("permissionDecisionReason", ""))
+        self.assertIn("this chat", out.get("permissionDecisionReason", ""))
+        self.assertIsNone(ST.child_binding(child_id))
+        task = copilot_hook.handle_event("PreToolUse", {
+            "hook_event_name": "PreToolUse", "session_id": self.sid, "cwd": str(self.proj),
+            "tool_name": "task", "tool_input": {"prompt": "open a scout"},
+        })
+        self.assertEqual(task.get("permissionDecision"), "deny")
+        self.assertIn("this chat", task.get("permissionDecisionReason", ""))
 
-    def test_subagent_stop_cleans_child_binding(self):
+    def test_subagent_stop_of_a_refused_chat_stays_empty(self):
         self.start()
         self.advance_to_approve()
         self.approve()
@@ -172,19 +172,13 @@ class TestCopilotHookAdapter(FlowBase):
         self.assertIsNone(ST.child_binding(child_id))
         self.assertIsNone(copilot_hook._active_role(child_id))
 
-    def test_parallel_roles_in_one_session_cannot_write(self):
+    def test_session_start_says_to_stay_in_this_chat(self):
         self.start()
-        self.advance_to_approve()
-        self.approve()
-        self.phase_next()
-        for name in ("Orkestra Scout", "Orkestra Implementer"):
-            copilot_hook.handle_event("subagentStart", {
-                "hook_event_name": "subagentStart", "sessionId": self.sid,
-                "cwd": str(self.proj), "agentName": name,
-            })
-        out = self.copilot("PreToolUse", tool_name="Edit",
-                           tool_input={"file_path": str(self.proj / "calc.py")})
-        self.assertEqual(out.get("permissionDecision"), "deny")
+        out = copilot_hook.handle_event("SessionStart", {
+            "hook_event_name": "SessionStart", "session_id": self.sid,
+            "cwd": str(self.proj), "source": "new",
+        })
+        self.assertIn("this chat", out.get("additionalContext", ""))
 
     def test_stop_block_is_preserved_for_copilot(self):
         self.start()

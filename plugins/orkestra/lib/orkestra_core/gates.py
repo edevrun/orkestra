@@ -398,10 +398,20 @@ def effective_parallel(requested: Any) -> int:
     return max(1, min(n, (os.cpu_count() or 2) // 2))
 
 
+_TEST_CMD = re.compile(
+    r"(?:^|[\s;&|])(?:python3?(?:\s+-m)?\s+)?(?:unittest|pytest)\b"
+    r"|(?:^|[\s;&|])(?:go|cargo)\s+test\b"
+    r"|(?:^|[\s;&|])(?:npm|pnpm|yarn)\s+(?:run\s+)?test\b"
+)
+
+
 def _concurrent(g: Dict[str, Any]) -> bool:
     if g.get("exclusive") or g.get("parallel") is False:
         return False
-    return bool(g.get("parallel")) or g.get("kind") in _CONCURRENT_KINDS
+    if g.get("parallel") or g.get("kind") in _CONCURRENT_KINDS:
+        return True
+    # A hand-written unittest/pytest gate has no kind. It still belongs in the test wave.
+    return _TEST_CMD.search(str(g.get("cmd") or "")) is not None
 
 
 def run_all(project: Path, gates: List[Dict[str, Any]], log_dir: Path, label: str,
@@ -450,6 +460,13 @@ def run_all(project: Path, gates: List[Dict[str, Any]], log_dir: Path, label: st
                         emit(futs[fut], fut.result())
                 except BaseException:
                     abort.set()             # the running gates kill their own process groups; queued ones never start
+                    for fut, i in futs.items():
+                        if i in done or fut.cancelled():
+                            continue
+                        try:
+                            emit(i, fut.result(timeout=5))  # keep a sibling that finished or finishes at once
+                        except BaseException:
+                            pass
                     for f in futs:
                         f.cancel()
                     raise

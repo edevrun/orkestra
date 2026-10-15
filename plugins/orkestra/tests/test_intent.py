@@ -204,6 +204,26 @@ class TestInferSize(unittest.TestCase):
     def test_empty_defaults_m(self):
         self.assertEqual(infer_size(""), "M")
 
+    def test_a_long_small_fix_stays_on_the_fast_track(self):
+        text = "küçük bugfix: null check. " + ("Ayrıntı. " * 80)
+        self.assertGreater(len(text), 480)
+        self.assertEqual(infer_size(text), "S")
+
+    def test_a_long_article_stays_on_the_fast_track(self):
+        text = "kind: writing bir makale hazırla. " + ("Giriş ve kaynak. " * 40)
+        self.assertGreater(len(text), 480)
+        self.assertEqual(infer_size(text), "S")
+
+    def test_a_long_feature_stays_on_the_full_pipeline(self):
+        text = "yeni ekran ekle. " + ("Ayrıntı. " * 80)
+        self.assertGreater(len(text), 480)
+        self.assertEqual(infer_size(text), "M")
+
+    def test_a_long_vague_request_stays_m(self):
+        text = "bunu toparla lütfen. " + ("cümle. " * 80)
+        self.assertGreater(len(text), 480)
+        self.assertEqual(infer_size(text), "M")
+
     def test_slim_helpers(self):
         self.assertTrue(skips_plan_critic("XS") and skips_plan_critic("S"))
         self.assertFalse(skips_plan_critic("M"))

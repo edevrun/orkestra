@@ -21,6 +21,7 @@ from . import planparse as PP
 from .messages import protocol as PR
 from .state import PHASES
 from .util import read_json, read_text, write_json_atomic
+from .workkind import kind_of
 
 # thresholds live in ~/.orkestra/config.json → "watchdog" (defaults: paths.DEFAULT_GLOBAL_CONFIG)
 WD_DEFAULTS: Dict[str, Any] = {"dead_wait_seconds": 90, "hung_command_seconds": 900, "gate_command_seconds": 1800,
@@ -185,6 +186,28 @@ def task_step(project: Path, st: Dict[str, Any], tid: str, deep: bool = False) -
     else:
         out.update(step="review_unclear", verdict=rv["verdict"])
     return out
+
+
+def parallel_ready(st: Dict[str, Any], primary: str, limit: int = 2, busy: Optional[List[str]] = None) -> List[str]:
+    """Other pending tasks that can start with `primary`: dependencies done, files disjoint, at most `limit`."""
+    tasks = st.get("tasks") or {}
+    chosen = list(busy) if busy else [primary]
+    if primary not in chosen:
+        chosen.append(primary)
+    extras: List[str] = []
+    for tid in sorted(tasks):
+        if tid == primary or len(extras) >= limit:
+            continue
+        t = tasks[tid]
+        if t.get("status") != "pending":
+            continue
+        if not all((tasks.get(d) or {}).get("status") in ("done", "deferred") for d in (t.get("depends") or [])):
+            continue
+        if overlap(tasks, tid, chosen):
+            continue
+        extras.append(tid)
+        chosen.append(tid)
+    return extras
 
 
 def next_task(st: Dict[str, Any]) -> Optional[str]:
@@ -398,7 +421,14 @@ def _task_action(project: Path, st: Dict[str, Any], tid: str, deep: bool) -> Dic
                       "a blocked task needs a decision", **base)
         return _n("ask_user", f"{tid} is blocked ({str(notes[-1])[:120]}) → decide from spec/context, or ask the user; then "
                               f"`orkestra task start {tid} {p}`", "a blocked task needs a decision", **base)
-    return _n("cli", f"{tid}: `orkestra task start {tid} {p}` → `orkestra brief {tid} {p}` → dispatch orkestra:implementer",
+    extras = parallel_ready(st, tid)
+    extra = ""
+    if extras:
+        names = " and ".join(extras)
+        extra = (f" Also start {names} in this same turn: their files do not overlap "
+                 f"(at most 3 implementers at once). Each still gets its own review.")
+    return _n("cli", f"{tid}: `orkestra task start {tid} {p}` → `orkestra brief {tid} {p}` → dispatch orkestra:implementer"
+                     + extra,
               "next task in dependency order", f"orkestra task start {tid} {p}", **base)
 
 
@@ -510,7 +540,17 @@ def next_action(project: Path, st: Dict[str, Any], deep: bool = True, now: Optio
         critic = PP.verdict(read_text(fdir / "reviews" / "plan-critic.md"))
         size = st.get("size") or "M"
         if not plan.strip():
-            if size in ("XS", "S"):
+            if kind_of(st) in ("writing", "general"):
+                # Content work writes the plan itself. The architect dispatch stays for software and a missing kind.
+                rule = (f"Only `.orkestra/features/{rid}/deliverable.md` (new) or "
+                        "`.orkestra/current/deliverable.md` (new). `TDD: n/a (content check)`.")
+                if size in ("XS", "S"):
+                    act = _n("work", f"{size}: write a short plan.md yourself (1–3 tasks), then `orkestra plan check` "
+                                     f"(`orkestra playbook plan`). {rule}", "plan.md does not exist")
+                else:
+                    act = _n("work", "write plan.md yourself, then `orkestra plan check` "
+                                     f"(`orkestra playbook plan`). {rule}", "plan.md does not exist")
+            elif size in ("XS", "S"):
                 act = _n("work", f"{size}: write a short plan.md yourself (1–3 tasks), then `orkestra plan check` "
                                  "(`orkestra playbook plan`)", "plan.md does not exist")
             else:

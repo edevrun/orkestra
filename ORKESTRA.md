@@ -270,7 +270,7 @@ full. `gates_parallel` above 1 runs typecheck, lint and test gates side by side 
 | `watchdog.agent_silent_seconds` | `150` | A registered subagent with no sign of life this long is lost. |
 | `watchdog.autostart` | `true` | SessionStart may start the fast watcher. |
 | `watchdog.daemon_idle_minutes` | `30` | The detached watcher exits after this long with no open run and no live session. |
-| `gates_parallel` | `1` | Concurrent typecheck, lint and test gates (a project `config.json` value wins). |
+| `gates_parallel` | `2` | Concurrent typecheck, lint and test gates (a project `config.json` value wins). |
 | `gates_rerun_failed_baseline` | `false` | `true`: `gate verify` re-runs gates that failed or timed out at baseline. |
 | `headless.max_budget_usd` | `0` | Above 0, a spend ceiling for headless turns. |
 | `bridge.turn_timeout_seconds` | `7200` | Wall-clock budget of one bridge turn. |

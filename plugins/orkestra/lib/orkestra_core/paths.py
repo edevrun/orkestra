@@ -43,7 +43,7 @@ DEFAULT_GLOBAL_CONFIG: Dict[str, Any] = {
                  "autostart": True,           # SessionStart may start the fast watcher (fastwatch.ensure_running); POSIX only
                  "daemon_idle_minutes": 30},  # the detached fast watcher exits after this long with no open run and no live session
     "secrets": {"extra_patterns": [], "allow": []},
-    "gates_parallel": 1,    # >1: typecheck/lint/test gates run concurrently (<= min(N, cpus/2)); a project config.json value wins
+    "gates_parallel": 2,    # >1: typecheck/lint/test gates run concurrently (<= min(N, cpus/2)); a project config.json value wins
     "gates_rerun_failed_baseline": False,   # True: `gate verify` re-runs gates that failed/timed out at baseline (same as --all)
     "notify": {"webhook_url": "", "token": ""},
     "headless": {"permission_mode": "auto", "max_turns": 400,

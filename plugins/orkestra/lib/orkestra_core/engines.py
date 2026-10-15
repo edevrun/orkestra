@@ -173,7 +173,8 @@ def headless_command(engine: str, bin_path: str, session_id: str, prompt: str, n
             argv += ["--max-budget-usd", str(o["max_budget_usd"])]
         return {"argv": argv + [str(x) for x in (o.get("extra_args") or [])], "stdin": prompt}
     if engine == "copilot":
-        argv = [bin_path, "-p", "--output-format", "json", "--allow-all-tools"]
+        argv = [bin_path, "-p", "--output-format", "json", "--allow-all-tools",
+                "--excluded-tools", COPILOT_EXCLUDED_TOOLS]
         if o.get("approval_mode", "autopilot") != "manual":
             argv += ["--autopilot", "--no-ask-user"]
         if o.get("model"):
@@ -200,7 +201,7 @@ def interactive_command(engine: str, bin_path: str, prompt: str, opts: Optional[
     """Open the engine's own interactive terminal UI with the first prompt already submitted."""
     engine, o = normalize(engine), dict(opts or {})
     if engine == "copilot":
-        argv = [bin_path, "-i", prompt, "--allow-all-tools"]
+        argv = [bin_path, "-i", prompt, "--allow-all-tools", "--excluded-tools", COPILOT_EXCLUDED_TOOLS]
         if o.get("approval_mode", "autopilot") != "manual":
             argv += ["--autopilot", "--no-ask-user"]
         if o.get("model"):
@@ -223,8 +224,11 @@ def run_prompt(engine: str, request: str) -> str:
     if normalize(engine) == "claude":
         return f"/orkestra:run {request}"
     # no reliance on skill discovery: the CLI serves the same instructions the skill carries
-    return ("Orkestra run. First run the shell command `orkestra playbook run` and follow what it prints exactly "
+    body = ("Orkestra run. First run the shell command `orkestra playbook run` and follow what it prints exactly "
             f"(it is the orkestra-run skill).\n\n{i18n.heading('request')}: {request}")
+    if normalize(engine) == "copilot":
+        return COPILOT_RUN_RULE + "\n\n" + body
+    return body
 
 
 def resume_prompt(engine: str, project_name: str = "") -> str:
@@ -237,7 +241,19 @@ def resume_prompt(engine: str, project_name: str = "") -> str:
 
 # ---------------------------------------------------------------- instructions: one text, two vocabularies
 
+# Tools that open another Copilot chat or subagent. Official names: task, list_agents, read_agent, write_agent.
+COPILOT_EXCLUDED_TOOLS = "task,list_agents,read_agent,write_agent"
+COPILOT_RUN_RULE = ("Stay in this one Copilot session. Do not open another chat, fleet, or subagent. "
+                    "Do every role yourself with the shell and the orkestra CLI.")
+
 NOTES_MARK = "[orkestra · Cursor engine]"
+COPILOT_MARK = "[orkestra · Copilot engine]"
+COPILOT_NOTES = COPILOT_MARK + """ The instructions below were written for Claude Code. In Copilot:
+- Do not open another chat, session, fleet, or subagent. The task tool is off. Do every role in this one session.
+- Use the shell and the `orkestra` CLI. Where the text says to dispatch a subagent, do that role here instead.
+- Do not end the turn while the run is active. End it only for `orkestra await` or `orkestra block`.
+- AskUserQuestion does not exist. Write the question in this session, run `orkestra await "<one-line summary>"`, and end the turn.
+- One session runs the task's own tests. The full suite runs at `orkestra gate baseline` and `orkestra gate verify`, not after every edit."""
 CURSOR_NOTES = NOTES_MARK + """ The instructions below were written for Claude Code. In Cursor:
 - A subagent `orkestra:<name>` is the Cursor subagent `orkestra-<name>`: launch it with the Task tool
   (subagent_type "orkestra-<name>"), ALWAYS in the foreground (run_in_background: false). Its report comes back in
@@ -333,6 +349,8 @@ def adapt_text(text: str, engine: Optional[str], footnote: bool = True) -> str:
 
 def with_notes(text: str, engine: Optional[str], agent: bool = False) -> str:
     """The vocabulary header plus the renamed text (whole documents: playbooks, skills; `agent`: a subagent's file)."""
+    if engine == "copilot":
+        return COPILOT_NOTES + "\n\n" + (text or "")
     if (engine or DEFAULT_ENGINE) != "cursor":
         return text
     return (AGENT_NOTES if agent else CURSOR_NOTES) + "\n\n" + _rename(text)

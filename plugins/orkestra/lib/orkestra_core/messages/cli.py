@@ -154,6 +154,9 @@ EN: Dict[str, str] = {
     "cli.clean_bytes": "{size} GiB",
     "cli.clean_line": "- {path} ({size})",
     "cli.clean_error": "error: {path}: {error}",
+    "cli.mcp_row": "{host}: {name} is {state}",
+    "cli.mcp_partial": "installed on {hosts}. Other hosts failed:",
+    "cli.mcp_refused": "orkestra mcp changes the MCP configuration: run it from your terminal.",
 }
 
 TR: Dict[str, str] = {
@@ -293,4 +296,7 @@ TR: Dict[str, str] = {
     "cli.clean_bytes": "{size} GiB",
     "cli.clean_line": "- {path} ({size})",
     "cli.clean_error": "hata: {path}: {error}",
+    "cli.mcp_row": "{host}: {name} durumu {state}",
+    "cli.mcp_partial": "{hosts} üzerine kuruldu. Diğer hedefler başarısız:",
+    "cli.mcp_refused": "orkestra mcp MCP yapılandırmasını değiştirir: bunu terminalinizden çalıştırın.",
 }

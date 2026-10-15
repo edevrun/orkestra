@@ -37,6 +37,7 @@ from .cliparse import requested_lang
 from .messages import protocol as PR
 from .state import (PHASES, OrkestraError, bind_marker, load_state, project_active_run, unbind_marker)
 from .util import read_json, read_text
+from .workkind import kind_of
 
 PLUGIN_ROOT = Path(__file__).resolve().parent.parent.parent
 PLAYBOOKS = PLUGIN_ROOT / "skills" / "run" / "references"
@@ -811,6 +812,10 @@ def cmd_next(a: argparse.Namespace) -> int:
         return 0
     for ln in T.next_lines(n, fl):
         _out(ln)
+    if st.get("phase") == "implement" and st.get("approval_mode", "autopilot") == "autopilot":
+        from .parallel_workers import launch_ready
+        for ln in launch_ready(project, st):
+            _out(ln)
     return 0
 
 
@@ -1058,7 +1063,8 @@ def cmd_check(a: argparse.Namespace) -> int:
     fdir = paths.feature_dir(project, rid)
     spec = read_text(fdir / "spec.md")
     if a.cmd == "plan":
-        problems = PP.check_plan(spec, read_text(fdir / "plan.md"), project)
+        problems = PP.check_plan(spec, read_text(fdir / "plan.md"), project,
+                                  work_kind=kind_of(load_state(project, rid)), run_id=rid)
     elif a.cmd == "trace":
         ver = read_text(fdir / "verification.md")
         gate_names = [g["name"] for g in paths.project_config(project).get("gates") or []]
@@ -1273,8 +1279,9 @@ def cmd_playbook(a: argparse.Namespace) -> int:
         raise OrkestraError(f"no playbook '{name}'. available: run, {', '.join(avail)}")
     else:
         text = read_text(path)
-    if _ASKER == "cursor":      # the vocabulary header, then the document with Cursor's names
-        sys.stdout.write(EN.with_notes(text, "cursor").rstrip("\n") + "\n")
+    voice = _ASKER or (str(st.get("engine")) if st else "")
+    if voice in ("cursor", "copilot"):      # header, then the document in that engine's words
+        sys.stdout.write(EN.with_notes(text, voice).rstrip("\n") + "\n")
         return 0
     _out(text)
     return 0
@@ -1402,6 +1409,25 @@ def cmd_copilot(a: argparse.Namespace) -> int:
             return 0 if ok else 1
     except EN.EngineError as exc:
         raise OrkestraError(str(exc))
+    return 0
+
+
+def cmd_mcp(a: argparse.Namespace) -> int:
+    """Install or report MCP servers. An agent shell is refused before any install or status call."""
+    if _ASKER:
+        raise OrkestraError(i18n.t("cli.mcp_refused"))
+    from . import mcpinstall
+    names = tuple(a.only) if a.only else None
+    try:
+        if a.action == "install":
+            rows = mcpinstall.install(a.engine, names)
+        else:
+            rows = mcpinstall.status(a.engine, names)
+    except mcpinstall.McpError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 1
+    for row in rows:
+        _out(i18n.t("cli.mcp_row", host=row["host"], name=row["name"], state=row["state"]))
     return 0
 
 
@@ -1770,7 +1796,7 @@ HANDLERS = {
     "watch": cmd_watch, "dashboard": cmd_dashboard,
     "evidence": cmd_evidence, "integrity": cmd_integrity, "report": cmd_report,
     "next": cmd_next, "wait": cmd_wait, "tempo": cmd_tempo, "watchdog": cmd_watchdog, "agents": cmd_agents,
-    "run": cmd_run, "cursor": cmd_cursor, "copilot": cmd_copilot, "setup": cmd_setup, "lang": cmd_lang,
+    "run": cmd_run, "cursor": cmd_cursor, "copilot": cmd_copilot, "mcp": cmd_mcp, "setup": cmd_setup, "lang": cmd_lang,
 }
 
 

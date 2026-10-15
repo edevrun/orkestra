@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 from . import i18n
 from .messages import protocol as P
+from .workkind import nonsoftware_plan_problems
 
 ID_RE = re.compile(r"\b((?:FR|SC)-\d{3})\b")
 TASK_HEAD_RE = re.compile(r"^###\s+(T\d{3})\s*(?:[—–:\-]+\s*)?(.*?)\s*$", re.M)
@@ -269,8 +270,13 @@ def _field_label(key: str) -> str:
     return _lang_pair(*P.TASK_FIELDS[key])
 
 
-def check_plan(spec_text: str, plan_text: str, project: Optional[Path] = None) -> List[str]:
-    """Structural lint (+ file existence when `project` is given). Returns problems (empty == OK)."""
+def check_plan(spec_text: str, plan_text: str, project: Optional[Path] = None, *,
+               work_kind: Optional[str] = None, run_id: Optional[str] = None) -> List[str]:
+    """Structural lint (+ file existence when `project` is given). Returns problems (empty == OK).
+
+    writing and general add deliverable-path and content-check TDD problems. Any other
+    work_kind, including a missing one, leaves the software list unchanged.
+    """
     problems: List[str] = []
     if not spec_text.strip():
         problems.append("spec.md is missing or empty")
@@ -314,6 +320,8 @@ def check_plan(spec_text: str, plan_text: str, project: Optional[Path] = None) -
     for sc in sc_ids:
         if sc not in plan_text:
             problems.append(f"{sc} is not referenced anywhere in plan.md (map it in the test strategy)")
+    if work_kind in ("writing", "general"):
+        problems.extend(nonsoftware_plan_problems(tasks, run_id if isinstance(run_id, str) else ""))
     return problems
 
 
